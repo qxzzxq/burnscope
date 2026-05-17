@@ -1,0 +1,57 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python (client/)
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+dist/
+build/
+
+# Go (server/)
+server/bin/
+server/burnscope-server
+server/vendor/
+*.test
+*.out
+coverage.txt
+
+# Node (web/)
+node_modules/
+web/dist/
+web/.svelte-kit/
+*.log
+npm-debug.log*
+
+# PlatformIO (firmware/)
+firmware/.pio/
+firmware/.pioenvs/
+firmware/.piolibdeps/
+firmware/.clang_complete
+firmware/.gcc-flags.json
+
+# Generated from schema/
+**/_schema_generated/
+**/_schema.d.ts
+**/_schema_generated.py
+**/_schema_generated.go
+
+# Local config / secrets
+*.env
+.env.*
+!.env.example
+local.toml
+local.yaml

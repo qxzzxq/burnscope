@@ -84,7 +84,7 @@ Single repo. Component boundaries kept clean so a split is possible later.
 
 ---
 
-## Development Workflow
+## Remote workbench
 
 An ESP32 workbench has been installed on a remote server (http://workbench.local:8080/), with an ESP32 display directly connected to it. Please follow the instruction on https://github.com/SensorsIot/Universal-Embedded-Workbench.
 

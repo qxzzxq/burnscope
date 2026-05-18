@@ -28,12 +28,12 @@ Both windows for one agent at one point in time.
 |---------------|------------------|-------------|
 | `agent`       | string enum      | One of `"claude"`, `"codex"`. |
 | `captured_at` | integer (unix s) | When the daemon read the headers from the upstream API. |
-| `window_5h`   | `WindowSnapshot` | The 5-hour rolling window. |
-| `window_7d`   | `WindowSnapshot` | The 7-day rolling window. |
+| `window_primary`   | `WindowSnapshot` | The shorter rolling window (5h for both currently-supported agents). |
+| `window_secondary` | `WindowSnapshot` | The longer rolling window (7d for both currently-supported agents). |
 
-Field names hardcode `5h` and `7d` because both supported agents use exactly
-these window sizes. If a future agent ships different windows, that becomes a
-deliberate schema change.
+Field names are agent-agnostic so a future agent with different window sizes
+can map onto the same schema without a rename. The current window sizes (5h /
+7d) are documented in the header-mapping table below.
 
 ---
 
@@ -74,10 +74,10 @@ and `docs/probe-codex.sh`.
 
 | Schema field          | Claude Code header                              | Codex CLI header                          |
 |-----------------------|-------------------------------------------------|-------------------------------------------|
-| `window_5h.used_pct`  | `anthropic-ratelimit-unified-5h-utilization`    | `x-codex-primary-used-percent` ÷ 100      |
-| `window_5h.resets_at` | `anthropic-ratelimit-unified-5h-reset`          | `x-codex-primary-reset-at`                |
-| `window_7d.used_pct`  | `anthropic-ratelimit-unified-7d-utilization`    | `x-codex-secondary-used-percent` ÷ 100    |
-| `window_7d.resets_at` | `anthropic-ratelimit-unified-7d-reset`          | `x-codex-secondary-reset-at`              |
+| `window_primary.used_pct`    | `anthropic-ratelimit-unified-5h-utilization`    | `x-codex-primary-used-percent` ÷ 100      |
+| `window_primary.resets_at`   | `anthropic-ratelimit-unified-5h-reset`          | `x-codex-primary-reset-at`                |
+| `window_secondary.used_pct`  | `anthropic-ratelimit-unified-7d-utilization`    | `x-codex-secondary-used-percent` ÷ 100    |
+| `window_secondary.resets_at` | `anthropic-ratelimit-unified-7d-reset`          | `x-codex-secondary-reset-at`              |
 
 Claude returns `used_pct` already as a `0.0`–`1.0` float; Codex returns
 `0`–`100` integers and the collector divides by 100.

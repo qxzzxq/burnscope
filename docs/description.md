@@ -86,16 +86,7 @@ Single repo. Component boundaries kept clean so a split is possible later.
 
 ## Development Workflow
 
-Flashing and runtime testing happen against a remote CYD attached to a Raspberry Pi, which exposes the ESP32's serial port over the network via `esp_rfc2217_server`. Any developer (or Claude) can flash and monitor without physical access.
-
-```ini
-# platformio.ini
-upload_port = rfc2217://workbench.local:4000?ign_set_control
-```
-
-```bash
-miniterm.py rfc2217://workbench.local:4000?ign_set_control 115200
-```
+An ESP32 workbench has been installed on a remote server (http://workbench.local:8080/), with an ESP32 display directly connected to it. Please follow the instruction on https://github.com/SensorsIot/Universal-Embedded-Workbench.
 
 ---
 

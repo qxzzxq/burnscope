@@ -29,6 +29,10 @@
 - Write clear commit messages in the imperative mood (e.g., "Add volume slider", not "Added volume slider").
 - Reference issue numbers where applicable (e.g., `fix/screen-flicker: debounce resize handler (#142)`).
 
+## Documentation
+- Update documentation (README, design docs, inline comments) as part of the same PR that implements the change.
+- Document public interfaces, expected inputs/outputs, and any non-obvious behavior. For complex logic, include examples or diagrams if helpful.
+
 ## Pull Requests
 - Open a PR only when:
   - All tests pass locally and in CI.

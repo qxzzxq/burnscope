@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import httpx
 
-from .claude import AgentSnapshot
+from .schema import AgentSnapshot
 
 
 class PushError(RuntimeError):

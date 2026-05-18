@@ -1,0 +1,1206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BurnScope client — detailed specification</title>
+<style>
+  :root {
+    --accent: #2c5aa0;
+    --accent-soft: #eef3fa;
+    --border: #e1e4e8;
+    --bg-soft: #fafbfc;
+    --bg-code: #f4f4f7;
+    --text: #24292f;
+    --muted: #57606a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    max-width: 1040px;
+    margin: 2em auto;
+    padding: 0 1.5em;
+    color: var(--text);
+    line-height: 1.55;
+  }
+  h1 { border-bottom: 2px solid var(--accent); padding-bottom: .35em; }
+  h2 { border-bottom: 1px solid var(--border); padding-bottom: .25em; margin-top: 2.2em; }
+  h3 { color: var(--accent); margin-top: 1.8em; }
+  h4 { margin-top: 1.4em; margin-bottom: .4em; color: var(--muted); text-transform: uppercase;
+       font-size: .82em; letter-spacing: .05em; }
+  p { margin: .6em 0; }
+  code, pre {
+    font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  code {
+    background: var(--bg-code);
+    padding: .1em .35em;
+    border-radius: 3px;
+    font-size: .92em;
+  }
+  pre {
+    background: var(--bg-code);
+    padding: 1em 1.2em;
+    border-radius: 6px;
+    overflow-x: auto;
+    border-left: 3px solid var(--accent);
+    font-size: .87em;
+    line-height: 1.5;
+  }
+  pre code { background: transparent; padding: 0; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 1em 0;
+    font-size: .92em;
+  }
+  th, td {
+    border: 1px solid var(--border);
+    padding: .55em .8em;
+    text-align: left;
+    vertical-align: top;
+  }
+  th { background: var(--bg-soft); font-weight: 600; }
+  td.mono, table.mono td:first-child, table.surface td:first-child,
+  table.errors td:first-child {
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: .9em;
+    white-space: nowrap;
+  }
+  .toc {
+    background: var(--bg-soft);
+    border: 1px solid var(--border);
+    padding: 1em 1.5em;
+    border-radius: 6px;
+  }
+  .toc ul { margin: .3em 0; padding-left: 1.4em; }
+  .toc li { margin: .15em 0; }
+  .module-header {
+    background: var(--bg-soft);
+    padding: .8em 1.2em;
+    border-radius: 6px;
+    border-left: 4px solid var(--accent);
+    margin-top: 1.8em;
+  }
+  .module-header h3 { margin: 0; }
+  .module-header .path { color: var(--muted); font-family: monospace; font-size: .88em; }
+  .tag {
+    display: inline-block;
+    background: var(--accent-soft);
+    color: var(--accent);
+    padding: .12em .55em;
+    border-radius: 3px;
+    font-size: .78em;
+    font-weight: 600;
+    margin-right: .4em;
+    vertical-align: middle;
+  }
+  blockquote {
+    border-left: 3px solid #ccc;
+    margin: 1em 0;
+    padding: .35em 1em;
+    color: var(--muted);
+    background: var(--bg-soft);
+    border-radius: 0 4px 4px 0;
+  }
+  .diagram {
+    background: white;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 1em;
+    margin: 1.2em 0;
+    overflow-x: auto;
+  }
+  .diagram pre {
+    background: transparent;
+    border-left: none;
+    padding: 0;
+    margin: 0;
+    font-size: .88em;
+  }
+  ul.tests li { margin: .15em 0; }
+  ul.tests li code { font-size: .88em; }
+  .small { font-size: .88em; color: var(--muted); }
+  hr { border: 0; border-top: 1px solid var(--border); margin: 2.5em 0; }
+</style>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral', securityLevel: 'loose' });
+</script>
+</head>
+<body>
+
+<h1>BurnScope Client — Detailed Specification</h1>
+
+<p class="small">
+  Component-level reference for <code>client/src/burnscope_client/</code>.
+  Pairs with <a href="./description.md">description.md</a> (project goals)
+  and <a href="./wire-format.md">wire-format.md</a> (on-wire contract).
+</p>
+
+<div class="toc">
+  <strong>Contents</strong>
+  <ul>
+    <li><a href="#overview">1. Overview</a></li>
+    <li><a href="#data-flow">2. Data flow</a></li>
+    <li><a href="#class-hierarchy">3. Class hierarchy</a></li>
+    <li><a href="#components">4. Component reference</a>
+      <ul>
+        <li><a href="#schema"><code>schema.py</code></a></li>
+        <li><a href="#credentials"><code>credentials.py</code></a></li>
+        <li><a href="#agent"><code>agent.py</code></a></li>
+        <li><a href="#agents-claude"><code>agents/claude.py</code></a></li>
+        <li><a href="#agents-codex"><code>agents/codex.py</code></a></li>
+        <li><a href="#watcher"><code>watcher.py</code></a></li>
+        <li><a href="#discovery"><code>discovery.py</code></a></li>
+        <li><a href="#pusher"><code>pusher.py</code></a></li>
+        <li><a href="#daemon"><code>daemon.py</code></a></li>
+        <li><a href="#cli"><code>cli.py</code></a></li>
+      </ul>
+    </li>
+    <li><a href="#lifecycle">5. Per-cycle lifecycle</a></li>
+    <li><a href="#test-matrix">6. Test matrix</a></li>
+  </ul>
+</div>
+
+<!-- =============================================================== -->
+<h2 id="overview">1. Overview</h2>
+
+<p>
+  The client is a Python 3.11+ asynchronous daemon that probes one or more
+  upstream AI-agent rate-limit endpoints, normalises each into an
+  agent-agnostic <code>AgentSnapshot</code>, and pushes each snapshot to a
+  BurnScope ESP32 display over HTTP. The ESP32 is discovered on the LAN via
+  mDNS (overridable). A <code>JsonlActivityWatcher</code> tails
+  <code>~/.claude/projects/**/*.jsonl</code> as a cheap activity signal that
+  flips the probe cadence between an <em>active</em> and an <em>idle</em>
+  interval.
+</p>
+
+<div class="diagram">
+<pre class="mermaid">
+flowchart LR
+  subgraph Local["laptop"]
+    direction LR
+    keychain[("macOS keychain<br/>~/.codex/auth.json<br/>~/.claude/.credentials.json")]
+    jsonl[("~/.claude/projects/**/*.jsonl")]
+    cli["cli.py<br/>(entry point)"]
+    daemon["daemon.py<br/>(event loop)"]
+    agents["agents/*<br/>(probe + parse)"]
+    watcher["watcher.py"]
+    discovery["discovery.py<br/>(mDNS)"]
+    pusher["pusher.py"]
+  end
+
+  upstream[("Upstream APIs<br/>Anthropic / ChatGPT")]
+  esp32[("ESP32<br/>POST /summary")]
+
+  cli -->|builds agents| daemon
+  keychain -.->|"Credential.load()"| agents
+  daemon -->|"agent.probe(http)"| agents
+  agents -->|HTTP probe| upstream
+  daemon -->|"last_change_ts"| watcher
+  jsonl -.->|file events| watcher
+  daemon -->|"if host unknown"| discovery
+  discovery -.->|"host:port"| daemon
+  daemon -->|"AgentSnapshot per agent"| pusher
+  pusher -->|HTTP POST| esp32
+</pre>
+</div>
+
+<p>
+  Every concrete agent has the same shape: a <code>*Credential</code>
+  frozen dataclass (telling us <em>where</em> credentials live and
+  <em>what</em> fields they have) and an <code>*Agent</code> subclass
+  (telling us <em>how</em> to probe and what to extract). Adding a new
+  agent is a pure subclass-and-register operation; nothing else in the
+  client knows about specific providers.
+</p>
+
+<!-- =============================================================== -->
+<h2 id="data-flow">2. Data flow</h2>
+
+<p>
+  All inputs enter through the boundary modules; everything in between is
+  pure plumbing over <code>AgentSnapshot</code> values.
+</p>
+
+<table>
+  <thead><tr><th>Boundary module</th><th>Reads</th><th>Writes</th></tr></thead>
+  <tbody>
+    <tr><td><code>credentials.py</code> / <code>agents/*</code></td>
+        <td>macOS keychain, <code>~/.claude/.credentials.json</code>,
+            <code>~/.codex/auth.json</code></td>
+        <td>—</td></tr>
+    <tr><td><code>watcher.py</code></td>
+        <td><code>~/.claude/projects/**/*.jsonl</code> (file system events)</td>
+        <td>—</td></tr>
+    <tr><td><code>agents/claude.py</code></td>
+        <td><code>POST https://api.anthropic.com/v1/messages</code></td>
+        <td>—</td></tr>
+    <tr><td><code>agents/codex.py</code></td>
+        <td><code>POST https://chatgpt.com/backend-api/codex/responses</code> (streaming)</td>
+        <td>—</td></tr>
+    <tr><td><code>discovery.py</code></td>
+        <td>mDNS (<code>_burnscope._tcp.local.</code>)</td>
+        <td>—</td></tr>
+    <tr><td><code>pusher.py</code></td>
+        <td>—</td>
+        <td><code>POST http://&lt;host&gt;/summary</code></td></tr>
+  </tbody>
+</table>
+
+<!-- =============================================================== -->
+<h2 id="class-hierarchy">3. Class hierarchy</h2>
+
+<div class="diagram">
+<pre class="mermaid">
+classDiagram
+  class Credential {
+    &lt;&lt;abstract&gt;&gt;
+    +load(**kwargs) Credential
+    #_read_keychain(service) str
+    #_read_file(path) str
+    #_parse_json(blob, source) dict
+  }
+  class ClaudeCredential {
+    +access_token: str
+    +load(keychain_service, credentials_path) ClaudeCredential
+  }
+  class CodexCredential {
+    +access_token: str
+    +account_id: str | None
+    +load(credentials_path) CodexCredential
+  }
+  Credential &lt;|-- ClaudeCredential
+  Credential &lt;|-- CodexCredential
+
+  class Agent {
+    &lt;&lt;abstract&gt;&gt;
+    +name: ClassVar[str]
+    +__init__(credential)
+    +probe(client) AgentSnapshot
+    +load_credential() Credential
+    +try_create() Agent | None
+  }
+  class ClaudeAgent {
+    +KEYCHAIN_SERVICE: ClassVar[str]
+    +CREDENTIALS_PATH: ClassVar[Path]
+    +probe(client) AgentSnapshot
+    +load_credential() ClaudeCredential
+  }
+  class CodexAgent {
+    +CREDENTIALS_PATH: ClassVar[Path]
+    +probe(client) AgentSnapshot
+    +load_credential() CodexCredential
+  }
+  Agent &lt;|-- ClaudeAgent
+  Agent &lt;|-- CodexAgent
+
+  ClaudeAgent --&gt; ClaudeCredential : holds
+  CodexAgent --&gt; CodexCredential : holds
+
+  class AgentSnapshot {
+    +agent: str
+    +captured_at: int
+    +sessions: list[SessionSnapshot]
+    +to_dict() dict
+  }
+  class SessionSnapshot {
+    +type: str
+    +used_pct: float
+    +resets_at: int
+  }
+  AgentSnapshot --&gt; SessionSnapshot : 1..*
+  Agent ..&gt; AgentSnapshot : returns
+</pre>
+</div>
+
+<p>
+  The two ABC hierarchies (<code>Credential</code> and <code>Agent</code>)
+  are parallel: each concrete agent contributes one of each. The schema
+  types are agent-agnostic and never inherited.
+</p>
+
+<!-- =============================================================== -->
+<h2 id="components">4. Component reference</h2>
+
+<!-- ---------------- schema.py ---------------- -->
+<div class="module-header">
+  <h3 id="schema"><code>schema.py</code></h3>
+  <span class="path">client/src/burnscope_client/schema.py</span>
+</div>
+
+<h4>Purpose</h4>
+<p>
+  Defines the agent-agnostic wire-format dataclasses. The single source of
+  truth on the wire is <a href="./wire-format.md">wire-format.md</a>; this
+  module is the Python mirror of it.
+</p>
+
+<h4>Public surface</h4>
+<table class="surface">
+  <thead><tr><th>Name</th><th>Kind</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>SessionSnapshot</td><td>frozen dataclass</td>
+        <td><code>type: str</code>, <code>used_pct: float</code> (0.0–1.0),
+            <code>resets_at: int</code> (unix seconds, UTC).</td></tr>
+    <tr><td>AgentSnapshot</td><td>frozen dataclass</td>
+        <td><code>agent: str</code>, <code>captured_at: int</code>,
+            <code>sessions: list[SessionSnapshot]</code>.</td></tr>
+    <tr><td>AgentSnapshot.to_dict()</td><td>method</td>
+        <td>Returns a JSON-serialisable dict matching wire-format.md.</td></tr>
+  </tbody>
+</table>
+
+<h4>Behaviour</h4>
+<p>
+  Pure value types. Both dataclasses are frozen so a snapshot, once
+  captured by an agent, cannot be mutated downstream by the daemon or
+  pusher. Agents are responsible for normalising upstream
+  <code>used_pct</code> scales into <code>0.0</code>–<code>1.0</code>
+  before constructing these.
+</p>
+
+<h4>Error handling</h4>
+<p>None. No validation; constructors trust their callers.</p>
+
+<h4>Tests</h4>
+<ul class="tests">
+  <li><code>test_claude_agent.py::test_session_snapshot_dataclass_fields</code></li>
+  <li><code>test_claude_agent.py::test_agent_snapshot_dataclass_fields</code></li>
+  <li><code>test_claude_agent.py::test_probe_to_dict_matches_wire_format</code> (validates
+      the <code>to_dict()</code> shape end-to-end)</li>
+</ul>
+
+<!-- ---------------- credentials.py ---------------- -->
+<div class="module-header">
+  <h3 id="credentials"><code>credentials.py</code></h3>
+  <span class="path">client/src/burnscope_client/credentials.py</span>
+</div>
+
+<h4>Purpose</h4>
+<p>
+  Defines the <code>Credential</code> abstract base class and the shared
+  reading capabilities that every <code>*Credential</code> subclass
+  composes inside its own <code>load()</code>.
+</p>
+
+<h4>Public surface</h4>
+<table class="surface">
+  <thead><tr><th>Name</th><th>Kind</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>CredentialsError</td><td>exception</td>
+        <td>Raised when credentials cannot be located or parsed.</td></tr>
+    <tr><td>Credential</td><td>ABC</td>
+        <td>Base class for an agent's credential blob. Subclasses are
+            frozen dataclasses with a <code>load()</code> classmethod.</td></tr>
+    <tr><td>Credential.load(**kwargs)</td><td>abstract classmethod</td>
+        <td>Subclasses implement with their own signature
+            (paths / service names).</td></tr>
+    <tr><td>Credential._read_keychain(service)</td><td>static</td>
+        <td>Runs <code>security find-generic-password -s &lt;service&gt;</code>;
+            returns stdout. Raises on non-zero rc or empty output.</td></tr>
+    <tr><td>Credential._read_file(path)</td><td>static</td>
+        <td>Reads <code>path</code> as text; raises if not found.</td></tr>
+    <tr><td>Credential._parse_json(blob, source)</td><td>static</td>
+        <td>Parses <code>blob</code> as JSON; on <code>JSONDecodeError</code>
+            raises <code>CredentialsError</code> mentioning <code>source</code>.</td></tr>
+  </tbody>
+</table>
+
+<h4>Behaviour</h4>
+<p>
+  No I/O happens at module import. Each reader is a static method on the
+  base class — subclasses call them via <code>cls._read_…</code> for
+  readability and discoverability. The class hierarchy is purely a
+  mixin-style code-sharing device; <code>Credential</code> has no
+  instance state of its own.
+</p>
+
+<h4>Error handling</h4>
+<table class="errors">
+  <thead><tr><th>Raises</th><th>When</th></tr></thead>
+  <tbody>
+    <tr><td>CredentialsError</td>
+        <td><code>_read_keychain</code>: <code>security</code> command
+            returned non-zero or empty stdout.</td></tr>
+    <tr><td>CredentialsError</td>
+        <td><code>_read_file</code>: file not found.</td></tr>
+    <tr><td>CredentialsError</td>
+        <td><code>_parse_json</code>: blob is not valid JSON.</td></tr>
+  </tbody>
+</table>
+
+<h4>Tests</h4>
+<ul class="tests">
+  <li>Tested transitively through <code>ClaudeCredential.load()</code> and
+      <code>CodexCredential.load()</code> in
+      <code>test_credentials.py</code> — see the
+      <a href="#agents-claude"><code>claude.py</code></a> and
+      <a href="#agents-codex"><code>codex.py</code></a> sections below.</li>
+</ul>
+
+<!-- ---------------- agent.py ---------------- -->
+<div class="module-header">
+  <h3 id="agent"><code>agent.py</code></h3>
+  <span class="path">client/src/burnscope_client/agent.py</span>
+</div>
+
+<h4>Purpose</h4>
+<p>
+  Defines the <code>Agent</code> abstract base class — the contract every
+  upstream provider must satisfy — and <code>ProbeError</code>, the
+  shared error type for probe failures.
+</p>
+
+<h4>Public surface</h4>
+<table class="surface">
+  <thead><tr><th>Name</th><th>Kind</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>ProbeError</td><td>exception</td>
+        <td>Raised by <code>Agent.probe()</code> implementations on
+            transport failure, non-2xx response, or missing/malformed
+            rate-limit headers.</td></tr>
+    <tr><td>Agent</td><td>ABC</td>
+        <td>Base class. Subclasses define <code>name</code>,
+            <code>__init__(credential)</code>, <code>probe()</code>,
+            <code>load_credential()</code>.</td></tr>
+    <tr><td>Agent.name</td><td><code>ClassVar[str]</code></td>
+        <td>Wire-format identifier (<code>"claude"</code>,
+            <code>"codex"</code>, …). Also the
+            <code>--agent</code> CLI value.</td></tr>
+    <tr><td>Agent.probe(client)</td><td>abstract async</td>
+        <td>Issues one upstream probe; returns <code>AgentSnapshot</code>;
+            raises <code>ProbeError</code> on any failure.</td></tr>
+    <tr><td>Agent.load_credential()</td><td>abstract classmethod</td>
+        <td>Reads this agent's credential from local storage. Raises
+            <code>CredentialsError</code>.</td></tr>
+    <tr><td>Agent.try_create()</td><td>classmethod</td>
+        <td>Returns <code>cls(cls.load_credential())</code> if available,
+            else <code>None</code>. Used by CLI auto-detect.</td></tr>
+  </tbody>
+</table>
+
+<h4>Behaviour</h4>
+<p>
+  <code>try_create()</code> is the only concrete method on the base. It
+  catches <code>CredentialsError</code> exclusively — any other exception
+  bubbles. Subclasses do not need to override it because the credential
+  type encapsulates all per-agent fields.
+</p>
+
+<h4>Error handling</h4>
+<table class="errors">
+  <thead><tr><th>Raises</th><th>When</th></tr></thead>
+  <tbody>
+    <tr><td>ProbeError</td>
+        <td>Subclasses raise during <code>probe()</code> for HTTP
+            errors, 4xx/5xx responses, or unparseable headers.</td></tr>
+    <tr><td>CredentialsError</td>
+        <td>Bubbles up from <code>load_credential()</code> when called
+            directly. Suppressed inside <code>try_create()</code>.</td></tr>
+  </tbody>
+</table>
+
+<h4>Tests</h4>
+<ul class="tests">
+  <li>The ABC is exercised transitively by every concrete-agent test
+      (every <code>test_claude_agent</code> and <code>test_codex_agent</code>
+      test).</li>
+  <li><code>test_claude_agent.py::test_claude_agent_name</code> /
+      <code>test_codex_agent.py::test_codex_agent_name</code> assert the
+      <code>name</code> class attribute is set correctly.</li>
+  <li><code>test_daemon_integration.py</code> defines a <code>_StubAgent</code>
+      subclass that asserts the ABC can be implemented without the real
+      credential machinery.</li>
+</ul>
+
+<!-- ---------------- agents/claude.py ---------------- -->
+<div class="module-header">
+  <h3 id="agents-claude"><code>agents/claude.py</code></h3>
+  <span class="path">client/src/burnscope_client/agents/claude.py</span>
+</div>
+
+<h4>Purpose</h4>
+<p>
+  Probes Anthropic's rate-limit headers for Claude Code's subscription
+  windows.
+</p>
+
+<h4>Public surface</h4>
+<table class="surface">
+  <thead><tr><th>Name</th><th>Kind</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>ClaudeCredential</td><td>frozen dataclass(Credential)</td>
+        <td>Field: <code>access_token: str</code>. Class method
+            <code>load(keychain_service, credentials_path)</code>.</td></tr>
+    <tr><td>ClaudeAgent</td><td>Agent subclass</td>
+        <td><code>name = "claude"</code>. Class attributes
+            <code>KEYCHAIN_SERVICE</code>, <code>CREDENTIALS_PATH</code>.</td></tr>
+    <tr><td>API_URL, PROBE_MODEL, USER_AGENT</td><td>module const</td>
+        <td>Probe target and request shape constants.</td></tr>
+  </tbody>
+</table>
+
+<h4>Behaviour</h4>
+
+<p><strong>Credential location.</strong> On macOS, reads
+   <code>security find-generic-password -s "Claude Code-credentials"</code>.
+   Elsewhere, reads <code>~/.claude/.credentials.json</code>. Both paths
+   are class attributes on <code>ClaudeAgent</code> so the agent class
+   is the single source of truth.</p>
+
+<p><strong>Credential parsing.</strong> Either
+   <code>claudeAiOauth.accessToken</code> or top-level
+   <code>accessToken</code> is accepted (the Claude Code CLI has produced
+   both shapes historically).</p>
+
+<p><strong>Probe.</strong>
+   <code>POST https://api.anthropic.com/v1/messages</code> with
+   <code>max_tokens=1</code>, model <code>claude-haiku-4-5-20251001</code>,
+   message <code>"hi"</code>. Required headers:
+   <code>Authorization: Bearer &lt;token&gt;</code>,
+   <code>anthropic-version: 2023-06-01</code>,
+   <code>anthropic-beta: oauth-2025-04-20</code>,
+   <code>User-Agent: claude-code/2.1.5</code>.
+   Timeout: <code>10s</code>.</p>
+
+<p><strong>Header parsing.</strong> Reads
+   <code>anthropic-ratelimit-unified-{5h,7d}-{utilization,reset}</code>.
+   <code>utilization</code> is already a <code>0.0</code>–<code>1.0</code>
+   float (no scaling). <code>reset</code> is ISO-8601 with a trailing
+   <code>Z</code>; bare unix-seconds digits are also accepted. Missing
+   pairs are skipped rather than failing. A response with neither pair
+   raises <code>ProbeError</code>.</p>
+
+<h4>Inputs / outputs</h4>
+<table>
+  <tbody>
+    <tr><td><strong>Input</strong></td>
+        <td><code>ClaudeCredential</code> (constructor), then an
+            <code>httpx.AsyncClient</code> per <code>probe()</code> call.</td></tr>
+    <tr><td><strong>Output</strong></td>
+        <td><code>AgentSnapshot(agent="claude", captured_at=int(time.time()),
+            sessions=[SessionSnapshot("5h", …), SessionSnapshot("7d", …)])</code></td></tr>
+  </tbody>
+</table>
+
+<h4>Error handling</h4>
+<table class="errors">
+  <thead><tr><th>Raises</th><th>When</th></tr></thead>
+  <tbody>
+    <tr><td>ProbeError</td><td>Any <code>httpx.HTTPError</code> during the POST.</td></tr>
+    <tr><td>ProbeError</td><td>Response status &ge; 400 (message includes the first 200
+        bytes of the body).</td></tr>
+    <tr><td>ProbeError</td><td>Neither <code>5h</code> nor <code>7d</code> pair present.</td></tr>
+    <tr><td>ProbeError</td><td>Utilization value isn't parseable as a float, or reset value
+        isn't a valid ISO-8601 / digit string.</td></tr>
+    <tr><td>CredentialsError</td><td>From <code>ClaudeCredential.load()</code>: keychain
+        miss, file not found, malformed JSON, no <code>accessToken</code>.</td></tr>
+  </tbody>
+</table>
+
+<h4>Tests</h4>
+<ul class="tests">
+  <li><code>test_claude_agent.py::test_probe_builds_snapshot_from_headers</code></li>
+  <li><code>test_claude_agent.py::test_probe_to_dict_matches_wire_format</code></li>
+  <li><code>test_claude_agent.py::test_probe_partial_headers_returns_only_present_sessions</code></li>
+  <li><code>test_claude_agent.py::test_probe_no_rate_limit_headers_raises</code></li>
+  <li><code>test_claude_agent.py::test_probe_malformed_utilization_raises</code></li>
+  <li><code>test_claude_agent.py::test_probe_http_error_raises</code></li>
+  <li><code>test_claude_agent.py::test_claude_agent_name</code></li>
+  <li><code>test_credentials.py::test_claude_credential_load_from_macos_keychain</code></li>
+  <li><code>test_credentials.py::test_claude_credential_falls_back_to_top_level_accessToken</code></li>
+  <li><code>test_credentials.py::test_claude_credential_keychain_missing_raises</code></li>
+  <li><code>test_credentials.py::test_claude_credential_load_from_linux_file</code></li>
+  <li><code>test_credentials.py::test_claude_credential_linux_missing_file_raises</code></li>
+  <li><code>test_credentials.py::test_claude_credential_malformed_json_raises</code></li>
+  <li><code>test_credentials.py::test_claude_credential_no_access_token_in_blob_raises</code></li>
+  <li><code>test_credentials.py::test_claude_agent_class_constants_match_expected_locations</code></li>
+</ul>
+
+<!-- ---------------- agents/codex.py ---------------- -->
+<div class="module-header">
+  <h3 id="agents-codex"><code>agents/codex.py</code></h3>
+  <span class="path">client/src/burnscope_client/agents/codex.py</span>
+</div>
+
+<h4>Purpose</h4>
+<p>
+  Probes ChatGPT Codex's rate-limit headers. Mirrors
+  <a href="./probe-codex.sh"><code>docs/probe-codex.sh</code></a>.
+</p>
+
+<h4>Public surface</h4>
+<table class="surface">
+  <thead><tr><th>Name</th><th>Kind</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>CodexCredential</td><td>frozen dataclass(Credential)</td>
+        <td>Fields: <code>access_token: str</code>,
+            <code>account_id: str | None = None</code>. Class method
+            <code>load(credentials_path)</code>.</td></tr>
+    <tr><td>CodexAgent</td><td>Agent subclass</td>
+        <td><code>name = "codex"</code>. Class attribute
+            <code>CREDENTIALS_PATH</code>.</td></tr>
+    <tr><td>API_URL</td><td>module const</td>
+        <td><code>https://chatgpt.com/backend-api/codex/responses</code></td></tr>
+  </tbody>
+</table>
+
+<h4>Behaviour</h4>
+
+<p><strong>Credential location.</strong>
+   <code>~/.codex/auth.json</code> (declared as
+   <code>CodexAgent.CREDENTIALS_PATH</code>).
+   <code>tokens.access_token</code> is required;
+   <code>tokens.account_id</code> is optional.</p>
+
+<p><strong>Probe.</strong> Streaming
+   <code>POST https://chatgpt.com/backend-api/codex/responses</code>.
+   The body is an SSE event stream that we deliberately never
+   consume — we open the stream, read response headers, and exit the
+   <code>async with</code> context, which closes it. This keeps the
+   probe cheap and bypasses needing to parse SSE.</p>
+
+<p><strong>Required headers:</strong>
+   <code>Authorization: Bearer &lt;token&gt;</code>,
+   <code>Content-Type: application/json</code>,
+   <code>OpenAI-Beta: responses=experimental</code>,
+   and <code>ChatGPT-Account-ID: &lt;account_id&gt;</code>
+   <em>only</em> if <code>account_id</code> is set on the credential.
+   Timeout: <code>10s</code>.</p>
+
+<p><strong>Header parsing.</strong> Reads
+   <code>x-codex-{primary,secondary}-{used-percent,reset-at}</code>.
+   <code>used-percent</code> is an integer <code>0</code>–<code>100</code>
+   and is divided by <code>100.0</code> to fit the wire format's
+   <code>0.0</code>–<code>1.0</code> contract. <code>reset-at</code>
+   is unix-seconds. Missing pairs are skipped; an empty result raises
+   <code>ProbeError</code>.</p>
+
+<h4>Inputs / outputs</h4>
+<table>
+  <tbody>
+    <tr><td><strong>Input</strong></td>
+        <td><code>CodexCredential</code> (constructor), then an
+            <code>httpx.AsyncClient</code> per <code>probe()</code> call.</td></tr>
+    <tr><td><strong>Output</strong></td>
+        <td><code>AgentSnapshot(agent="codex", captured_at=int(time.time()),
+            sessions=[SessionSnapshot("primary", …), SessionSnapshot("secondary", …)])</code></td></tr>
+  </tbody>
+</table>
+
+<h4>Error handling</h4>
+<table class="errors">
+  <thead><tr><th>Raises</th><th>When</th></tr></thead>
+  <tbody>
+    <tr><td>ProbeError</td><td>Any <code>httpx.HTTPError</code> during the streamed POST.</td></tr>
+    <tr><td>ProbeError</td><td>Response status &ge; 400 (drained body included up to 200 bytes).</td></tr>
+    <tr><td>ProbeError</td><td>Neither <code>primary</code> nor <code>secondary</code> pair present.</td></tr>
+    <tr><td>ProbeError</td><td>Malformed <code>used-percent</code> (not float-parseable) or
+        non-integer <code>reset-at</code>.</td></tr>
+    <tr><td>CredentialsError</td><td>From <code>CodexCredential.load()</code>: file not found,
+        malformed JSON, missing <code>tokens.access_token</code>.</td></tr>
+  </tbody>
+</table>
+
+<h4>Tests</h4>
+<ul class="tests">
+  <li><code>test_codex_agent.py::test_probe_builds_snapshot_with_percent_divided_by_100</code></li>
+  <li><code>test_codex_agent.py::test_probe_omits_account_header_when_no_account_id</code></li>
+  <li><code>test_codex_agent.py::test_probe_partial_headers_returns_only_present_sessions</code></li>
+  <li><code>test_codex_agent.py::test_probe_no_rate_limit_headers_raises</code></li>
+  <li><code>test_codex_agent.py::test_probe_malformed_percent_raises</code></li>
+  <li><code>test_codex_agent.py::test_probe_malformed_reset_raises</code></li>
+  <li><code>test_codex_agent.py::test_probe_http_error_raises</code></li>
+  <li><code>test_codex_agent.py::test_codex_agent_name</code></li>
+  <li><code>test_credentials.py::test_codex_credential_load_with_account_id</code></li>
+  <li><code>test_credentials.py::test_codex_credential_load_without_account_id</code></li>
+  <li><code>test_credentials.py::test_codex_credential_missing_file_raises</code></li>
+  <li><code>test_credentials.py::test_codex_credential_missing_access_token_raises</code></li>
+  <li><code>test_credentials.py::test_codex_credential_malformed_json_raises</code></li>
+  <li><code>test_credentials.py::test_codex_agent_class_constants_match_expected_location</code></li>
+</ul>
+
+<!-- ---------------- watcher.py ---------------- -->
+<div class="module-header">
+  <h3 id="watcher"><code>watcher.py</code></h3>
+  <span class="path">client/src/burnscope_client/watcher.py</span>
+</div>
+
+<h4>Purpose</h4>
+<p>
+  Tails <code>~/.claude/projects/**/*.jsonl</code> as a binary signal
+  ("did anything happen recently?") used by the daemon to switch between
+  the active and idle probe cadences.
+</p>
+
+<h4>Public surface</h4>
+<table class="surface">
+  <thead><tr><th>Name</th><th>Kind</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>JsonlActivityWatcher(root, poll_interval=1.0)</td><td>class</td>
+        <td>Wraps <code>watchdog.PollingObserver</code>.</td></tr>
+    <tr><td>watcher.last_change_ts</td><td>property</td>
+        <td><code>float | None</code> — wall-clock unix seconds of the
+            most recent <code>*.jsonl</code> create / modify / move beneath
+            <code>root</code>, or <code>None</code> if nothing yet.</td></tr>
+    <tr><td>watcher.start() / watcher.stop()</td><td>method</td>
+        <td>Idempotent. <code>start()</code> also creates
+            <code>root</code> if missing.</td></tr>
+  </tbody>
+</table>
+
+<h4>Behaviour</h4>
+<p>
+  Uses <code>PollingObserver</code> (not the native one) for cross-platform
+  determinism, especially under CI. Only <code>*.jsonl</code> file events
+  count; directories and other extensions are ignored. The internal
+  <code>_last_change_ts</code> is guarded by a <code>threading.Lock</code>
+  because the observer runs in its own thread.
+</p>
+
+<h4>Error handling</h4>
+<p>
+  No exceptions are raised from observer callbacks (watchdog suppresses
+  them); pathological errors are logged by watchdog and the
+  <code>last_change_ts</code> simply doesn't update.
+</p>
+
+<h4>Tests</h4>
+<ul class="tests">
+  <li><code>test_watcher.py::test_initial_last_change_is_none</code></li>
+  <li><code>test_watcher.py::test_jsonl_modification_updates_last_change</code></li>
+  <li><code>test_watcher.py::test_non_jsonl_files_are_ignored</code></li>
+  <li><code>test_watcher.py::test_nested_jsonl_modifications_detected</code></li>
+  <li><code>test_watcher.py::test_stop_is_idempotent</code></li>
+</ul>
+
+<!-- ---------------- discovery.py ---------------- -->
+<div class="module-header">
+  <h3 id="discovery"><code>discovery.py</code></h3>
+  <span class="path">client/src/burnscope_client/discovery.py</span>
+</div>
+
+<h4>Purpose</h4>
+<p>
+  Locates a BurnScope ESP32 on the LAN via mDNS, or parses a
+  user-supplied override.
+</p>
+
+<h4>Public surface</h4>
+<table class="surface">
+  <thead><tr><th>Name</th><th>Kind</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>SERVICE_TYPE</td><td>const</td>
+        <td><code>"_burnscope._tcp.local."</code></td></tr>
+    <tr><td>discover_esp32(timeout=10.0, *, zc=None)</td><td>async fn</td>
+        <td>Browses for <code>SERVICE_TYPE</code>; returns
+            <code>"host:port"</code> on first hit, <code>None</code> on
+            timeout. <code>zc</code> is injectable for tests.</td></tr>
+    <tr><td>parse_host_override(value, default_port=80)</td><td>fn</td>
+        <td>Normalises a CLI override into <code>"host:port"</code>; adds
+            the default port if missing.</td></tr>
+  </tbody>
+</table>
+
+<h4>Behaviour</h4>
+<p>
+  Uses <code>zeroconf.asyncio.AsyncServiceBrowser</code>. On the first
+  <code>Added</code> event we resolve the service info, take the first
+  IPv4 address, and complete an internal <code>Future</code>. Resolution
+  failures (no IPv4, missing port) are quietly ignored — the browser
+  keeps running and we wait for the next event until the timeout fires.
+  The browser and zeroconf instance are cleanly cancelled / closed in
+  the <code>finally</code> block.
+</p>
+
+<h4>Error handling</h4>
+<table class="errors">
+  <thead><tr><th>Returns / raises</th><th>When</th></tr></thead>
+  <tbody>
+    <tr><td>returns <code>None</code></td>
+        <td>Timeout elapsed with no usable service.</td></tr>
+    <tr><td>returns <code>"host:port"</code></td>
+        <td>First service resolved to a valid IPv4 + port.</td></tr>
+  </tbody>
+</table>
+
+<h4>Tests</h4>
+<ul class="tests">
+  <li><code>test_discovery.py::test_parse_host_override_adds_default_port</code></li>
+  <li><code>test_discovery.py::test_parse_host_override_preserves_explicit_port</code></li>
+  <li><code>test_discovery.py::test_discover_returns_none_on_timeout</code></li>
+  <li><code>test_discovery.py::test_discover_finds_advertised_service</code> (registers a
+      real <code>_burnscope._tcp.local.</code> advertiser on <code>127.0.0.1</code>
+      and asserts the browser finds it)</li>
+</ul>
+
+<!-- ---------------- pusher.py ---------------- -->
+<div class="module-header">
+  <h3 id="pusher"><code>pusher.py</code></h3>
+  <span class="path">client/src/burnscope_client/pusher.py</span>
+</div>
+
+<h4>Purpose</h4>
+<p>
+  Posts a single <code>AgentSnapshot</code> as JSON to the ESP32's
+  <code>POST /summary</code> endpoint.
+</p>
+
+<h4>Public surface</h4>
+<table class="surface">
+  <thead><tr><th>Name</th><th>Kind</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>PushError</td><td>exception</td>
+        <td>Raised on transport failure or non-2xx response.</td></tr>
+    <tr><td>push(snapshot, host, client)</td><td>async fn</td>
+        <td>POSTs <code>snapshot.to_dict()</code> as JSON to
+            <code>http://{host}/summary</code>. Expects 2xx.</td></tr>
+  </tbody>
+</table>
+
+<h4>Behaviour</h4>
+<p>
+  <code>host</code> may be <code>"hostname"</code> or
+  <code>"hostname:port"</code>; both are accepted because
+  <code>parse_host_override</code> upstream normalises CLI overrides and
+  <code>discover_esp32</code> always returns <code>"host:port"</code>.
+  Timeout: <code>5s</code>. No retries — the daemon's loop calls
+  <code>push()</code> again on the next tick.
+</p>
+
+<h4>Error handling</h4>
+<table class="errors">
+  <thead><tr><th>Raises</th><th>When</th></tr></thead>
+  <tbody>
+    <tr><td>PushError</td><td>Any <code>httpx.HTTPError</code> (DNS, connect, timeout).</td></tr>
+    <tr><td>PushError</td><td>Response status &ge; 300.</td></tr>
+  </tbody>
+</table>
+
+<h4>Tests</h4>
+<ul class="tests">
+  <li><code>test_pusher.py::test_push_posts_snapshot_as_json</code></li>
+  <li><code>test_pusher.py::test_push_assumes_port_80_when_missing</code></li>
+  <li><code>test_pusher.py::test_push_non_2xx_raises_push_error</code></li>
+  <li><code>test_pusher.py::test_push_network_error_raises_push_error</code></li>
+</ul>
+
+<!-- ---------------- daemon.py ---------------- -->
+<div class="module-header">
+  <h3 id="daemon"><code>daemon.py</code></h3>
+  <span class="path">client/src/burnscope_client/daemon.py</span>
+</div>
+
+<h4>Purpose</h4>
+<p>
+  Orchestrates probe scheduling, mDNS discovery, JSONL activity sensing,
+  and push delivery for one or more agents inside a single asyncio loop.
+</p>
+
+<h4>Public surface</h4>
+<table class="surface">
+  <thead><tr><th>Name</th><th>Kind</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>DaemonConfig</td><td>dataclass</td>
+        <td><code>agents: list[Agent]</code>,
+            <code>esp32_host: str | None</code>,
+            <code>claude_projects_dir: Path</code>,
+            cadence knobs (<code>active_interval</code>,
+            <code>idle_interval</code>, <code>active_window</code>,
+            <code>tick</code>, <code>discovery_timeout</code>,
+            <code>watcher_poll_interval</code>).</td></tr>
+    <tr><td>DiscoverFn</td><td>type alias</td>
+        <td><code>Callable[[], Awaitable[str | None]]</code> — injection
+            point for tests.</td></tr>
+    <tr><td>run(config, *, stop_event=None, discover_fn=None)</td><td>async fn</td>
+        <td>Main loop. Returns when <code>stop_event</code> is set.</td></tr>
+  </tbody>
+</table>
+
+<h4>Behaviour</h4>
+
+<p><strong>Cadence.</strong>
+   <code>_current_interval</code> picks <code>active_interval</code> if
+   <code>now - watcher.last_change_ts &lt; active_window</code>, else
+   <code>idle_interval</code>. The loop wakes every <code>tick</code>
+   seconds (or earlier if <code>stop_event</code> fires).</p>
+
+<p><strong>Probing.</strong> For each agent, if
+   <code>now - last_probe_ts &ge; interval</code>, await
+   <code>agent.probe(http)</code>. On success, cache the snapshot. On
+   any exception, log a warning and back off by setting
+   <code>last_probe_ts = now - interval + tick</code> so the next attempt
+   is one tick away — a failing agent doesn't burn the loop. Failures
+   are isolated per agent.</p>
+
+<p><strong>Discovery.</strong> If <code>cached_host is None</code> and
+   <em>any</em> agent has a snapshot to push, call
+   <code>discover_fn()</code>. <code>config.esp32_host</code> (when set)
+   is treated as a permanent cache — never invalidated on push failure.
+   An mDNS-discovered host is dropped (and rediscovered next tick) only
+   when <em>every</em> agent's most recent push attempt failed.</p>
+
+<p><strong>Pushing.</strong> One push per agent per cycle. Per-agent
+   <code>last_push_failed</code> is reset on success / set on failure.
+   No retries within a cycle — the loop's natural cadence retries.</p>
+
+<p><strong>Validation.</strong> An empty <code>agents</code> list raises
+   <code>ValueError</code>. The CLI is responsible for never passing
+   one.</p>
+
+<h4>Inputs / outputs</h4>
+<table>
+  <tbody>
+    <tr><td><strong>Input</strong></td>
+        <td><code>DaemonConfig</code>, an optional
+            <code>asyncio.Event</code> for shutdown, an optional
+            <code>discover_fn</code>.</td></tr>
+    <tr><td><strong>Output</strong></td>
+        <td>Side-effecting HTTP POSTs via <code>pusher.push</code>; log
+            output via <code>logging</code>. Returns <code>None</code>.</td></tr>
+  </tbody>
+</table>
+
+<h4>Error handling</h4>
+<table class="errors">
+  <thead><tr><th>Raises / handles</th><th>When</th></tr></thead>
+  <tbody>
+    <tr><td>raises <code>ValueError</code></td>
+        <td><code>config.agents</code> is empty.</td></tr>
+    <tr><td>swallows all probe exceptions</td>
+        <td>Logged at WARNING; agent backs off one tick.</td></tr>
+    <tr><td>swallows all push exceptions</td>
+        <td>Logged at WARNING; mDNS host invalidated only if every push failed.</td></tr>
+    <tr><td>swallows mDNS discovery exceptions</td>
+        <td><code>discover_fn</code> failure means
+            <code>cached_host</code> stays <code>None</code>; retried next tick.</td></tr>
+  </tbody>
+</table>
+
+<h4>Tests</h4>
+<ul class="tests">
+  <li><code>test_daemon_integration.py::test_daemon_probes_and_pushes_to_fake_esp</code>
+      — single-agent happy path.</li>
+  <li><code>test_daemon_integration.py::test_daemon_uses_active_interval_after_jsonl_change</code>
+      — activity-driven cadence switch.</li>
+  <li><code>test_daemon_integration.py::test_daemon_pushes_one_snapshot_per_agent</code>
+      — two agents push independently to the same ESP32.</li>
+  <li><code>test_daemon_integration.py::test_daemon_isolates_probe_failures</code>
+      — failing agent never pushes; healthy agent still does.</li>
+</ul>
+
+<!-- ---------------- cli.py ---------------- -->
+<div class="module-header">
+  <h3 id="cli"><code>cli.py</code></h3>
+  <span class="path">client/src/burnscope_client/cli.py</span>
+</div>
+
+<h4>Purpose</h4>
+<p>
+  Command-line entry point. Parses flags, builds the list of agents
+  (either from <code>--agent</code> or by auto-detect), wires signal
+  handlers, and runs the daemon loop.
+</p>
+
+<h4>Public surface</h4>
+<table class="surface">
+  <thead><tr><th>Name</th><th>Kind</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>main(argv=None)</td><td>fn</td>
+        <td>argparse + asyncio entry. Returns an exit code.</td></tr>
+    <tr><td>build_parser()</td><td>fn</td>
+        <td>Constructs the <code>argparse.ArgumentParser</code>.</td></tr>
+    <tr><td>_AGENT_CLASSES</td><td>module dict</td>
+        <td>Maps <code>name → Agent</code> subclass. The registration
+            point for new agents.</td></tr>
+  </tbody>
+</table>
+
+<h4>Behaviour</h4>
+
+<p><strong>Flags.</strong>
+   <code>--agent {claude,codex}</code> (repeatable),
+   <code>--esp32-host</code>, <code>--active-interval</code>,
+   <code>--idle-interval</code>, <code>--active-window</code>,
+   <code>--claude-projects-dir</code>, <code>--log-level</code>.</p>
+
+<p><strong>Agent build.</strong>
+   <em>With</em> <code>--agent</code>: every named agent must have
+   credentials; missing credentials raise <code>SystemExit(1)</code>
+   with a clear message.
+   <em>Without</em> <code>--agent</code>: every class in
+   <code>_AGENT_CLASSES</code> whose <code>try_create()</code> returns
+   non-<code>None</code> is included. If none load, exit with a
+   "log into Claude Code or the Codex CLI first" message.</p>
+
+<p><strong>Signals.</strong> SIGINT / SIGTERM set the
+   <code>asyncio.Event</code> that ends the loop cleanly. On Windows
+   the signal handler registration is best-effort.</p>
+
+<h4>Inputs / outputs</h4>
+<table>
+  <tbody>
+    <tr><td><strong>Input</strong></td>
+        <td><code>argv</code> (or <code>sys.argv</code>), the local
+            file system / keychain via agent classes.</td></tr>
+    <tr><td><strong>Output</strong></td>
+        <td>Exit code (<code>0</code> success, <code>1</code> error message
+            on stderr). Side effects: log output and HTTP traffic via the
+            daemon.</td></tr>
+  </tbody>
+</table>
+
+<h4>Error handling</h4>
+<table class="errors">
+  <thead><tr><th>Returns / raises</th><th>When</th></tr></thead>
+  <tbody>
+    <tr><td>exit 1 + stderr message</td>
+        <td>No agent credentials available, or a named agent's credentials
+            are missing.</td></tr>
+    <tr><td>argparse exit 2</td>
+        <td>Unrecognised flag or invalid value.</td></tr>
+  </tbody>
+</table>
+
+<h4>Tests</h4>
+<ul class="tests">
+  <li><em>No direct CLI tests yet.</em> Smoke-checked manually via
+      <code>python -m burnscope_client.cli --help</code>; the daemon and
+      agent layers underneath are exercised by their respective tests.</li>
+</ul>
+
+<!-- =============================================================== -->
+<h2 id="lifecycle">5. Per-cycle lifecycle</h2>
+
+<p>
+  One full iteration of the daemon's outer loop. <code>http</code> is the
+  shared <code>httpx.AsyncClient</code>.
+</p>
+
+<div class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant CLI as cli.py
+  participant Daemon as daemon.run()
+  participant Watcher as JsonlActivityWatcher
+  participant Agent as Agent.probe()
+  participant Upstream as Anthropic / ChatGPT
+  participant Discovery as discover_esp32()
+  participant Pusher as pusher.push()
+  participant ESP32 as ESP32 /summary
+
+  CLI->>Daemon: run(config, stop_event)
+  Daemon->>Watcher: start()
+  loop while not stop_event.is_set()
+    Daemon->>Watcher: last_change_ts
+    Daemon->>Daemon: pick interval (active/idle)
+    par per agent
+      alt now - last_probe_ts ≥ interval
+        Daemon->>Agent: await probe(http)
+        Agent->>Upstream: POST (single token / streaming)
+        Upstream-->>Agent: rate-limit headers
+        Agent-->>Daemon: AgentSnapshot
+      else not yet due
+        Daemon-->>Daemon: skip
+      end
+    end
+    opt no cached_host AND any snapshot
+      Daemon->>Discovery: discover_esp32()
+      Discovery-->>Daemon: "host:port" or None
+    end
+    opt cached_host known
+      loop per agent with snapshot
+        Daemon->>Pusher: push(snapshot, host, http)
+        Pusher->>ESP32: POST /summary
+        ESP32-->>Pusher: 204
+      end
+    end
+    Daemon->>Daemon: await stop_event.wait(timeout=tick)
+  end
+  Daemon->>Watcher: stop()
+</pre>
+</div>
+
+<!-- =============================================================== -->
+<h2 id="test-matrix">6. Test matrix</h2>
+
+<p>
+  48 tests, all passing in CI on Python 3.11+. Test framework:
+  <code>pytest</code> with <code>pytest-asyncio</code> in auto mode and
+  <code>respx</code> for HTTP mocking. mDNS discovery uses a real
+  loopback zeroconf advertiser to avoid stubbing the protocol.
+</p>
+
+<table>
+  <thead>
+    <tr><th>Module</th><th>File</th><th>Tests</th><th>Focus</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>schema.py</code></td>
+        <td>(within <code>test_claude_agent.py</code>)</td>
+        <td>3</td>
+        <td>Dataclass shape and <code>to_dict()</code> wire-format conformance.</td></tr>
+    <tr><td><code>agent.py</code> /
+            <code>credentials.py</code> /
+            <code>agents/claude.py</code></td>
+        <td><code>test_claude_agent.py</code> +
+            <code>test_credentials.py</code> (Claude block)</td>
+        <td>9 + 8</td>
+        <td>Header parsing, scale (no-op for Claude), partial-headers,
+            transport errors, every credential failure mode (keychain,
+            file, JSON, missing field).</td></tr>
+    <tr><td><code>agents/codex.py</code></td>
+        <td><code>test_codex_agent.py</code> +
+            <code>test_credentials.py</code> (Codex block)</td>
+        <td>8 + 6</td>
+        <td>÷100 scaling, optional <code>account_id</code> header,
+            streaming response handling, partial-headers, every
+            credential failure mode.</td></tr>
+    <tr><td><code>watcher.py</code></td>
+        <td><code>test_watcher.py</code></td>
+        <td>5</td>
+        <td>Initial state, modification detection, non-jsonl filtering,
+            recursive descent, idempotent stop.</td></tr>
+    <tr><td><code>discovery.py</code></td>
+        <td><code>test_discovery.py</code></td>
+        <td>4</td>
+        <td><code>parse_host_override</code> normalisation, timeout return,
+            real-loopback service discovery.</td></tr>
+    <tr><td><code>pusher.py</code></td>
+        <td><code>test_pusher.py</code></td>
+        <td>4</td>
+        <td>JSON body shape, default port behaviour, non-2xx and network
+            error mapping to <code>PushError</code>.</td></tr>
+    <tr><td><code>daemon.py</code></td>
+        <td><code>test_daemon_integration.py</code></td>
+        <td>4</td>
+        <td>End-to-end probe→push, active-cadence switch, multi-agent
+            isolation, failing-agent isolation. Uses a real local HTTP
+            server + real JSONL watcher; only the probe is stubbed via
+            a <code>_StubAgent</code> subclass.</td></tr>
+    <tr><td><code>cli.py</code></td>
+        <td>—</td>
+        <td>0</td>
+        <td>Not directly tested. Auto-detect and flag-parsing are
+            small enough that the integration tests on
+            <code>daemon.run</code> + manual smoke-testing
+            (<code>python -m burnscope_client.cli --help</code>)
+            cover practical regressions. A future addition would
+            assert exit codes for missing credentials.</td></tr>
+  </tbody>
+</table>
+
+<hr>
+
+<p class="small">
+  Generated alongside the multi-agent refactor that introduced the
+  <code>Agent</code> and <code>Credential</code> abstract base classes.
+  Update this document whenever a new agent module is added or the
+  wire format changes.
+</p>
+
+</body>
+</html>

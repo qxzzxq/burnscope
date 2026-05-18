@@ -1,6 +1,7 @@
 """Integration: run the daemon against a real local HTTP server and a real
-JSONL watcher. The Anthropic probe is stubbed (we never hit the network) but
-the discovery / push / file-watch wiring is exercised end-to-end.
+JSONL watcher. Upstream probes are stubbed via fake `Agent` subclasses
+(we never hit the network) but the discovery / push / file-watch wiring
+is exercised end-to-end.
 """
 
 from __future__ import annotations
@@ -12,10 +13,30 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
 
+import httpx
 import pytest
 
-from burnscope_client.claude import AgentSnapshot, SessionSnapshot
+from burnscope_client.agent import Agent
 from burnscope_client.daemon import DaemonConfig, run
+from burnscope_client.schema import AgentSnapshot, SessionSnapshot
+
+
+class _StubAgent(Agent):
+    """Returns a fixed snapshot and records each probe call's wall-clock."""
+
+    def __init__(self, name: str, snapshot: AgentSnapshot) -> None:
+        # `name` is a class attribute on real agents; tests need it per-instance.
+        self.name = name  # type: ignore[misc]
+        self._snapshot = snapshot
+        self.calls: list[float] = []
+
+    async def probe(self, client: httpx.AsyncClient) -> AgentSnapshot:
+        self.calls.append(asyncio.get_running_loop().time())
+        return self._snapshot
+
+    @classmethod
+    def load_credential(cls):  # pragma: no cover - never called in tests
+        return None
 
 
 class _Receiver:
@@ -75,12 +96,10 @@ async def test_daemon_probes_and_pushes_to_fake_esp(tmp_path: Path, fake_esp):
             SessionSnapshot("7d", 0.09, 1779156000),
         ],
     )
-
-    async def fake_probe(token, client):
-        return expected
+    agent = _StubAgent("claude", expected)
 
     config = DaemonConfig(
-        token="dummy",
+        agents=[agent],
         esp32_host=host,
         claude_projects_dir=tmp_path,
         active_interval=0.05,
@@ -89,9 +108,8 @@ async def test_daemon_probes_and_pushes_to_fake_esp(tmp_path: Path, fake_esp):
         tick=0.05,
     )
     stop = asyncio.Event()
-    task = asyncio.create_task(run(config, stop_event=stop, probe_fn=fake_probe))
+    task = asyncio.create_task(run(config, stop_event=stop))
 
-    # Wait until the receiver has at least one body.
     for _ in range(60):
         if receiver.bodies:
             break
@@ -112,14 +130,10 @@ async def test_daemon_uses_active_interval_after_jsonl_change(tmp_path: Path, fa
         captured_at=1,
         sessions=[SessionSnapshot("5h", 0.0, 1)],
     )
-    probe_calls: list[float] = []
-
-    async def fake_probe(token, client):
-        probe_calls.append(asyncio.get_running_loop().time())
-        return snapshot
+    agent = _StubAgent("claude", snapshot)
 
     config = DaemonConfig(
-        token="t",
+        agents=[agent],
         esp32_host=host,
         claude_projects_dir=tmp_path,
         active_interval=0.1,
@@ -129,7 +143,7 @@ async def test_daemon_uses_active_interval_after_jsonl_change(tmp_path: Path, fa
         watcher_poll_interval=0.05,
     )
     stop = asyncio.Event()
-    task = asyncio.create_task(run(config, stop_event=stop, probe_fn=fake_probe))
+    task = asyncio.create_task(run(config, stop_event=stop))
 
     # Touch a jsonl to switch the daemon into active mode.
     await asyncio.sleep(0.1)
@@ -141,4 +155,95 @@ async def test_daemon_uses_active_interval_after_jsonl_change(tmp_path: Path, fa
     stop.set()
     await asyncio.wait_for(task, timeout=2)
 
-    assert len(probe_calls) >= 3, f"expected active cadence, got {probe_calls}"
+    assert len(agent.calls) >= 3, f"expected active cadence, got {agent.calls}"
+
+
+async def test_daemon_pushes_one_snapshot_per_agent(tmp_path: Path, fake_esp):
+    receiver, host = fake_esp
+
+    claude_snap = AgentSnapshot(
+        agent="claude",
+        captured_at=1,
+        sessions=[SessionSnapshot("5h", 0.1, 100)],
+    )
+    codex_snap = AgentSnapshot(
+        agent="codex",
+        captured_at=1,
+        sessions=[SessionSnapshot("primary", 0.2, 200)],
+    )
+
+    config = DaemonConfig(
+        agents=[
+            _StubAgent("claude", claude_snap),
+            _StubAgent("codex", codex_snap),
+        ],
+        esp32_host=host,
+        claude_projects_dir=tmp_path,
+        active_interval=0.05,
+        idle_interval=0.05,
+        active_window=10,
+        tick=0.05,
+    )
+    stop = asyncio.Event()
+    task = asyncio.create_task(run(config, stop_event=stop))
+
+    # Wait for at least one push from each agent.
+    agents_seen: set[str] = set()
+    for _ in range(80):
+        agents_seen = {b["agent"] for b in receiver.bodies}
+        if {"claude", "codex"}.issubset(agents_seen):
+            break
+        await asyncio.sleep(0.05)
+
+    stop.set()
+    await asyncio.wait_for(task, timeout=2)
+
+    assert {"claude", "codex"}.issubset(agents_seen), (
+        f"daemon never pushed both agents; saw {agents_seen}"
+    )
+
+
+async def test_daemon_isolates_probe_failures(tmp_path: Path, fake_esp):
+    receiver, host = fake_esp
+
+    class _FailingAgent(Agent):
+        name = "claude"
+
+        def __init__(self) -> None:
+            pass
+
+        async def probe(self, client: httpx.AsyncClient) -> AgentSnapshot:
+            raise RuntimeError("boom")
+
+        @classmethod
+        def load_credential(cls):  # pragma: no cover
+            return None
+
+    good_snap = AgentSnapshot(
+        agent="codex",
+        captured_at=1,
+        sessions=[SessionSnapshot("primary", 0.5, 999)],
+    )
+
+    config = DaemonConfig(
+        agents=[_FailingAgent(), _StubAgent("codex", good_snap)],
+        esp32_host=host,
+        claude_projects_dir=tmp_path,
+        active_interval=0.05,
+        idle_interval=0.05,
+        active_window=10,
+        tick=0.05,
+    )
+    stop = asyncio.Event()
+    task = asyncio.create_task(run(config, stop_event=stop))
+
+    for _ in range(60):
+        if any(b["agent"] == "codex" for b in receiver.bodies):
+            break
+        await asyncio.sleep(0.05)
+
+    stop.set()
+    await asyncio.wait_for(task, timeout=2)
+
+    pushed = {b["agent"] for b in receiver.bodies}
+    assert pushed == {"codex"}, f"failing agent should not push; got {pushed}"

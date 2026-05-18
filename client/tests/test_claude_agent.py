@@ -4,15 +4,16 @@ import httpx
 import pytest
 import respx
 
-from burnscope_client.claude import (
-    AgentSnapshot,
-    ProbeError,
-    SessionSnapshot,
-    probe,
-)
+from burnscope_client.agent import ProbeError
+from burnscope_client.agents.claude import ClaudeAgent, ClaudeCredential
+from burnscope_client.schema import AgentSnapshot, SessionSnapshot
 
 
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+
+
+def _agent(token: str = "test-token") -> ClaudeAgent:
+    return ClaudeAgent(ClaudeCredential(access_token=token))
 
 
 def _mock_response(headers: dict[str, str]) -> httpx.Response:
@@ -34,7 +35,7 @@ async def test_probe_builds_snapshot_from_headers():
     route = respx.post(ANTHROPIC_URL).mock(return_value=_mock_response(headers))
 
     async with httpx.AsyncClient() as client:
-        snap = await probe("test-token", client)
+        snap = await _agent().probe(client)
 
     assert route.called
     sent = route.calls[0].request
@@ -66,7 +67,7 @@ async def test_probe_to_dict_matches_wire_format():
     respx.post(ANTHROPIC_URL).mock(return_value=_mock_response(headers))
 
     async with httpx.AsyncClient() as client:
-        snap = await probe("t", client)
+        snap = await _agent("t").probe(client)
 
     payload = snap.to_dict()
     assert payload["agent"] == "claude"
@@ -87,7 +88,7 @@ async def test_probe_partial_headers_returns_only_present_sessions():
     respx.post(ANTHROPIC_URL).mock(return_value=_mock_response(headers))
 
     async with httpx.AsyncClient() as client:
-        snap = await probe("t", client)
+        snap = await _agent("t").probe(client)
 
     types = [s.type for s in snap.sessions]
     assert types == ["5h"]
@@ -99,7 +100,7 @@ async def test_probe_no_rate_limit_headers_raises():
 
     async with httpx.AsyncClient() as client:
         with pytest.raises(ProbeError):
-            await probe("t", client)
+            await _agent("t").probe(client)
 
 
 @respx.mock
@@ -112,7 +113,7 @@ async def test_probe_malformed_utilization_raises():
 
     async with httpx.AsyncClient() as client:
         with pytest.raises(ProbeError):
-            await probe("t", client)
+            await _agent("t").probe(client)
 
 
 @respx.mock
@@ -120,7 +121,7 @@ async def test_probe_http_error_raises():
     respx.post(ANTHROPIC_URL).mock(return_value=httpx.Response(500, json={}))
     async with httpx.AsyncClient() as client:
         with pytest.raises(ProbeError):
-            await probe("t", client)
+            await _agent("t").probe(client)
 
 
 def test_session_snapshot_dataclass_fields():
@@ -138,3 +139,7 @@ def test_agent_snapshot_dataclass_fields():
     )
     assert snap.agent == "claude"
     assert snap.sessions[0].type == "5h"
+
+
+def test_claude_agent_name():
+    assert ClaudeAgent.name == "claude"

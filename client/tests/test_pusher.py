@@ -2,7 +2,7 @@ import httpx
 import pytest
 import respx
 
-from burnscope_client.claude import AgentSnapshot, SessionSnapshot
+from burnscope_client.schema import AgentSnapshot, SessionSnapshot
 from burnscope_client.pusher import PushError, push
 
 

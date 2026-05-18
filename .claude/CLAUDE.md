@@ -5,7 +5,7 @@ An always-on token & quota meter for your AI coding agents.
 This repo has two components:
 
 - `client/` — Python 3.11+ daemon that probes each supported agent and pushes snapshots to the ESP32.
-- `firmware/` — ESP32 firmware (PlatformIO, Cheap Yellow Display).
+- `firmware/` — ESP32 firmware (ESP-IDF, Cheap Yellow Display).
 
 The wire format (`docs/wire-format.md`) is the daemon ↔ firmware contract — agent-agnostic, hand-mirrored in both languages.
 

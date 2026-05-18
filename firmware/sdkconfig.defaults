@@ -1,0 +1,13 @@
+# Cheap Yellow Display = ESP32-WROOM-32, 4 MB flash.
+CONFIG_IDF_TARGET="esp32"
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions-4mb.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions-4mb.csv"
+
+# LVGL has plenty of room to grow; bump main task stack.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# LVGL color depth + a larger font for the hello-world label.
+CONFIG_LV_COLOR_DEPTH_16=y
+CONFIG_LV_FONT_MONTSERRAT_24=y

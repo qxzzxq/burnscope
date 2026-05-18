@@ -11,29 +11,30 @@ to match. Examples live alongside as `examples/event.json` and
 
 ## Types
 
-### `WindowSnapshot`
+### `SessionSnapshot`
 
-One rolling-quota window at one point in time.
+One rate-limit session (rolling-quota window) at one point in time.
 
 | Field       | Type    | Range / format     | Description |
 |-------------|---------|--------------------|-------------|
-| `used_pct`  | float   | `0.0` – `1.0`      | Fraction of the window used. `0.03` = 3%. |
-| `resets_at` | integer | unix seconds (UTC) | When the window rolls over. Clients compute the countdown locally against their own (NTP-synced) clock. |
+| `type`      | string  | agent-defined      | Label for this session, in the upstream agent's own vocabulary. See the per-agent vocabulary table below. |
+| `used_pct`  | float   | `0.0` – `1.0`      | Fraction of the session used. `0.03` = 3%. |
+| `resets_at` | integer | unix seconds (UTC) | When the session rolls over. Clients compute the countdown locally against their own (NTP-synced) clock. |
 
 ### `AgentSnapshot`
 
-Both windows for one agent at one point in time.
+All sessions reported by one agent at one point in time.
 
 | Field         | Type             | Description |
 |---------------|------------------|-------------|
 | `agent`       | string enum      | One of `"claude"`, `"codex"`. |
 | `captured_at` | integer (unix s) | When the daemon read the headers from the upstream API. |
-| `window_primary`   | `WindowSnapshot` | The shorter rolling window (5h for both currently-supported agents). |
-| `window_secondary` | `WindowSnapshot` | The longer rolling window (7d for both currently-supported agents). |
+| `sessions`    | array of `SessionSnapshot` | One or more session entries. Order is not guaranteed; clients look up by `type`. |
 
-Field names are agent-agnostic so a future agent with different window sizes
-can map onto the same schema without a rename. The current window sizes (5h /
-7d) are documented in the header-mapping table below.
+Each agent uses its own vocabulary for `type` (Claude reports `5h`/`7d`;
+Codex reports `primary`/`secondary`); the daemon passes those labels through
+untouched. Clients should render any `type` they receive — including ones
+they don't recognise — using the raw string as the label.
 
 ---
 
@@ -51,7 +52,7 @@ MVP. No auth (LAN trust).
 
 ---
 
-## `GET /api/summary/window`
+## `GET /api/summary/session`
 
 ESP32 (or web client) → server. Returns the latest snapshot the server has
 received for every agent.
@@ -67,17 +68,17 @@ Clients must handle an empty `agents` array (nothing has reported yet).
 
 ---
 
-## Header → field mapping
+## Header → session mapping
 
 For collector implementers. Source of these headers: `docs/probe-claude.sh`
 and `docs/probe-codex.sh`.
 
-| Schema field          | Claude Code header                              | Codex CLI header                          |
-|-----------------------|-------------------------------------------------|-------------------------------------------|
-| `window_primary.used_pct`    | `anthropic-ratelimit-unified-5h-utilization`    | `x-codex-primary-used-percent` ÷ 100      |
-| `window_primary.resets_at`   | `anthropic-ratelimit-unified-5h-reset`          | `x-codex-primary-reset-at`                |
-| `window_secondary.used_pct`  | `anthropic-ratelimit-unified-7d-utilization`    | `x-codex-secondary-used-percent` ÷ 100    |
-| `window_secondary.resets_at` | `anthropic-ratelimit-unified-7d-reset`          | `x-codex-secondary-reset-at`              |
+| Agent    | `sessions[].type` | `used_pct` header                              | `resets_at` header                |
+|----------|-------------------|------------------------------------------------|-----------------------------------|
+| `claude` | `5h`              | `anthropic-ratelimit-unified-5h-utilization`   | `anthropic-ratelimit-unified-5h-reset` |
+| `claude` | `7d`              | `anthropic-ratelimit-unified-7d-utilization`   | `anthropic-ratelimit-unified-7d-reset` |
+| `codex`  | `primary`         | `x-codex-primary-used-percent` ÷ 100           | `x-codex-primary-reset-at`        |
+| `codex`  | `secondary`       | `x-codex-secondary-used-percent` ÷ 100         | `x-codex-secondary-reset-at`      |
 
 Claude returns `used_pct` already as a `0.0`–`1.0` float; Codex returns
 `0`–`100` integers and the collector divides by 100.
@@ -95,7 +96,10 @@ re-litigate without a reason.
   shows both windows simultaneously.
 - **Third-tier buckets.** Claude `unified-overage-*` (pay-per-use overage) and
   Codex `x-codex-credits-*` (pay-as-you-go credits) describe a third quota
-  beyond 5h+7d. Not shown on the MVP display.
+  beyond 5h+7d. These fit the current schema — they'd just be an additional
+  `sessions[]` entry (e.g. `type: "overage"` or `type: "credits"`) — so the
+  collector and server need no changes when we wire them up. Deferred only
+  because the MVP display doesn't render them.
 - **Plan metadata.** Codex exposes `x-codex-plan-type` and
   `x-codex-active-limit`; Claude exposes `unified-status` and
   `unified-fallback-percentage`. Useful for UI polish, not for the MVP numbers.

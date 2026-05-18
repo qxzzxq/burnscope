@@ -12,9 +12,9 @@ Claude Code (and most subscription-based agents) work in fixed usage windows —
 
 ## Scope
 
-**MVP (this document):** one machine, one agent (Claude Code), one board (CYD), one API endpoint. Goal is end-to-end: a real token count from a real session appears on the display and counts down to window reset.
+**MVP (this document):** one machine, two agents (Claude Code and Codex CLI), one board (CYD), one API endpoint. Goal is end-to-end: a real token count from a real session appears on the display and counts down to window reset. The daemon auto-detects which agents are logged in and runs every available one concurrently.
 
-**Deferred to Phase 2:** multi-machine aggregation, additional agents (Codex, Gemini, Copilot, …), additional boards & layout families, web dashboard, auth, captive-portal Wi-Fi provisioning, OTA, cost/$ estimation, persistent storage, and an intermediate aggregation server (see note below).
+**Deferred to Phase 2:** multi-machine aggregation, additional agents (Gemini, Copilot, …), additional boards & layout families, web dashboard, auth, captive-portal Wi-Fi provisioning, OTA, cost/$ estimation, persistent storage, and an intermediate aggregation server (see note below).
 
 > **Note on the cut server.** An earlier draft of this document put a Go aggregation server between the daemon and the ESP32. It was cut for the single-user MVP: for one laptop and one display it added two installs and a second always-on process without buying anything. It returns in Phase 2 only if it earns its keep — multi-machine aggregation, non-session agent schemas (credits, overage) that need shared state, or auth. The firmware contract (`POST /summary`) is designed to stay stable in that case: a future server simply takes the daemon's place as the thing speaking it.
 
@@ -31,7 +31,7 @@ Claude Code (and most subscription-based agents) work in fixed usage windows —
 └──────────────────────────┘                         └─────────────────────┘
 ```
 
-- **Python daemon** — tails `~/.claude/projects/**/*.jsonl`, reads the rate-limit headers the agent already exposes, computes the current `AgentSnapshot`, and pushes it to the ESP32. Pushes on file change and on a ~30s keepalive so a freshly-booted display catches up quickly.
+- **Python daemon** — probes each supported agent's rate-limit endpoint (a tiny throwaway request whose response headers carry the usage numbers), normalises any per-agent scale (Claude returns `0.0`-`1.0` directly; Codex returns `0`-`100` integers), builds one `AgentSnapshot` per agent, and pushes each to the ESP32. Also tails `~/.claude/projects/**/*.jsonl` as a cheap activity signal that switches probes between an active and an idle cadence. Pushes on every cycle so a freshly-booted display catches up quickly. New agents plug in by subclassing `Agent` and `Credential` — see `CLAUDE.md` for the seam.
 - **ESP32 firmware** — advertises itself over mDNS as `_burnscope._tcp.local` on boot, runs a small HTTP server accepting `POST /summary`, and renders the last snapshot it received. Holds no rolling-window state of its own — the daemon does the math.
 - **Discovery** — daemon uses `zeroconf` to find the advertised service. A `--esp32-host` override is accepted for networks where mDNS fails (corporate WiFi, some routers, Docker bridges).
 
@@ -73,7 +73,11 @@ burnscope/
 │   └── examples/
 ├── client/                # Python daemon
 │   ├── pyproject.toml
-│   └── burnscope_client/
+│   └── src/burnscope_client/
+│       ├── schema.py          # wire-format dataclasses
+│       ├── agent.py           # Agent ABC
+│       ├── credentials.py     # Credential ABC + shared readers
+│       └── agents/            # one module per supported provider
 └── firmware/              # ESP32 (PlatformIO), CYD only
     ├── platformio.ini
     └── src/

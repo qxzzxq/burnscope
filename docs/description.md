@@ -2,7 +2,7 @@
 
 > An always-on token & quota meter for your AI coding agents.
 
-BurnScope tracks token usage for your AI coding agent and surfaces it on a dedicated ESP32 desk display. A daemon reads the session data the agent already produces and pushes usage events to a local server, which keeps a running window total and exposes a small HTTP API. The ESP32 polls that API.
+BurnScope tracks token usage for your AI coding agent and surfaces it on a dedicated ESP32 desk display. A daemon on your laptop reads the session data the agent already produces, computes the current window summary, discovers the ESP32 over mDNS, and pushes the rendered numbers straight to it over HTTP. No intermediate server.
 
 ## Why a hardware display
 
@@ -12,51 +12,52 @@ Claude Code (and most subscription-based agents) work in fixed usage windows —
 
 ## Scope
 
-**MVP (this document):** one machine, one agent (Claude Code), one board (CYD), two API endpoints. Goal is end-to-end: a real token count from a real session appears on the display and counts down to window reset.
+**MVP (this document):** one machine, one agent (Claude Code), one board (CYD), one API endpoint. Goal is end-to-end: a real token count from a real session appears on the display and counts down to window reset.
 
-**Deferred to Phase 2:** multi-machine aggregation, additional agents (Codex, Gemini, Copilot, …), additional boards & layout families, web dashboard, auth, mDNS discovery, captive-portal Wi-Fi provisioning, OTA, cost/$ estimation, persistent storage. See [TODO.md](./TODO.md).
+**Deferred to Phase 2:** multi-machine aggregation, additional agents (Codex, Gemini, Copilot, …), additional boards & layout families, web dashboard, auth, captive-portal Wi-Fi provisioning, OTA, cost/$ estimation, persistent storage, and an intermediate aggregation server (see note below).
+
+> **Note on the cut server.** An earlier draft of this document put a Go aggregation server between the daemon and the ESP32. It was cut for the single-user MVP: for one laptop and one display it added two installs and a second always-on process without buying anything. It returns in Phase 2 only if it earns its keep — multi-machine aggregation, non-session agent schemas (credits, overage) that need shared state, or auth. The firmware contract (`POST /summary`) is designed to stay stable in that case: a future server simply takes the daemon's place as the thing speaking it.
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────┐  HTTP POST  ┌──────────────────┐  HTTP GET   ┌─────────────┐
-│ Client daemon   │ ──────────▶ │      Server      │ ◀────────── │   ESP32     │
-│ (laptop)        │   (push)    │ rolling window   │   (poll)    │  (CYD)      │
-└─────────────────┘             │ + HTTP API       │             └─────────────┘
-                                └──────────────────┘
+┌──────────────────────────┐   HTTP POST /summary    ┌─────────────────────┐
+│ Python daemon (laptop)   │ ──────────────────────▶ │  ESP32 (CYD)        │
+│ - tails JSONL            │   AgentSnapshot JSON    │  - advertises mDNS  │
+│ - computes summary       │                         │  - tiny HTTP server │
+│ - discovers ESP32 (mDNS) │                         │  - renders TFT      │
+└──────────────────────────┘                         └─────────────────────┘
 ```
 
-- **Client daemon** — tails `~/.claude/projects/**/*.jsonl`, extracts token counts, POSTs to the server.
-- **Server** — keeps the current 5-hour window total in memory; serves the read API.
-- **ESP32 firmware** — polls the API every few seconds; renders tokens used and time until reset.
-
-For MVP the daemon and server can run on the same machine. They are still separate processes — splitting later (to a always-on server) doesn't require a refactor.
+- **Python daemon** — tails `~/.claude/projects/**/*.jsonl`, reads the rate-limit headers the agent already exposes, computes the current `AgentSnapshot`, and pushes it to the ESP32. Pushes on file change and on a ~30s keepalive so a freshly-booted display catches up quickly.
+- **ESP32 firmware** — advertises itself over mDNS as `_burnscope._tcp.local` on boot, runs a small HTTP server accepting `POST /summary`, and renders the last snapshot it received. Holds no rolling-window state of its own — the daemon does the math.
+- **Discovery** — daemon uses `zeroconf` to find the advertised service. A `--esp32-host` override is accepted for networks where mDNS fails (corporate WiFi, some routers, Docker bridges).
 
 ---
 
 ## HTTP API
 
-| Endpoint                  | Returns                                        |
-| ------------------------- | ---------------------------------------------- |
-| `POST /api/events`        | Push usage events from the daemon              |
-| `GET /api/summary/session` | Latest session snapshots (5h/7d for Claude, primary/secondary for Codex) for each agent |
+One endpoint, on the ESP32:
 
-Schemas are hand-written in each language (Python, Go, C++). Schema-as-codegen is deferred until there's a third consumer.
+| Endpoint         | Direction        | Body                                   | Response          |
+| ---------------- | ---------------- | -------------------------------------- | ----------------- |
+| `POST /summary`  | daemon → ESP32   | a single `AgentSnapshot` (see [wire-format.md](./wire-format.md)) | `204 No Content`  |
+
+Schemas are hand-written in each language (Python, C++). Schema-as-codegen is deferred until there's a third consumer.
 
 ---
 
 ## Tech Stack
 
-| Component       | Choice                                          |
-| --------------- | ----------------------------------------------- |
-| Firmware        | PlatformIO + Arduino, C++, TFT_eSPI             |
-| Board           | Cheap Yellow Display (ESP32-2432S028R), 320×240 |
-| Server          | Go (`net/http`)                                 |
-| Client daemon   | Python 3.11+ (`watchdog`, `httpx`)              |
+| Component       | Choice                                                              |
+| --------------- | ------------------------------------------------------------------- |
+| Firmware        | PlatformIO + Arduino, C++, TFT_eSPI, `ESPmDNS`, `WebServer`         |
+| Board           | Cheap Yellow Display (ESP32-2432S028R), 320×240                     |
+| Daemon          | Python 3.11+ (`watchdog`, `httpx`, `zeroconf`)                      |
 
-WiFi credentials and the server URL are compiled into the firmware for MVP. Network provisioning UX is Phase 2.
+WiFi credentials are compiled into the firmware for MVP. mDNS handles the rest — no addresses need to be kept in sync between the two sides. Captive-portal network provisioning is Phase 2.
 
 ---
 
@@ -68,19 +69,17 @@ burnscope/
 ├── CLAUDE.md
 ├── docs/
 │   ├── description.md
-│   └── TODO.md
+│   ├── wire-format.md
+│   └── examples/
 ├── client/                # Python daemon
 │   ├── pyproject.toml
 │   └── burnscope_client/
-├── server/                # Go server + API
-│   ├── go.mod
-│   └── cmd/burnscope-server/
 └── firmware/              # ESP32 (PlatformIO), CYD only
     ├── platformio.ini
     └── src/
 ```
 
-Single repo. Component boundaries kept clean so a split is possible later.
+Single repo, two components. The wire format ([wire-format.md](./wire-format.md)) is the boundary — if Phase 2 ever needs an intermediate server, it slots in between by speaking the same `POST /summary` to the firmware.
 
 ---
 
@@ -92,4 +91,4 @@ An ESP32 workbench has been installed on a remote server (http://workbench.local
 
 ## Getting Started
 
-To be written once MVP is implementable end-to-end. See [TODO.md](./TODO.md).
+To be written once MVP is implementable end-to-end.

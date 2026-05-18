@@ -1,11 +1,11 @@
 # BurnScope wire format (MVP)
 
-The shared contract spoken by the daemon, server, and ESP32 firmware. JSON over
-HTTP, UTF-8. Two endpoints, two payload shapes.
+The shared contract spoken by the Python daemon and the ESP32 firmware. JSON
+over HTTP, UTF-8. One endpoint, one payload shape.
 
 This document is the source of truth — each language hand-writes its own types
-to match. Examples live alongside as `examples/event.json` and
-`examples/summary.json` and are kept in sync by hand.
+to match. An example payload lives alongside as `examples/summary-push.json`
+and is kept in sync by hand.
 
 ---
 
@@ -38,33 +38,20 @@ they don't recognise — using the raw string as the label.
 
 ---
 
-## `POST /api/events`
+## `POST /summary`
 
-Daemon → server. One snapshot per request. Sent on every poll, even if values
-haven't changed.
+Daemon → ESP32. One snapshot per request. Sent on every JSONL change and on a
+~30 s keepalive so a freshly-booted display catches up without waiting for the
+next agent action.
 
-**Request body:** a single `AgentSnapshot` (see `examples/event.json`).
+**Request body:** a single `AgentSnapshot` (see `examples/summary-push.json`).
 
 **Response:** `204 No Content` on success.
 
-Server overwrites its in-memory cache keyed by `agent`. No history is kept in
-MVP. No auth (LAN trust).
-
----
-
-## `GET /api/summary/session`
-
-ESP32 (or web client) → server. Returns the latest snapshot the server has
-received for every agent.
-
-**Response body:** an object (see `examples/summary.json`).
-
-| Field         | Type                | Description |
-|---------------|---------------------|-------------|
-| `server_time` | integer (unix s)    | The server's current wall-clock time. Lets the client sanity-check its own clock and compute "last update Xs ago" without making the server pre-compute it. |
-| `agents`      | array of `AgentSnapshot` | Zero, one, or two entries. Order is not guaranteed; clients look up by the `agent` field. |
-
-Clients must handle an empty `agents` array (nothing has reported yet).
+The firmware overwrites its in-memory "latest snapshot" on receipt and
+repaints. No history is kept. No auth (LAN trust). The ESP32 syncs its
+wall-clock over NTP and computes "last update Xs ago" locally against
+`captured_at` — there is no server timestamp on the wire.
 
 ---
 
@@ -98,14 +85,19 @@ re-litigate without a reason.
   Codex `x-codex-credits-*` (pay-as-you-go credits) describe a third quota
   beyond 5h+7d. These fit the current schema — they'd just be an additional
   `sessions[]` entry (e.g. `type: "overage"` or `type: "credits"`) — so the
-  collector and server need no changes when we wire them up. Deferred only
-  because the MVP display doesn't render them.
+  daemon and firmware need no contract changes when we wire them up.
+  Deferred only because the MVP display doesn't render them.
 - **Plan metadata.** Codex exposes `x-codex-plan-type` and
   `x-codex-active-limit`; Claude exposes `unified-status` and
   `unified-fallback-percentage`. Useful for UI polish, not for the MVP numbers.
-- **Historical aggregates.** No `/api/summary/daily`, no per-session breakdown.
-  Cut during the description-doc trim — server keeps only the latest snapshot
-  per agent.
+- **Historical aggregates.** No daily totals, no per-session breakdown. The
+  firmware keeps only the latest snapshot per agent.
 - **Cost/dollar estimates.** Token-based metrics only.
-- **Auth.** `POST /api/events` accepts pushes from any LAN client. A shared
+- **Auth.** `POST /summary` accepts pushes from any LAN client. A shared
   secret is straightforward to add later.
+- **Intermediate aggregation server.** An earlier MVP draft had a Go server
+  fronting the firmware. Cut because for one laptop + one display it added
+  installs and an always-on process without buying anything. It earns its
+  keep in Phase 2 if multi-machine aggregation, non-session schemas
+  (credits, overage) needing shared state, or auth arrive — and slots in by
+  speaking this same `POST /summary` to the firmware.

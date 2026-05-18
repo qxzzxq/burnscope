@@ -88,12 +88,6 @@ Single repo, two components. The wire format ([wire-format.md](./wire-format.md)
 
 ---
 
-## Remote workbench
-
-An ESP32 workbench has been installed on a remote server (http://workbench.local:8080/), with an ESP32 display directly connected to it. Please follow the instruction on https://github.com/SensorsIot/Universal-Embedded-Workbench.
-
----
-
 ## Getting Started
 
 To be written once MVP is implementable end-to-end.

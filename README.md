@@ -58,7 +58,7 @@ burnscope/
 │       ├── agents/          ← one module per supported provider
 │       ├── daemon.py
 │       └── cli.py
-└── firmware/            ← ESP32 firmware (PlatformIO, CYD)
+└── firmware/            ← ESP32 firmware (ESP-IDF, CYD)
 ```
 
 ## Adding a new agent

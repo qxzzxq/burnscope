@@ -53,7 +53,7 @@ Schemas are hand-written in each language (Python, C++). Schema-as-codegen is de
 
 | Component       | Choice                                                              |
 | --------------- | ------------------------------------------------------------------- |
-| Firmware        | PlatformIO + Arduino, C++, TFT_eSPI, `ESPmDNS`, `WebServer`         |
+| Firmware        | ESP-IDF v6.x, C, `esp_lcd_ili9341` + LVGL, `mdns`, `esp_http_server` |
 | Board           | Cheap Yellow Display (ESP32-2432S028R), 320×240                     |
 | Daemon          | Python 3.11+ (`watchdog`, `httpx`, `zeroconf`)                      |
 
@@ -78,9 +78,10 @@ burnscope/
 │       ├── agent.py           # Agent ABC
 │       ├── credentials.py     # Credential ABC + shared readers
 │       └── agents/            # one module per supported provider
-└── firmware/              # ESP32 (PlatformIO), CYD only
-    ├── platformio.ini
-    └── src/
+└── firmware/              # ESP32 (ESP-IDF), CYD only
+    ├── CMakeLists.txt
+    ├── sdkconfig.defaults
+    └── main/
 ```
 
 Single repo, two components. The wire format ([wire-format.md](./wire-format.md)) is the boundary — if Phase 2 ever needs an intermediate server, it slots in between by speaking the same `POST /summary` to the firmware.

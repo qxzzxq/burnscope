@@ -1,12 +1,16 @@
 {
   "agent": "claude",
   "captured_at": 1779050146,
-  "window_5h": {
-    "used_pct": 0.03,
-    "resets_at": 1779066600
-  },
-  "window_7d": {
-    "used_pct": 0.09,
-    "resets_at": 1779156000
-  }
+  "sessions": [
+    {
+      "type": "5h",
+      "used_pct": 0.03,
+      "resets_at": 1779066600
+    },
+    {
+      "type": "7d",
+      "used_pct": 0.09,
+      "resets_at": 1779156000
+    }
+  ]
 }

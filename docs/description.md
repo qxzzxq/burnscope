@@ -41,7 +41,7 @@ For MVP the daemon and server can run on the same machine. They are still separa
 | Endpoint                  | Returns                                        |
 | ------------------------- | ---------------------------------------------- |
 | `POST /api/events`        | Push usage events from the daemon              |
-| `GET /api/summary/window` | Current 5-hour-window tokens + seconds-to-reset |
+| `GET /api/summary/session` | Latest session snapshots (5h/7d for Claude, primary/secondary for Codex) for each agent |
 
 Schemas are hand-written in each language (Python, Go, C++). Schema-as-codegen is deferred until there's a third consumer.
 

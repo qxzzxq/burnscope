@@ -86,10 +86,10 @@
 
   .panel {
     /* Panel-scoped colors — driven by the sidebar color pickers. */
-    --title-fg: #FFFFFF;
-    --chip-fg: #9E9E9E;
-    --pct-fg: #9E9E9E;
-    --countdown-fg: #CCCCCC;
+    --title-fg: #F9F2DF;
+    --chip-fg: #F9F2DF;
+    --pct-fg: #F9F2DF;
+    --countdown-fg: #B0ACA0;
     --bar-track: #2F2F2F;
     --row1: #DE7356;
     --row2: #A4A049;
@@ -387,19 +387,19 @@
     <div class="group" id="color-group">
       <div class="swatch-row">
         <label for="c-title">Title text</label>
-        <input type="color" id="c-title" data-var="--title-fg" value="#FFFFFF">
+        <input type="color" id="c-title" data-var="--title-fg" value="#F9F2DF">
       </div>
       <div class="swatch-row">
         <label for="c-chip">Row label (chip)</label>
-        <input type="color" id="c-chip" data-var="--chip-fg" value="#9E9E9E">
+        <input type="color" id="c-chip" data-var="--chip-fg" value="#F9F2DF">
       </div>
       <div class="swatch-row">
         <label for="c-pct">Percent text</label>
-        <input type="color" id="c-pct" data-var="--pct-fg" value="#9E9E9E">
+        <input type="color" id="c-pct" data-var="--pct-fg" value="#F9F2DF">
       </div>
       <div class="swatch-row">
         <label for="c-cd">Countdown text</label>
-        <input type="color" id="c-cd" data-var="--countdown-fg" value="#CCCCCC">
+        <input type="color" id="c-cd" data-var="--countdown-fg" value="#B0ACA0">
       </div>
       <div class="swatch-row">
         <label for="c-row1">Row 1 bar fill</label>
@@ -587,7 +587,10 @@
   });
   titleSizeEl.addEventListener("change", redraw);
   bodySizeEl.addEventListener("change", redraw);
-  agentEl.addEventListener("change", redraw);
+  agentEl.addEventListener("change", () => {
+    applyAgentPalette(agentEl.value);
+    redraw();
+  });
   claudeMarkEl.addEventListener("change", redraw);
 
   document.querySelectorAll(".stage-controls button").forEach(b => {
@@ -604,12 +607,34 @@
       panelEl.style.setProperty(inp.dataset.var, inp.value);
     });
   });
+  // Per-agent bar palettes — mirrors AGENT_PALETTES in ui.c. Row colours
+  // swap with the agent dropdown; the per-row pickers still override.
+  const AGENT_PALETTES = {
+    claude: { "--row1": "#DE7356", "--row2": "#A4A049" },
+    codex:  { "--row1": "#81C3DD", "--row2": "#A4A049" },
+  };
+  const rowInputsByVar = {
+    "--row1": document.getElementById("c-row1"),
+    "--row2": document.getElementById("c-row2"),
+  };
+  function applyAgentPalette(name) {
+    const pal = AGENT_PALETTES[name] || AGENT_PALETTES.claude;
+    for (const [v, hex] of Object.entries(pal)) {
+      rowInputsByVar[v].value = hex;
+      panelEl.style.setProperty(v, hex);
+    }
+  }
+  applyAgentPalette(agentEl.value);
+
   document.getElementById("reset-colors").addEventListener("click", () => {
     colorInputs.forEach(inp => {
+      // Skip row fills — they reset via the current agent's palette.
+      if (inp.dataset.var === "--row1" || inp.dataset.var === "--row2") return;
       const def = colorDefaults.get(inp.id);
       inp.value = def;
       panelEl.style.setProperty(inp.dataset.var, def);
     });
+    applyAgentPalette(agentEl.value);
   });
 
   // Bar corner radius slider — drives --bar-radius (used by both track and fill).

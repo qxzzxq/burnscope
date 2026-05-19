@@ -65,14 +65,29 @@ static char s_visible_agent[SNAPSHOT_AGENT_MAX] = "";
 #define CYCLE_INTERVAL_S 5
 static int s_cycle_ticks = 0;
 
-/* Distinct accent colours per row (FR-4.7). `lv_color_hex` isn't a
- * constant expression, so we keep the palette as 0xRRGGBB ints and
- * convert at use. */
-static const uint32_t ROW_ACCENT_RGB[SNAPSHOT_MAX_SESSIONS] = {
-    0xDE7356,   /* clay     */
-    0xA4A049,   /* olive    */
-    0xB0BEC5,   /* fallback grey for a future 3rd row */
+/* Per-agent bar palette (FR-4.7). One row of colours per agent; unknown
+ * agents fall back to the first entry (claude). `lv_color_hex` isn't a
+ * constant expression, so we keep colours as 0xRRGGBB ints and convert
+ * at use. */
+typedef struct {
+    const char *agent;
+    uint32_t rows[SNAPSHOT_MAX_SESSIONS];
+} agent_palette_t;
+
+static const agent_palette_t AGENT_PALETTES[] = {
+    { "claude", { 0xDE7356, 0xA4A049, 0xB0BEC5 } },
+    { "codex",  { 0x81C3DD, 0xA4A049, 0xB0BEC5 } },
 };
+
+static const agent_palette_t *palette_for(const char *agent)
+{
+    for (size_t i = 0; i < sizeof(AGENT_PALETTES) / sizeof(AGENT_PALETTES[0]); ++i) {
+        if (strcmp(agent, AGENT_PALETTES[i].agent) == 0) {
+            return &AGENT_PALETTES[i];
+        }
+    }
+    return &AGENT_PALETTES[0];
+}
 
 /* Map an agent name to its brand icon. Unknown agents fall back to the
  * Claude mark so the header stays populated rather than blank. */
@@ -143,8 +158,9 @@ static void build_row(lv_obj_t *parent, int row_idx, int y_offset, int height)
     lv_obj_set_style_pad_all(card, 6, 0);
     lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* Subdued grey for the row labels — the bar is the focal point. */
-    const lv_color_t LABEL_GREY = lv_color_hex(0x9E9E9E);
+    /* Warm off-white shared by the chip and the percent — keeps the row
+     * label and the percentage visually paired. */
+    const lv_color_t LABEL_FG = lv_color_hex(0xF9F2DF);
     /* Chip background sits one step lighter than the card (0x1C1C1C). */
     const lv_color_t CHIP_BG    = lv_color_hex(0x2E2E2E);
 
@@ -152,7 +168,7 @@ static void build_row(lv_obj_t *parent, int row_idx, int y_offset, int height)
     lv_obj_t *type_lbl = lv_label_create(card);
     lv_label_set_text(type_lbl, "—");
     lv_obj_set_style_text_font(type_lbl, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(type_lbl, LABEL_GREY, 0);
+    lv_obj_set_style_text_color(type_lbl, LABEL_FG, 0);
     lv_obj_set_style_bg_color(type_lbl, CHIP_BG, 0);
     lv_obj_set_style_bg_opa(type_lbl, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(type_lbl, 6, 0);
@@ -163,7 +179,7 @@ static void build_row(lv_obj_t *parent, int row_idx, int y_offset, int height)
     lv_obj_t *pct_lbl = lv_label_create(card);
     lv_label_set_text(pct_lbl, "0%");
     lv_obj_set_style_text_font(pct_lbl, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(pct_lbl, LABEL_GREY, 0);
+    lv_obj_set_style_text_color(pct_lbl, LABEL_FG, 0);
     lv_obj_align(pct_lbl, LV_ALIGN_TOP_RIGHT, 0, 2);
 
     lv_obj_t *bar = lv_bar_create(card);
@@ -176,7 +192,7 @@ static void build_row(lv_obj_t *parent, int row_idx, int y_offset, int height)
     lv_obj_set_style_bg_color(bar, lv_color_hex(0x2F2F2F), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_border_width(bar, 0, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(bar, lv_color_hex(ROW_ACCENT_RGB[row_idx]), LV_PART_INDICATOR);
+    /* Indicator colour is set per-agent in render_snapshot_locked. */
     lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_INDICATOR);
     lv_obj_set_style_border_width(bar, 0, LV_PART_INDICATOR);
     lv_obj_set_style_radius(bar, 3, LV_PART_MAIN);
@@ -185,7 +201,7 @@ static void build_row(lv_obj_t *parent, int row_idx, int y_offset, int height)
     lv_obj_t *countdown_lbl = lv_label_create(card);
     lv_label_set_text(countdown_lbl, "resets in --");
     lv_obj_set_style_text_font(countdown_lbl, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(countdown_lbl, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_style_text_color(countdown_lbl, lv_color_hex(0xB0ACA0), 0);
     lv_obj_align(countdown_lbl, LV_ALIGN_BOTTOM_LEFT, 0, 0);
 
     r->card = card;
@@ -199,7 +215,7 @@ static void build_agent_screen(void)
 {
     lv_obj_t *scr = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
-    lv_obj_set_style_text_color(scr, lv_color_white(), 0);
+    lv_obj_set_style_text_color(scr, lv_color_hex(0xF9F2DF), 0);
     lv_obj_set_style_pad_all(scr, 0, 0);
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
@@ -244,6 +260,8 @@ static void render_snapshot_locked(const agent_snapshot_t *snap)
     lv_image_set_src(s_agent_icon, agent_icon(snap->agent));
     lv_label_set_text(s_agent_label, "Usage");
 
+    const agent_palette_t *pal = palette_for(snap->agent);
+
     /* Pull wall clock once per repaint. May be 0 before SNTP completes;
      * the tick will pick up the right values once the clock is set. */
     int64_t now = (int64_t)time(NULL);
@@ -269,6 +287,7 @@ static void render_snapshot_locked(const agent_snapshot_t *snap)
         snprintf(pct_buf, sizeof(pct_buf), "%d%%", (int)lroundf(pct * 100.0f));
         lv_label_set_text(r->pct_lbl, pct_buf);
         lv_bar_set_value(r->bar, (int)lroundf(pct * 1000.0f), LV_ANIM_OFF);
+        lv_obj_set_style_bg_color(r->bar, lv_color_hex(pal->rows[i]), LV_PART_INDICATOR);
 
         char buf[32];
         format_countdown(s->resets_at - now, buf, sizeof(buf));

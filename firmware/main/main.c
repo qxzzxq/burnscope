@@ -1,7 +1,7 @@
 /*
  * BurnScope firmware — hello-world bring-up for the Cheap Yellow Display.
  *
- * Targets the cyd2usb variant (two USB ports): the panel is an ST7789, wired
+ * Targets the cyd2usb variant (one USB-C + one micro-USB): the panel is an ST7789, wired
  * BGR with inversion off. Pinout per
  * https://github.com/witnessmenow/ESP32-Cheap-Yellow-Display/blob/main/PINS.md.
  * LVGL (via esp_lvgl_port) renders "Hello, world!" centred on the panel.

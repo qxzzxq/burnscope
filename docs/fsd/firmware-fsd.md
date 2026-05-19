@@ -115,9 +115,10 @@ fighting for locks beyond the LVGL port mutex.
 
 ### 2.2 Hardware / Platform Architecture
 
-- **Board:** Cheap Yellow Display, `cyd2usb` variant (two USB-C ports).
-  ESP32-WROOM-32, 4 MB flash, 520 KiB SRAM. Reference pinout per the
-  ESP32-Cheap-Yellow-Display project.
+- **Board:** Cheap Yellow Display, `cyd2usb` variant (one USB-C and one
+  micro-USB port — either can power the board and expose the serial
+  console). ESP32-WROOM-32, 4 MB flash, 520 KiB SRAM. Reference pinout
+  per the ESP32-Cheap-Yellow-Display project.
 - **Panel:** ST7789, 320×240 landscape (native 240×320 portrait, rotated
   in LVGL). BGR pixel order, inversion off, 16-bit RGB565. SPI bus at
   20 MHz (40 MHz produces bit errors on the non-IOMUX pins — confirmed
@@ -125,7 +126,8 @@ fighting for locks beyond the LVGL port mutex.
 - **Backlight:** GPIO21, active-high.
 - **Touch:** the panel has a resistive touch controller but **MVP does
   not use touch** — provisioning happens from another device via the AP.
-- **Power:** USB-C, 5 V. No battery in this hardware revision.
+- **Power:** 5 V via either the USB-C or the micro-USB port. No battery
+  in this hardware revision.
 - **Connectivity:** 2.4 GHz WiFi only (ESP32 single-band).
 
 ### 2.3 Software Architecture
@@ -374,7 +376,7 @@ unit-testable on the host).
 ### 4.3 Constraints
 
 - **C-1:** ESP32-WROOM-32 has no native USB; serial logging is via the
-  CYD's onboard CP2102N over USB-C.
+  CYD's onboard CP2102N over either the USB-C or the micro-USB port.
 - **C-2:** SPI to the display is **not** routed on IOMUX pins on the CYD,
   capping reliable pclk at ~20 MHz (per `firmware/main/main.c`).
 - **C-3:** ESP32 supports **2.4 GHz only**. A 5 GHz-only network at the

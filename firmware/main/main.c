@@ -35,7 +35,7 @@ static const char *TAG = "burnscope";
 #define LCD_V_RES_NATIVE    320
 #define LCD_H_RES           320
 #define LCD_V_RES           240
-/* CYD's display SPI is not on IOMUX pins; 40 MHz produces bit errors. */
+/* CYD's display SPI is not on IOMUX pins; drop to 20 MHz if bit errors appear. */
 #define LCD_PIXEL_CLOCK_HZ  (40 * 1000 * 1000)
 
 static void enable_backlight(void)

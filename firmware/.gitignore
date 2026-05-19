@@ -4,3 +4,6 @@ dependencies.lock
 sdkconfig
 sdkconfig.old
 .cache/
+
+# Phase 1 compile-time WiFi credentials — never check in.
+main/wifi_creds.h

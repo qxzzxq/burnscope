@@ -11,3 +11,12 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 # LVGL color depth + a larger font for the hello-world label.
 CONFIG_LV_COLOR_DEPTH_16=y
 CONFIG_LV_FONT_MONTSERRAT_24=y
+
+# Task Watchdog (FSD NFR-3.2): reboot if any subscribed task ceases to feed.
+CONFIG_ESP_TASK_WDT_EN=y
+CONFIG_ESP_TASK_WDT_INIT=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+CONFIG_ESP_TASK_WDT_PANIC=y
+
+# HTTP server: give URIs some headroom for future routes.
+CONFIG_HTTPD_MAX_URI_LEN=128

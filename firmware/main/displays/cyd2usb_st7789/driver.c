@@ -75,7 +75,9 @@ static esp_lcd_panel_handle_t init_st7789(esp_lcd_panel_io_handle_t *io_out)
     esp_lcd_panel_handle_t panel_handle = NULL;
     const esp_lcd_panel_dev_config_t panel_config = {
         .reset_gpio_num = PIN_NUM_LCD_RST,
-        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_BGR,
+        /* CYD ST7789 panels are physically RGB; setting BGR here would flip
+         * the R and B channels (orange→blue), as seen with the brand icons. */
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
         .bits_per_pixel = 16,
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(io_handle, &panel_config, &panel_handle));

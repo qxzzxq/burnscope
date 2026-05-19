@@ -10,6 +10,8 @@ set(srcs
     "factory_reset.c"
     "provisioning.c"
     "captive_dns.c"
+    "icons/icon_claude.c"
+    "icons/icon_codex.c"
 )
 
 set(inc ".")

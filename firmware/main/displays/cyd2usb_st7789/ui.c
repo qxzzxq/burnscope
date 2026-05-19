@@ -33,6 +33,12 @@
 #include "snapshot.h"
 #include "version.h"
 
+/* Per-agent brand icons (24x24 ARGB8888). Sources are the official brand
+ * marks mirrored by lobehub/lobe-icons (MIT); icons/icon_*.c is regenerated
+ * with rsvg-convert + LVGL's LVGLImage.py — see firmware README. */
+LV_IMAGE_DECLARE(icon_claude);
+LV_IMAGE_DECLARE(icon_codex);
+
 static const char *TAG = "render";
 
 /* Splash widgets. */
@@ -41,7 +47,7 @@ static lv_obj_t *s_status_label  = NULL;
 
 /* Agent-screen widgets (built once, mutated per snapshot). */
 static lv_obj_t *s_agent_screen  = NULL;
-static lv_obj_t *s_agent_dot     = NULL;     /* header colour swatch */
+static lv_obj_t *s_agent_icon    = NULL;     /* header brand icon (lv_image) */
 static lv_obj_t *s_agent_label   = NULL;     /* "Usage" or agent name */
 typedef struct {
     lv_obj_t *card;
@@ -68,11 +74,12 @@ static const uint32_t ROW_ACCENT_RGB[SNAPSHOT_MAX_SESSIONS] = {
     0xB0BEC5,   /* fallback grey for a future 3rd row */
 };
 
-static lv_color_t agent_accent(const char *agent)
+/* Map an agent name to its brand icon. Unknown agents fall back to the
+ * Claude mark so the header stays populated rather than blank. */
+static const lv_image_dsc_t *agent_icon(const char *agent)
 {
-    if (strcmp(agent, "claude") == 0) return lv_color_hex(0xFF9A3C);
-    if (strcmp(agent, "codex") == 0)  return lv_color_hex(0x66BB6A);
-    return lv_color_white();
+    if (strcmp(agent, "codex") == 0) return &icon_codex;
+    return &icon_claude;
 }
 
 static void format_countdown(int64_t seconds, char *out, size_t n)
@@ -190,20 +197,22 @@ static void build_agent_screen(void)
     lv_obj_set_style_pad_all(scr, 0, 0);
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* Header: 24x24 agent dot top-left, "Usage" centred, battery slot
-     * top-right reserved but hidden (has_battery == false on CYD). */
-    s_agent_dot = lv_obj_create(scr);
-    lv_obj_set_size(s_agent_dot, 24, 24);
-    lv_obj_align(s_agent_dot, LV_ALIGN_TOP_LEFT, 8, 6);
-    lv_obj_set_style_bg_color(s_agent_dot, lv_color_white(), 0);
-    lv_obj_set_style_border_width(s_agent_dot, 0, 0);
-    lv_obj_set_style_radius(s_agent_dot, 12, 0);
-    lv_obj_clear_flag(s_agent_dot, LV_OBJ_FLAG_SCROLLABLE);
+    /* Header: 24x24 agent brand icon top-left, "Usage" centred, battery
+     * slot top-right reserved but hidden (has_battery == false on CYD).
+     *
+     * Optical alignment: Montserrat 28's bbox is 30 px tall with the
+     * baseline 25 px below its top and cap-top ~5 px below its top, so the
+     * caps of "Usage" sit centred around y=21. The icon's visible-pixel
+     * centroid lands at +11.4 from its own top, so placing the icon at
+     * y=10 puts its optical centre at ~21 too — matching the text. */
+    s_agent_icon = lv_image_create(scr);
+    lv_image_set_src(s_agent_icon, &icon_claude);
+    lv_obj_align(s_agent_icon, LV_ALIGN_TOP_LEFT, 8, 10);
 
     s_agent_label = lv_label_create(scr);
     lv_label_set_text(s_agent_label, "Usage");
     lv_obj_set_style_text_font(s_agent_label, &lv_font_montserrat_28, 0);
-    lv_obj_align(s_agent_label, LV_ALIGN_TOP_MID, 0, 8);
+    lv_obj_align(s_agent_label, LV_ALIGN_TOP_MID, 0, 6);
 
     /* Two body rows. Header takes ~40 px, leaves 200 px for two rows
      * separated by a small gap. */
@@ -225,8 +234,8 @@ static void build_agent_screen(void)
 
 static void render_snapshot_locked(const agent_snapshot_t *snap)
 {
-    /* Header swatch + label. */
-    lv_obj_set_style_bg_color(s_agent_dot, agent_accent(snap->agent), 0);
+    /* Header icon + label. */
+    lv_image_set_src(s_agent_icon, agent_icon(snap->agent));
     lv_label_set_text(s_agent_label, "Usage");
 
     /* Pull wall clock once per repaint. May be 0 before SNTP completes;

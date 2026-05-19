@@ -4,3 +4,4 @@ dependencies:
   # ST7789 panel driver ships in ESP-IDF (esp_lcd component) — no managed dep.
   espressif/esp_lvgl_port: "^2"
   lvgl/lvgl: "^9"
+  espressif/mdns: "^1.8.0"

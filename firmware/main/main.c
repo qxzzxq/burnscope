@@ -1,7 +1,7 @@
 /*
  * BurnScope firmware — hello-world bring-up for the Cheap Yellow Display.
  *
- * Targets the cyd2usb variant (two USB ports): the panel is an ST7789, wired
+ * Targets the cyd2usb variant (one USB-C + one micro-USB): the panel is an ST7789, wired
  * BGR with inversion off. Pinout per
  * https://github.com/witnessmenow/ESP32-Cheap-Yellow-Display/blob/main/PINS.md.
  * LVGL (via esp_lvgl_port) renders "Hello, world!" centred on the panel.
@@ -35,8 +35,8 @@ static const char *TAG = "burnscope";
 #define LCD_V_RES_NATIVE    320
 #define LCD_H_RES           320
 #define LCD_V_RES           240
-/* CYD's display SPI is not on IOMUX pins; 40 MHz produces bit errors. */
-#define LCD_PIXEL_CLOCK_HZ  (20 * 1000 * 1000)
+/* CYD's display SPI is not on IOMUX pins; drop to 20 MHz if bit errors appear. */
+#define LCD_PIXEL_CLOCK_HZ  (40 * 1000 * 1000)
 
 static void enable_backlight(void)
 {

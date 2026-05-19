@@ -24,6 +24,14 @@ The Python daemon supports multiple upstream agents (Claude Code, Codex CLI, ...
 
 To add an agent: subclass `Credential` for the auth blob, subclass `Agent` for the probe, register it in `cli.py`'s `_AGENT_CLASSES`. See `agents/claude.py` and `agents/codex.py` for templates and the README's "Adding a new agent" section for the checklist.
 
+## Firmware
+
+The MVP is currently being developed on a Cheap-Yellow-Display (CYD), the board is a `cyd2usb` variant (one USB-C and one micro-USB port) -- ST7789, 320×240 landscape.
+
+## ESP-IDF
+
+Path: `~/.espressif/v6.0.1/esp-idf`
+
 ## Pointers
 
 - Code style: [./rules/code-style.md](./rules/code-style.md)

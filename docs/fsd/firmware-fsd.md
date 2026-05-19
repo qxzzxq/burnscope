@@ -686,7 +686,105 @@ A successful flash + boot yields the "Setup mode — connect to
 | AT-1       | 24 h soak                | Continuous pushes every 30 s with periodic WiFi flapping.                                              | No reboots; free heap drift < 5 %. |
 | AT-2       | Display swap              | Build with `mock_display` registered instead of the ST7789.                                            | Unit tests on host pass; rendering logic exercised without panel. (FR-5.3) |
 
-### 8.4 Traceability Matrix
+### 8.4 Live Verification Log
+
+Snapshot of what has been exercised on real hardware. Update on each
+bring-up. Use ✅ for verified, ⏳ for not yet run, ❌ for regressed.
+
+**Hardware:** CYD cyd2usb, STA MAC `d4:e9:f4:b2:f6:4c`, SoftAP MAC ends
+`f6:4d` → AP SSID `BURNSCOPE-F64D`, mDNS host `burnscope-f64c.local`.
+
+**Phase 2 first bring-up — 2026-05-18:**
+
+| Test          | Status | Notes |
+|---------------|:------:|-------|
+| AP-001        | ✅     | AP visible within ~1 s of cold boot. |
+| AP-003        | ✅     | SSID `BURNSCOPE-F64D` matches last 4 hex of SoftAP MAC. |
+| AP-005        | ✅     | Phone associated; portal flow completed (implies DHCP). |
+| CP-001        | ✅     | Portal HTML served on phone connect. |
+| CP-002        | ⏳     | Redirect handler registered; not directly exercised. |
+| CP-003        | ✅     | Form submission accepted creds. |
+| CP-006        | ✅     | After reboot the device joined STA without re-provisioning. |
+| TC-CP-100     | ✅     | Full first-boot path: blank NVS → portal → STA. |
+| TC-CP-102     | ⏳     | `/scan.json` endpoint present; UI listing not visually confirmed. |
+| NVS-001       | ✅     | Creds persisted in `burnscope_wifi` namespace. |
+| NVS-002       | ✅     | Survived a power-cycle (RTS reset). |
+| NVS-010       | ⏸     | NVS encryption deferred — see §10.4. |
+| NVS-012       | ✅     | Password absent from filtered serial log; only SSID logged. |
+| TC-NVS-100    | ✅     | Equivalent to NVS-001 + NVS-002. |
+| TC-NVS-102    | ⏳     | BOOT-button long-press path not yet exercised. |
+| TC-NVS-103    | ⏳     | `POST /factory-reset` path not yet exercised. |
+| TC-SUM-100    | ✅     | Smoke script — Claude push 204, panel repaints. |
+| TC-SUM-101    | ✅     | Codex push 204; `/health` returns both agents; UI cycles. |
+| TC-SUM-102    | ✅     | Codex labels (`primary`, `secondary`) render verbatim. |
+| TC-SUM-103    | ✅     | Bad JSON → 400. |
+| TC-SUM-104    | ✅     | `used_pct=1.5` → 400. |
+| TC-SUM-105    | ✅     | 20 KiB body → 413. |
+| TC-HEALTH-100 | ✅     | Shape OK, `agents.*.seconds_since_last_push` increments. |
+| TC-UI-100     | ✅     | Layout matches §6.1.6 sketch after a font/contrast polish pass. |
+| TC-UI-101     | ✅     | Countdown ticks once per second (after fixing the `s % 60` bug, see below). |
+| WIFI-001/003  | ✅     | STA join + auto-reconnect (re-validated during Phase 2). |
+| TC-MDNS-100   | ✅     | `burnscope-f64c.local` resolves; smoke script uses it. |
+| TC-NTP-100    | ⏳     | Implicit — countdowns now look sensible — but not explicitly timed. |
+| TC-WDT-100    | ⏳     | Hang-injection build not re-run for Phase 2. |
+
+**Bugs found and fixed during this bring-up:**
+
+1. **IDF auto-restored a stale `wifi_config_t`.** ESP-IDF's WiFi
+   subsystem persists its own copy of `wifi_config_t` in the
+   `nvs.net80211` namespace by default. On the first Phase-2 boot the
+   STA radio auto-associated with the SSID from the previous Phase-1
+   build even though our `burnscope_wifi` namespace was empty. This
+   also violated FR-6.1 (our NVS is the *only* persistent store of
+   credentials). Fix: call `esp_wifi_set_storage(WIFI_STORAGE_RAM)`
+   right after `esp_wifi_init`. Captured at `firmware/main/wifi.c`.
+
+2. **`WIFI_EVENT_STA_START` fired while in AP mode.** APSTA brings up
+   both interfaces; without a guard the STA handler emitted
+   `WIFI_STATE_CONNECTING` (overwriting the captive-portal splash) and
+   tried `esp_wifi_connect()` against an empty SSID. Guarded with
+   `s_ap_mode` in the same handler that already protected
+   `STA_DISCONNECTED`.
+
+3. **Countdown showed `…58m3515s`.** `format_countdown` printed the
+   minutes from `s / 60` but the seconds field used the raw
+   post-hour-modulo `s` instead of `s % 60`. One-character fix in
+   `firmware/main/displays/cyd2usb_st7789/ui.c`.
+
+4. **Splash text overflowed the panel.** The status label was using
+   `lv_obj_center` with no width cap; the literal
+   `"Setup mode — connect to BURNSCOPE-XXXX"` extended past the 320 px
+   panel. Fix: `LV_LABEL_LONG_WRAP` + explicit 300 px width +
+   `LV_TEXT_ALIGN_CENTER`. The placeholder string was also replaced
+   with the *real* SSID computed in `provisioning_start`, with an
+   added "Open 192.168.4.1" hint for users whose phone OS doesn't
+   auto-launch the captive portal.
+
+5. **No Latin serif in stock LVGL 9.5.** A-3 in this FSD assumed
+   Roboto Mono. We instead baked Apple **NewYork** at 22 px via
+   `lv_font_conv` from `/System/Library/Fonts/NewYork.ttf` (ASCII
+   printable range only, ~63 KB). Source lives at
+   `firmware/main/fonts/lv_font_newyork_22.c`. A-3 should be considered
+   superseded by this concrete choice on the cyd2usb profile.
+
+**Deviations from the FSD recorded during Phase 2 build-out:**
+
+- **cJSON is not in ESP-IDF v6.** The schema is small and regular, so
+  `POST /summary` parses inline (~150 lines, no allocations beyond the
+  request body) rather than pulling in a third-party managed
+  component. The wire-format contract is unchanged.
+
+- **Display abstraction is realised at build time, not runtime.** FSD
+  FR-5 specified a runtime `display_t` virtual interface. The
+  implementation instead bundles the panel driver and the UI layout
+  into a Kconfig-selected profile under
+  `firmware/main/displays/<name>/`. UI layout is geometry-bound, so
+  one driver-plus-layout unit per screen reads more honestly than a
+  runtime polymorphism. The `mock_display` profile envisioned by FR-5.3
+  is still possible — it would simply be another build-time profile —
+  but is deferred to Phase 3 along with the host-side tests.
+
+### 8.5 Traceability Matrix
 
 | Requirement | Priority | Test Case(s)                              | Status  |
 |-------------|----------|-------------------------------------------|---------|

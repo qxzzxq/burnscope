@@ -2,16 +2,18 @@
 
 #include "esp_netif.h"
 
+#include "nvs_store.h"
+
 /*
- * wifi.h — Phase 1 WiFi STA bring-up with exponential-backoff reconnect.
+ * wifi.h — runtime-configurable WiFi: STA from caller-supplied creds, or
+ * open AP for captive-portal provisioning. Exponential-backoff reconnect
+ * is preserved from Phase 1.
  *
- * Credentials are taken from the gitignored `wifi_creds.h` at compile time
- * (Phase 1 only — Phase 2 reads them from NVS via captive-portal flow).
- *
- * Lifecycle:
- *   wifi_init()                  — one-shot init of netif + esp_wifi
- *   wifi_register_state_cb(cb)   — main subscribes for state changes
- *   wifi_start()                 — kicks off STA connect; reconnects forever
+ * Typical sequence:
+ *   wifi_init();                           // once at boot
+ *   wifi_register_state_cb(cb);            // optional
+ *   if (have creds in NVS) wifi_start_sta(&creds);
+ *   else                   wifi_start_ap("BURNSCOPE-XXXX");
  */
 
 typedef enum {
@@ -19,24 +21,33 @@ typedef enum {
     WIFI_STATE_RECONNECTING,
     WIFI_STATE_GOT_IP,
     WIFI_STATE_DISCONNECTED,
+    WIFI_STATE_AP_MODE,
 } wifi_state_t;
 
 typedef void (*wifi_state_cb_t)(wifi_state_t state);
 
 /**
- * Initialise TCP/IP stack, event loop, and esp_wifi (STA mode).
- *
- * Returns the STA netif handle (never NULL — panics on failure).
+ * Initialise TCP/IP stack + event loop + esp_wifi core. Does NOT pick a
+ * mode or programme any SSID — the subsequent `wifi_start_*` call does
+ * that. Idempotent.
  */
-esp_netif_t *wifi_init(void);
+void wifi_init(void);
 
 /**
- * Register a state-change callback. The callback is invoked from the
- * default event loop task. NULL clears the callback.
+ * Register a state-change callback. Invoked from the default event loop
+ * task. NULL clears the callback.
  */
 void wifi_register_state_cb(wifi_state_cb_t cb);
 
 /**
- * Start the STA association. Triggers WIFI_STATE_CONNECTING immediately.
+ * Start station mode with the supplied credentials. Triggers
+ * WIFI_STATE_CONNECTING immediately; later transitions arrive via the
+ * registered callback.
  */
-void wifi_start(void);
+void wifi_start_sta(const wifi_creds_t *creds);
+
+/**
+ * Bring up an open SoftAP advertising `ssid` on channel 1, 192.168.4.0/24.
+ * Used by the captive-portal flow. Issues WIFI_STATE_AP_MODE.
+ */
+void wifi_start_ap(const char *ssid);

@@ -5,12 +5,18 @@ CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions-4mb.csv"
 CONFIG_PARTITION_TABLE_FILENAME="partitions-4mb.csv"
 
+# Build-time-selected display profile (Phase 2): the ST7789 CYD.
+CONFIG_BURNSCOPE_DISPLAY_CYD2USB_ST7789=y
+
 # LVGL has plenty of room to grow; bump main task stack.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 
-# LVGL color depth + a larger font for the hello-world label.
+# LVGL color depth + fonts.
+#  - montserrat_24 is used by the header and splash.
+#  - unscii_16 is the body's monospaced bitmap font (FR-4.2).
 CONFIG_LV_COLOR_DEPTH_16=y
 CONFIG_LV_FONT_MONTSERRAT_24=y
+CONFIG_LV_FONT_UNSCII_16=y
 
 # Task Watchdog (FSD NFR-3.2): reboot if any subscribed task ceases to feed.
 CONFIG_ESP_TASK_WDT_EN=y
@@ -18,5 +24,9 @@ CONFIG_ESP_TASK_WDT_INIT=y
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
 CONFIG_ESP_TASK_WDT_PANIC=y
 
-# HTTP server: give URIs some headroom for future routes.
+# HTTP server: room for future routes; small max handlers cap.
 CONFIG_HTTPD_MAX_URI_LEN=128
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+
+# SNTP resync interval: 6 h per FSD § 4.2.3.
+CONFIG_LWIP_SNTP_UPDATE_DELAY=21600000

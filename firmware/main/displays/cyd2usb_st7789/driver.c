@@ -7,7 +7,7 @@
  * BGR with inversion off (cyd2usb profile).
  */
 
-#include "panel.h"
+#include "driver.h"
 
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
@@ -34,6 +34,8 @@
 #define LCD_V_RES           240
 /* CYD display SPI is not on IOMUX pins; 40 MHz causes bit errors (C-2). */
 #define LCD_PIXEL_CLOCK_HZ  (20 * 1000 * 1000)
+
+static lv_display_t *s_display = NULL;
 
 static void enable_backlight(void)
 {
@@ -87,8 +89,12 @@ static esp_lcd_panel_handle_t init_st7789(esp_lcd_panel_io_handle_t *io_out)
     return panel_handle;
 }
 
-lv_display_t *panel_init(void)
+lv_display_t *cyd2usb_st7789_driver_init(void)
 {
+    if (s_display != NULL) {
+        return s_display;
+    }
+
     enable_backlight();
 
     esp_lcd_panel_io_handle_t io_handle = NULL;
@@ -116,5 +122,6 @@ lv_display_t *panel_init(void)
             .swap_bytes = true,
         },
     };
-    return lvgl_port_add_disp(&disp_cfg);
+    s_display = lvgl_port_add_disp(&disp_cfg);
+    return s_display;
 }

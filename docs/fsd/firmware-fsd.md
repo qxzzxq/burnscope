@@ -503,13 +503,29 @@ See FR-4. Sketch:
 │ [logo]       USAGE                  [batt]   │ ← header
 ├──────────────────────────────────────────────┤
 │ ╭──────────────────────────────────────────╮ │
-│ │ [5h ]  ██████░░░░░░░░░░░░░░░  37%  2h12m │ │
+│ │ 5h                                   63% │ │ ← type · remaining
+│ │ █████████████████████████░░░░░░░░░░░░░░░ │ │ ← progress bar
+│ │ resets in 2h 12m                         │ │ ← countdown
 │ ╰──────────────────────────────────────────╯ │
 │ ╭──────────────────────────────────────────╮ │
-│ │ [7d ]  ███░░░░░░░░░░░░░░░░░░  18%  4d05h │ │
+│ │ 7d                                   82% │ │
+│ │ █████████████████████████████████░░░░░░░ │ │
+│ │ resets in 4d 05h                         │ │
 │ ╰──────────────────────────────────────────╯ │
 └──────────────────────────────────────────────┘
 ```
+
+Per-row layout:
+
+1. **Header sub-row** — session `type` (from `SessionSnapshot.type`,
+   verbatim) on the left; remaining percentage (`100 − used_pct`,
+   rounded) on the right.
+2. **Bar sub-row** — horizontal progress bar whose filled portion
+   represents remaining capacity, so the bar and the percentage track
+   together (full bar = lots of headroom; empty bar = burned through).
+3. **Countdown sub-row** — `resets in Xh XXm` when the remaining time
+   to `resets_at` is < 24 h; otherwise `resets in Xd XXh`. The minute /
+   hour field is zero-padded to two digits.
 
 ### 6.2 Internal Interfaces
 

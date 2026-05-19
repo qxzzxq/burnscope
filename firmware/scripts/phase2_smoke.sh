@@ -31,8 +31,8 @@ CLAUDE_7D=$((NOW + 5 * 86400))
 claude_body=$(cat <<EOF
 {"agent":"claude","captured_at":${NOW},
  "sessions":[
-   {"type":"5h","used_pct":0.03,"resets_at":${CLAUDE_5H}},
-   {"type":"7d","used_pct":0.09,"resets_at":${CLAUDE_7D}}
+   {"type":"current","used_pct":0.03,"resets_at":${CLAUDE_5H}},
+   {"type":"weekly","used_pct":0.09,"resets_at":${CLAUDE_7D}}
  ]}
 EOF
 )
@@ -81,7 +81,7 @@ code=$(curl -s -o /dev/null -w '%{http_code}' \
 note "TC-SUM-104: used_pct=1.5 ⇒ 400"
 oor_body=$(cat <<EOF
 {"agent":"claude","captured_at":${NOW},
- "sessions":[{"type":"5h","used_pct":1.5,"resets_at":${RESET_5}}]}
+ "sessions":[{"type":"current","used_pct":1.5,"resets_at":${RESET_5}}]}
 EOF
 )
 code=$(curl -s -o /dev/null -w '%{http_code}' \

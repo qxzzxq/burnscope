@@ -92,8 +92,8 @@ async def test_daemon_probes_and_pushes_to_fake_esp(tmp_path: Path, fake_esp):
         agent="claude",
         captured_at=1779050146,
         sessions=[
-            SessionSnapshot("5h", 0.03, 1779066600),
-            SessionSnapshot("7d", 0.09, 1779156000),
+            SessionSnapshot("current", 0.03, 1779066600),
+            SessionSnapshot("weekly", 0.09, 1779156000),
         ],
     )
     agent = _StubAgent("claude", expected)
@@ -128,7 +128,7 @@ async def test_daemon_uses_active_interval_after_jsonl_change(tmp_path: Path, fa
     snapshot = AgentSnapshot(
         agent="claude",
         captured_at=1,
-        sessions=[SessionSnapshot("5h", 0.0, 1)],
+        sessions=[SessionSnapshot("current", 0.0, 1)],
     )
     agent = _StubAgent("claude", snapshot)
 
@@ -164,7 +164,7 @@ async def test_daemon_pushes_one_snapshot_per_agent(tmp_path: Path, fake_esp):
     claude_snap = AgentSnapshot(
         agent="claude",
         captured_at=1,
-        sessions=[SessionSnapshot("5h", 0.1, 100)],
+        sessions=[SessionSnapshot("current", 0.1, 100)],
     )
     codex_snap = AgentSnapshot(
         agent="codex",

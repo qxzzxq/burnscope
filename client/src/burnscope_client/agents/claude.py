@@ -2,7 +2,8 @@
 
 Issues a tiny `POST /v1/messages` (max_tokens=1) to api.anthropic.com
 using the user's OAuth token and parses the
-`anthropic-ratelimit-unified-{5h,7d}-*` response headers into an
+`anthropic-ratelimit-unified-{5h,7d}-*` response headers (relabelled
+to `current`/`weekly`) into an
 `AgentSnapshot` matching `docs/wire-format.md`.
 
 Anthropic already returns `utilization` as a `0.0`-`1.0` float, so no
@@ -28,7 +29,13 @@ API_URL = "https://api.anthropic.com/v1/messages"
 PROBE_MODEL = "claude-haiku-4-5-20251001"
 USER_AGENT = "claude-code/2.1.5"
 
-_SESSION_TYPES = ("5h", "7d")
+# Maps the Anthropic header window (`5h`/`7d`) to the BurnScope session
+# label we emit on the wire. Anthropic's own vocabulary stays in the
+# header names; the daemon presents a friendlier label downstream.
+_SESSION_TYPES: tuple[tuple[str, str], ...] = (
+    ("5h", "current"),
+    ("7d", "weekly"),
+)
 
 
 @dataclass(frozen=True)
@@ -134,16 +141,16 @@ class ClaudeAgent(Agent):
 def _parse_sessions(headers: httpx.Headers) -> list[SessionSnapshot]:
     """Extract zero or more sessions from Anthropic's response headers."""
     sessions: list[SessionSnapshot] = []
-    for session_type in _SESSION_TYPES:
-        util = headers.get(f"anthropic-ratelimit-unified-{session_type}-utilization")
-        reset = headers.get(f"anthropic-ratelimit-unified-{session_type}-reset")
+    for window, label in _SESSION_TYPES:
+        util = headers.get(f"anthropic-ratelimit-unified-{window}-utilization")
+        reset = headers.get(f"anthropic-ratelimit-unified-{window}-reset")
         if util is None or reset is None:
             continue
         sessions.append(
             SessionSnapshot(
-                type=session_type,
-                used_pct=_parse_float(util, session_type, "utilization"),
-                resets_at=_parse_reset(reset, session_type),
+                type=label,
+                used_pct=_parse_float(util, label, "utilization"),
+                resets_at=_parse_reset(reset, label),
             )
         )
     return sessions

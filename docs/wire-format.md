@@ -31,10 +31,12 @@ All sessions reported by one agent at one point in time.
 | `captured_at` | integer (unix s) | When the daemon read the headers from the upstream API. |
 | `sessions`    | array of `SessionSnapshot` | One or more session entries. Order is not guaranteed; clients look up by `type`. |
 
-Each agent uses its own vocabulary for `type` (Claude reports `5h`/`7d`;
-Codex reports `primary`/`secondary`); the daemon passes those labels through
-untouched. Clients should render any `type` they receive — including ones
-they don't recognise — using the raw string as the label.
+Each agent uses its own vocabulary for `type` (Claude reports
+`current`/`weekly` — derived from Anthropic's `5h`/`7d` rate-limit
+windows; Codex reports `primary`/`secondary`); the daemon passes those
+labels through untouched. Clients should render any `type` they receive
+— including ones they don't recognise — using the raw string as the
+label.
 
 ---
 
@@ -62,8 +64,8 @@ and `docs/probe-codex.sh`.
 
 | Agent    | `sessions[].type` | `used_pct` header                              | `resets_at` header                |
 |----------|-------------------|------------------------------------------------|-----------------------------------|
-| `claude` | `5h`              | `anthropic-ratelimit-unified-5h-utilization`   | `anthropic-ratelimit-unified-5h-reset` |
-| `claude` | `7d`              | `anthropic-ratelimit-unified-7d-utilization`   | `anthropic-ratelimit-unified-7d-reset` |
+| `claude` | `current`         | `anthropic-ratelimit-unified-5h-utilization`   | `anthropic-ratelimit-unified-5h-reset` |
+| `claude` | `weekly`          | `anthropic-ratelimit-unified-7d-utilization`   | `anthropic-ratelimit-unified-7d-reset` |
 | `codex`  | `primary`         | `x-codex-primary-used-percent` ÷ 100           | `x-codex-primary-reset-at`        |
 | `codex`  | `secondary`       | `x-codex-secondary-used-percent` ÷ 100         | `x-codex-secondary-reset-at`      |
 
@@ -83,7 +85,7 @@ re-litigate without a reason.
   shows both windows simultaneously.
 - **Third-tier buckets.** Claude `unified-overage-*` (pay-per-use overage) and
   Codex `x-codex-credits-*` (pay-as-you-go credits) describe a third quota
-  beyond 5h+7d. These fit the current schema — they'd just be an additional
+  beyond Claude's `current`+`weekly` (5h+7d) windows. These fit the current schema — they'd just be an additional
   `sessions[]` entry (e.g. `type: "overage"` or `type: "credits"`) — so the
   daemon and firmware need no contract changes when we wire them up.
   Deferred only because the MVP display doesn't render them.

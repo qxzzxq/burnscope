@@ -52,7 +52,7 @@ glance.
 - Accept `POST /summary` and render the result within a budget that feels
   immediate to the user.
 - Render whatever `sessions[].type` strings arrive, so the same firmware
-  works for Claude Code's `5h`/`7d` and Codex CLI's `primary`/`secondary`.
+  works for Claude Code's `current`/`weekly` and Codex CLI's `primary`/`secondary`.
 - Be stable enough to leave running for weeks (always-on watchdog).
 
 **Non-goals (deferred to Phase 2 or out of scope):**
@@ -503,12 +503,12 @@ See FR-4. Sketch:
 │ [logo]       USAGE                  [batt]   │ ← header
 ├──────────────────────────────────────────────┤
 │ ╭──────────────────────────────────────────╮ │
-│ │ 5h                                   63% │ │ ← type · remaining
+│ │ current                              63% │ │ ← type · remaining
 │ │ █████████████████████████░░░░░░░░░░░░░░░ │ │ ← progress bar
 │ │ resets in 2h 12m                         │ │ ← countdown
 │ ╰──────────────────────────────────────────╯ │
 │ ╭──────────────────────────────────────────╮ │
-│ │ 7d                                   82% │ │
+│ │ weekly                               82% │ │
 │ │ █████████████████████████████████░░░░░░░ │ │
 │ │ resets in 4d 05h                         │ │
 │ ╰──────────────────────────────────────────╯ │
@@ -891,8 +891,8 @@ Source: `firmware/main/main.c`.
   "agent": "claude",
   "captured_at": 1779050146,
   "sessions": [
-    { "type": "5h", "used_pct": 0.03, "resets_at": 1779066600 },
-    { "type": "7d", "used_pct": 0.09, "resets_at": 1779156000 }
+    { "type": "current", "used_pct": 0.03, "resets_at": 1779066600 },
+    { "type": "weekly", "used_pct": 0.09, "resets_at": 1779156000 }
   ]
 }
 ```

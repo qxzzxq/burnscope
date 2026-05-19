@@ -48,12 +48,12 @@ async def test_probe_builds_snapshot_from_headers():
     assert abs(snap.captured_at - int(time.time())) < 5
 
     by_type = {s.type: s for s in snap.sessions}
-    assert set(by_type) == {"5h", "7d"}
-    assert by_type["5h"].used_pct == pytest.approx(0.03)
+    assert set(by_type) == {"current", "weekly"}
+    assert by_type["current"].used_pct == pytest.approx(0.03)
     # 2026-05-18T17:30:00Z and 2026-05-19T18:00:00Z
-    assert by_type["5h"].resets_at == 1779125400
-    assert by_type["7d"].used_pct == pytest.approx(0.09)
-    assert by_type["7d"].resets_at == 1779213600
+    assert by_type["current"].resets_at == 1779125400
+    assert by_type["weekly"].used_pct == pytest.approx(0.09)
+    assert by_type["weekly"].resets_at == 1779213600
 
 
 @respx.mock
@@ -91,7 +91,7 @@ async def test_probe_partial_headers_returns_only_present_sessions():
         snap = await _agent("t").probe(client)
 
     types = [s.type for s in snap.sessions]
-    assert types == ["5h"]
+    assert types == ["current"]
 
 
 @respx.mock
@@ -125,8 +125,8 @@ async def test_probe_http_error_raises():
 
 
 def test_session_snapshot_dataclass_fields():
-    s = SessionSnapshot(type="5h", used_pct=0.5, resets_at=123)
-    assert s.type == "5h"
+    s = SessionSnapshot(type="current", used_pct=0.5, resets_at=123)
+    assert s.type == "current"
     assert s.used_pct == 0.5
     assert s.resets_at == 123
 
@@ -135,10 +135,10 @@ def test_agent_snapshot_dataclass_fields():
     snap = AgentSnapshot(
         agent="claude",
         captured_at=100,
-        sessions=[SessionSnapshot("5h", 0.1, 200)],
+        sessions=[SessionSnapshot("current", 0.1, 200)],
     )
     assert snap.agent == "claude"
-    assert snap.sessions[0].type == "5h"
+    assert snap.sessions[0].type == "current"
 
 
 def test_claude_agent_name():

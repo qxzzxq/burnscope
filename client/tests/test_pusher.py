@@ -11,8 +11,8 @@ def _snapshot() -> AgentSnapshot:
         agent="claude",
         captured_at=1779050146,
         sessions=[
-            SessionSnapshot("5h", 0.03, 1779066600),
-            SessionSnapshot("7d", 0.09, 1779156000),
+            SessionSnapshot("current", 0.03, 1779066600),
+            SessionSnapshot("weekly", 0.09, 1779156000),
         ],
     )
 

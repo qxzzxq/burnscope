@@ -19,7 +19,7 @@ class SessionSnapshot:
     """One rate-limit session (rolling-quota window) at one point in time.
 
     Fields:
-        type: Agent-defined label (e.g. `"5h"`, `"7d"` for Claude;
+        type: Agent-defined label (e.g. `"current"`, `"weekly"` for Claude;
             `"primary"`, `"secondary"` for Codex). Passed through to the
             display untouched.
         used_pct: Fraction of the session used, in `0.0`-`1.0`. Agents

@@ -69,8 +69,8 @@ static int s_cycle_ticks = 0;
  * constant expression, so we keep the palette as 0xRRGGBB ints and
  * convert at use. */
 static const uint32_t ROW_ACCENT_RGB[SNAPSHOT_MAX_SESSIONS] = {
-    0xFF9A3C,   /* warm orange */
-    0x4FC3F7,   /* sky blue   */
+    0xDE7356,   /* clay     */
+    0xA4A049,   /* olive    */
     0xB0BEC5,   /* fallback grey for a future 3rd row */
 };
 
@@ -167,14 +167,20 @@ static void build_row(lv_obj_t *parent, int row_idx, int y_offset, int height)
     lv_obj_align(pct_lbl, LV_ALIGN_TOP_RIGHT, 0, 2);
 
     lv_obj_t *bar = lv_bar_create(card);
-    lv_obj_set_size(bar, 288, 10);
+    lv_obj_set_size(bar, 292, 15);
     lv_obj_align(bar, LV_ALIGN_TOP_LEFT, 0, 34);
     lv_bar_set_range(bar, 0, 1000);
     lv_bar_set_value(bar, 0, LV_ANIM_OFF);
+    /* Explicit bg_opa + zero border on both parts: the default theme can
+     * leave PART_MAIN transparent, which kills the visible track. */
     lv_obj_set_style_bg_color(bar, lv_color_hex(0x2F2F2F), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(bar, 0, LV_PART_MAIN);
     lv_obj_set_style_bg_color(bar, lv_color_hex(ROW_ACCENT_RGB[row_idx]), LV_PART_INDICATOR);
-    lv_obj_set_style_radius(bar, 4, LV_PART_MAIN);
-    lv_obj_set_style_radius(bar, 4, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_INDICATOR);
+    lv_obj_set_style_border_width(bar, 0, LV_PART_INDICATOR);
+    lv_obj_set_style_radius(bar, 3, LV_PART_MAIN);
+    lv_obj_set_style_radius(bar, 3, LV_PART_INDICATOR);
 
     lv_obj_t *countdown_lbl = lv_label_create(card);
     lv_label_set_text(countdown_lbl, "resets in --");

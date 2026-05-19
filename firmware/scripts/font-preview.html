@@ -19,15 +19,11 @@
     --panel-bg: #000;
     --card-bg: #1C1C1C;
     --chip-bg: #2E2E2E;
-    --label-grey: #9E9E9E;
-    --countdown-grey: #CCCCCC;
-    --bar-track: #2F2F2F;
-    --row1: #FF9A3C;
-    --row2: #4FC3F7;
     --text: #e5e5e5;
     --muted: #888;
     --accent: #4FC3F7;
   }
+
 
   html, body {
     background: var(--bg);
@@ -89,6 +85,17 @@
   }
 
   .panel {
+    /* Panel-scoped colors — driven by the sidebar color pickers. */
+    --title-fg: #FFFFFF;
+    --chip-fg: #9E9E9E;
+    --pct-fg: #9E9E9E;
+    --countdown-fg: #CCCCCC;
+    --bar-track: #2F2F2F;
+    --row1: #DE7356;
+    --row2: #A4A049;
+    --bar-radius: 3px;
+    --bar-height: 15px;
+
     width: 320px;
     height: 240px;
     background: var(--panel-bg);
@@ -119,7 +126,7 @@
      * variant gets baked into firmware/main/fonts/. */
     font-weight: 400;
     line-height: 1;
-    color: #fff;
+    color: var(--title-fg);
   }
 
   /* Brand icon in the top-left slot the agent dot used to occupy. No disc,
@@ -154,7 +161,7 @@
     position: absolute;
     left: 6px; top: 6px;
     background: var(--chip-bg);
-    color: var(--label-grey);
+    color: var(--chip-fg);
     border-radius: 6px;
     padding: 2px 8px;
     line-height: 1.1;
@@ -164,7 +171,7 @@
   .pct {
     position: absolute;
     right: 6px; top: 8px;
-    color: var(--label-grey);
+    color: var(--pct-fg);
     line-height: 1;
     font-family: "Montserrat", sans-serif;
   }
@@ -172,22 +179,60 @@
   .bar {
     position: absolute;
     left: 6px; top: 40px;
-    width: 288px;
-    height: 10px;
+    width: 292px;
+    height: var(--bar-height);
     background: var(--bar-track);
-    border-radius: 4px;
+    border-radius: var(--bar-radius);
     overflow: hidden;
   }
   .bar > i {
     display: block;
     height: 100%;
-    border-radius: 4px;
+    border-radius: var(--bar-radius);
   }
+  .row.r1 .bar > i { background: var(--row1); }
+  .row.r2 .bar > i { background: var(--row2); }
+
+  /* Sidebar color-picker grid */
+  .swatch-row {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+  .swatch-row:last-child { margin-bottom: 0; }
+  .swatch-row label {
+    margin-bottom: 0;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .swatch-row input[type="color"] {
+    width: 36px;
+    height: 24px;
+    padding: 0;
+    border: 1px solid #2a2a2d;
+    border-radius: 4px;
+    background: #1c1c1f;
+    cursor: pointer;
+  }
+  .reset-btn {
+    margin-top: 8px;
+    background: #1b1b1d;
+    color: var(--muted);
+    border: 1px solid #2a2a2d;
+    border-radius: 6px;
+    padding: 4px 10px;
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .reset-btn:hover { color: var(--text); }
 
   .countdown {
     position: absolute;
     left: 6px; bottom: 6px;
-    color: var(--countdown-grey);
+    color: var(--countdown-fg);
     line-height: 1;
     font-family: "Montserrat", sans-serif;
   }
@@ -279,14 +324,14 @@
         <div class="row r1">
           <div class="chip body" id="chip1">current</div>
           <div class="pct body" id="pct1">42%</div>
-          <div class="bar"><i style="width:42%; background:var(--row1)"></i></div>
+          <div class="bar"><i style="width:42%"></i></div>
           <div class="countdown body" id="cd1">resets in 3h 12m</div>
         </div>
 
         <div class="row r2">
           <div class="chip body" id="chip2">weekly</div>
           <div class="pct body" id="pct2">17%</div>
-          <div class="bar"><i style="width:17%; background:var(--row2)"></i></div>
+          <div class="bar"><i style="width:17%"></i></div>
           <div class="countdown body" id="cd2">resets in 4d 02h</div>
         </div>
       </div>
@@ -335,6 +380,51 @@
           <option value="burst">Burst</option>
           <option value="pixel">Pixel C</option>
         </select>
+      </div>
+    </div>
+
+    <h2>Colors (text &amp; bars)</h2>
+    <div class="group" id="color-group">
+      <div class="swatch-row">
+        <label for="c-title">Title text</label>
+        <input type="color" id="c-title" data-var="--title-fg" value="#FFFFFF">
+      </div>
+      <div class="swatch-row">
+        <label for="c-chip">Row label (chip)</label>
+        <input type="color" id="c-chip" data-var="--chip-fg" value="#9E9E9E">
+      </div>
+      <div class="swatch-row">
+        <label for="c-pct">Percent text</label>
+        <input type="color" id="c-pct" data-var="--pct-fg" value="#9E9E9E">
+      </div>
+      <div class="swatch-row">
+        <label for="c-cd">Countdown text</label>
+        <input type="color" id="c-cd" data-var="--countdown-fg" value="#CCCCCC">
+      </div>
+      <div class="swatch-row">
+        <label for="c-row1">Row 1 bar fill</label>
+        <input type="color" id="c-row1" data-var="--row1" value="#DE7356">
+      </div>
+      <div class="swatch-row">
+        <label for="c-row2">Row 2 bar fill</label>
+        <input type="color" id="c-row2" data-var="--row2" value="#A4A049">
+      </div>
+      <div class="swatch-row">
+        <label for="c-track">Bar track</label>
+        <input type="color" id="c-track" data-var="--bar-track" value="#2F2F2F">
+      </div>
+      <button type="button" class="reset-btn" id="reset-colors">Reset to defaults</button>
+    </div>
+
+    <h2>Bar shape</h2>
+    <div class="group">
+      <div class="swatch-row">
+        <label for="bar-radius">Corner radius <span id="bar-radius-val">3 px</span></label>
+        <input type="range" id="bar-radius" min="0" max="20" step="1" value="3" style="width:90px">
+      </div>
+      <div class="swatch-row">
+        <label for="bar-height">Height <span id="bar-height-val">15 px</span></label>
+        <input type="range" id="bar-height" min="2" max="40" step="1" value="15" style="width:90px">
       </div>
     </div>
 
@@ -503,6 +593,45 @@
   document.querySelectorAll(".stage-controls button").forEach(b => {
     b.addEventListener("click", () => setScale(parseInt(b.dataset.scale, 10)));
   });
+
+  // Colors — each input owns one CSS variable scoped to the panel.
+  const colorInputs = document.querySelectorAll("#color-group input[type=color]");
+  const colorDefaults = new Map();
+  colorInputs.forEach(inp => {
+    colorDefaults.set(inp.id, inp.value);
+    panelEl.style.setProperty(inp.dataset.var, inp.value);
+    inp.addEventListener("input", () => {
+      panelEl.style.setProperty(inp.dataset.var, inp.value);
+    });
+  });
+  document.getElementById("reset-colors").addEventListener("click", () => {
+    colorInputs.forEach(inp => {
+      const def = colorDefaults.get(inp.id);
+      inp.value = def;
+      panelEl.style.setProperty(inp.dataset.var, def);
+    });
+  });
+
+  // Bar corner radius slider — drives --bar-radius (used by both track and fill).
+  const barRadiusEl = $("bar-radius");
+  const barRadiusValEl = $("bar-radius-val");
+  function applyBarRadius() {
+    const px = parseInt(barRadiusEl.value, 10);
+    panelEl.style.setProperty("--bar-radius", px + "px");
+    barRadiusValEl.textContent = px + " px";
+  }
+  barRadiusEl.addEventListener("input", applyBarRadius);
+  applyBarRadius();
+
+  const barHeightEl = $("bar-height");
+  const barHeightValEl = $("bar-height-val");
+  function applyBarHeight() {
+    const px = parseInt(barHeightEl.value, 10);
+    panelEl.style.setProperty("--bar-height", px + "px");
+    barHeightValEl.textContent = px + " px";
+  }
+  barHeightEl.addEventListener("input", applyBarHeight);
+  applyBarHeight();
 
   redraw();
 </script>

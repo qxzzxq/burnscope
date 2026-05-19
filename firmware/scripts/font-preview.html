@@ -1,0 +1,444 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>BurnScope · agent-screen font preview</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700&display=block" rel="stylesheet">
+<style>
+  /* UNSCII bitmap font — best-effort load; falls back to ui-monospace. */
+  @font-face {
+    font-family: "Unscii-16";
+    src: url("https://cdn.jsdelivr.net/npm/unscii@1.0.0/dist/unscii-16.woff2") format("woff2");
+    font-display: block;
+  }
+
+  :root {
+    --bg: #0b0b0c;
+    --panel-bg: #000;
+    --card-bg: #1C1C1C;
+    --chip-bg: #2E2E2E;
+    --label-grey: #9E9E9E;
+    --countdown-grey: #CCCCCC;
+    --bar-track: #2F2F2F;
+    --row1: #FF9A3C;
+    --row2: #4FC3F7;
+    --text: #e5e5e5;
+    --muted: #888;
+    --accent: #4FC3F7;
+  }
+
+  html, body {
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.4 -apple-system, "Helvetica Neue", Arial, sans-serif;
+    margin: 0;
+    padding: 0;
+  }
+
+  .app {
+    display: grid;
+    grid-template-columns: auto 320px;
+    gap: 40px;
+    padding: 32px;
+    align-items: start;
+  }
+
+  .stage {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    align-items: flex-start;
+  }
+
+  .stage-controls {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+
+  .stage-controls button {
+    background: #1b1b1d;
+    color: var(--text);
+    border: 1px solid #2a2a2d;
+    border-radius: 6px;
+    padding: 4px 10px;
+    font: inherit;
+    cursor: pointer;
+  }
+
+  .stage-controls button.on {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  /* The 320×240 panel, scaled via CSS transform without affecting layout. */
+  .panel-wrap {
+    background: #1a1a1c;
+    padding: 12px;
+    border-radius: 8px;
+    border: 1px solid #2a2a2d;
+    /* enough box for the 2x default scale */
+    width: calc(320px * 2 + 24px);
+    height: calc(240px * 2 + 24px);
+    box-sizing: border-box;
+    display: flex;
+    align-items: flex-start;
+    justify-content: flex-start;
+  }
+
+  .panel {
+    width: 320px;
+    height: 240px;
+    background: var(--panel-bg);
+    color: #fff;
+    position: relative;
+    overflow: hidden;
+    transform-origin: 0 0;
+    /* default 2× */
+    transform: scale(2);
+  }
+
+  /* Header layer (40 px tall — matches ui.c:216 `top = 40`). */
+  .header {
+    position: absolute;
+    left: 0; right: 0; top: 0;
+    height: 40px;
+  }
+
+  .agent-dot {
+    position: absolute;
+    left: 8px; top: 6px;
+    width: 24px; height: 24px;
+    border-radius: 12px;
+    background: #fff;
+  }
+
+  .title {
+    position: absolute;
+    left: 0; right: 0; top: 8px;
+    text-align: center;
+    font-family: "Montserrat", sans-serif;
+    font-weight: 600;
+    line-height: 1;
+    color: #fff;
+  }
+
+  /* Rows. Two cards, 88 px tall, 304 wide, centred, with 8 px gap. */
+  .row {
+    position: absolute;
+    left: 8px; right: 8px;
+    width: 304px;
+    height: 88px;
+    background: var(--card-bg);
+    border-radius: 8px;
+    padding: 6px;
+    box-sizing: border-box;
+  }
+  .row.r1 { top: 48px; }   /* 40 + 8 */
+  .row.r2 { top: 144px; }  /* 40 + 8 + 88 + 8 */
+
+  .chip {
+    position: absolute;
+    left: 6px; top: 6px;
+    background: var(--chip-bg);
+    color: var(--label-grey);
+    border-radius: 6px;
+    padding: 2px 8px;
+    line-height: 1.1;
+    font-family: "Montserrat", sans-serif;
+  }
+
+  .pct {
+    position: absolute;
+    right: 6px; top: 8px;
+    color: var(--label-grey);
+    line-height: 1;
+    font-family: "Montserrat", sans-serif;
+  }
+
+  .bar {
+    position: absolute;
+    left: 6px; top: 40px;
+    width: 288px;
+    height: 10px;
+    background: var(--bar-track);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .bar > i {
+    display: block;
+    height: 100%;
+    border-radius: 4px;
+  }
+
+  .countdown {
+    position: absolute;
+    left: 6px; bottom: 6px;
+    color: var(--countdown-grey);
+    line-height: 1;
+    font-family: "Montserrat", sans-serif;
+  }
+
+  /* Sidebar */
+  .sidebar {
+    background: #131316;
+    border: 1px solid #2a2a2d;
+    border-radius: 10px;
+    padding: 20px;
+  }
+
+  .sidebar h2 {
+    margin: 0 0 12px 0;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+
+  .group { margin-bottom: 20px; }
+  .group:last-child { margin-bottom: 0; }
+
+  .row-2 {
+    display: grid;
+    grid-template-columns: 1fr 90px;
+    gap: 8px;
+  }
+
+  label {
+    display: block;
+    color: var(--muted);
+    font-size: 12px;
+    margin-bottom: 4px;
+  }
+
+  select {
+    width: 100%;
+    background: #1c1c1f;
+    color: var(--text);
+    border: 1px solid #2a2a2d;
+    border-radius: 6px;
+    padding: 6px 8px;
+    font: inherit;
+  }
+
+  .snippet {
+    margin-top: 20px;
+    padding: 12px;
+    background: #0e0e10;
+    border: 1px solid #2a2a2d;
+    border-radius: 8px;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 12px;
+    color: var(--accent);
+    user-select: all;
+  }
+
+  .note {
+    margin-top: 12px;
+    font-size: 12px;
+    color: var(--muted);
+    line-height: 1.5;
+  }
+  .note.warn {
+    color: #ffb24a;
+  }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <div class="stage">
+    <div class="stage-controls">
+      <span style="color:var(--muted)">Scale:</span>
+      <button data-scale="1">1×</button>
+      <button data-scale="2" class="on">2×</button>
+      <button data-scale="3">3×</button>
+    </div>
+
+    <div class="panel-wrap" id="panel-wrap">
+      <div class="panel" id="panel">
+        <div class="header">
+          <div class="agent-dot"></div>
+          <div class="title" id="title">Usage</div>
+        </div>
+
+        <div class="row r1">
+          <div class="chip body" id="chip1">current</div>
+          <div class="pct body" id="pct1">42%</div>
+          <div class="bar"><i style="width:42%; background:var(--row1)"></i></div>
+          <div class="countdown body" id="cd1">resets in 3h 12m</div>
+        </div>
+
+        <div class="row r2">
+          <div class="chip body" id="chip2">weekly</div>
+          <div class="pct body" id="pct2">17%</div>
+          <div class="bar"><i style="width:17%; background:var(--row2)"></i></div>
+          <div class="countdown body" id="cd2">resets in 4d 02h</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="snippet" id="snippet">Title: Montserrat 24 · Body: New York 22</div>
+  </div>
+
+  <aside class="sidebar">
+    <h2>Title (the "Usage" header)</h2>
+    <div class="group row-2">
+      <div>
+        <label for="title-family">Font</label>
+        <select id="title-family"></select>
+      </div>
+      <div>
+        <label for="title-size">Size</label>
+        <select id="title-size"></select>
+      </div>
+    </div>
+
+    <h2>Body (row labels: chip, %, countdown)</h2>
+    <div class="group row-2">
+      <div>
+        <label for="body-family">Font</label>
+        <select id="body-family"></select>
+      </div>
+      <div>
+        <label for="body-size">Size</label>
+        <select id="body-size"></select>
+      </div>
+    </div>
+
+    <div class="note" id="note"></div>
+  </aside>
+
+</div>
+
+<script>
+  // Source of truth: what's actually compilable into the firmware today.
+  // Sizes listed here are sizes LVGL ships; for New York, only 22 is baked.
+  const FAMILIES = {
+    "Montserrat": {
+      css: '"Montserrat", sans-serif',
+      sizes: [8,10,12,14,16,18,20,22,24,26,28,30,32,34,36,38,40,42,44,46,48],
+      note: "",
+    },
+    "Unscii-16 (bitmap)": {
+      css: '"Unscii-16", ui-monospace, "SF Mono", Menlo, monospace',
+      sizes: [8, 16],
+      note: "UNSCII is a pixel font designed for low-res displays. Web rendering is approximate; the firmware will render it crisply at the exact pixel size.",
+    },
+    "New York (serif)": {
+      css: 'ui-serif, "New York", "Times New Roman", serif',
+      sizes: [22],
+      note: "Only 22 px is currently baked into firmware/main/fonts/. Other sizes would require regenerating lv_font_newyork_<N>.c via LVGL's font converter.",
+    },
+  };
+
+  const $ = (id) => document.getElementById(id);
+  const titleFamilyEl = $("title-family");
+  const titleSizeEl = $("title-size");
+  const bodyFamilyEl = $("body-family");
+  const bodySizeEl = $("body-size");
+  const noteEl = $("note");
+  const titleEl = $("title");
+  const bodyEls = document.querySelectorAll(".body");
+  const snippetEl = $("snippet");
+  const panelEl = $("panel");
+  const panelWrap = $("panel-wrap");
+
+  function fillFamilies(sel) {
+    sel.innerHTML = "";
+    for (const name of Object.keys(FAMILIES)) {
+      const opt = document.createElement("option");
+      opt.value = name; opt.textContent = name;
+      sel.appendChild(opt);
+    }
+  }
+
+  function fillSizes(sel, familyName, preferredSize) {
+    sel.innerHTML = "";
+    const fam = FAMILIES[familyName];
+    for (const sz of fam.sizes) {
+      const opt = document.createElement("option");
+      opt.value = String(sz);
+      opt.textContent = sz + " px";
+      sel.appendChild(opt);
+    }
+    // Try to keep the previously-selected size if the new family supports it.
+    if (preferredSize && fam.sizes.includes(preferredSize)) {
+      sel.value = String(preferredSize);
+    } else {
+      // Sensible defaults: title 24 / body 18 if available, else closest.
+      const target = sel === titleSizeEl ? 24 : 18;
+      const closest = fam.sizes.reduce((a, b) =>
+        Math.abs(b - target) < Math.abs(a - target) ? b : a);
+      sel.value = String(closest);
+    }
+  }
+
+  function redraw() {
+    const tFam = FAMILIES[titleFamilyEl.value];
+    const bFam = FAMILIES[bodyFamilyEl.value];
+    const tSz = parseInt(titleSizeEl.value, 10);
+    const bSz = parseInt(bodySizeEl.value, 10);
+
+    titleEl.style.fontFamily = tFam.css;
+    titleEl.style.fontSize = tSz + "px";
+
+    bodyEls.forEach(el => {
+      el.style.fontFamily = bFam.css;
+      el.style.fontSize = bSz + "px";
+    });
+
+    // Snippet for copy-back
+    snippetEl.textContent =
+      `Title: ${titleFamilyEl.value} ${tSz} · Body: ${bodyFamilyEl.value} ${bSz}`;
+
+    // Notes: surface family-specific caveats.
+    const notes = [];
+    if (tFam.note) notes.push("Title — " + tFam.note);
+    if (bFam.note && bFam !== tFam) notes.push("Body — " + bFam.note);
+    noteEl.textContent = notes.join("  ");
+    noteEl.className = (titleFamilyEl.value.startsWith("New York") ||
+                       bodyFamilyEl.value.startsWith("New York")) ? "note warn" : "note";
+  }
+
+  function setScale(n) {
+    panelEl.style.transform = `scale(${n})`;
+    panelWrap.style.width = `calc(320px * ${n} + 24px)`;
+    panelWrap.style.height = `calc(240px * ${n} + 24px)`;
+    document.querySelectorAll(".stage-controls button").forEach(b => {
+      b.classList.toggle("on", b.dataset.scale === String(n));
+    });
+  }
+
+  // Wire up
+  fillFamilies(titleFamilyEl);
+  fillFamilies(bodyFamilyEl);
+  titleFamilyEl.value = "Montserrat";
+  bodyFamilyEl.value = "New York (serif)";
+  fillSizes(titleSizeEl, titleFamilyEl.value, 24);
+  fillSizes(bodySizeEl, bodyFamilyEl.value, 22);
+
+  titleFamilyEl.addEventListener("change", () => {
+    const prev = parseInt(titleSizeEl.value, 10);
+    fillSizes(titleSizeEl, titleFamilyEl.value, prev);
+    redraw();
+  });
+  bodyFamilyEl.addEventListener("change", () => {
+    const prev = parseInt(bodySizeEl.value, 10);
+    fillSizes(bodySizeEl, bodyFamilyEl.value, prev);
+    redraw();
+  });
+  titleSizeEl.addEventListener("change", redraw);
+  bodySizeEl.addEventListener("change", redraw);
+
+  document.querySelectorAll(".stage-controls button").forEach(b => {
+    b.addEventListener("click", () => setScale(parseInt(b.dataset.scale, 10)));
+  });
+
+  redraw();
+</script>
+</body>
+</html>

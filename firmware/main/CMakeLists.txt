@@ -10,10 +10,9 @@ set(srcs
     "factory_reset.c"
     "provisioning.c"
     "captive_dns.c"
-    "fonts/lv_font_newyork_22.c"
 )
 
-set(inc "." "fonts")
+set(inc ".")
 
 # Build-time-selected display profile. Each profile bundles its panel
 # driver and its LVGL layout because UI design is geometry-bound.

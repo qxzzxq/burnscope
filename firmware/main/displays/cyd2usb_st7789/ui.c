@@ -4,7 +4,7 @@
  * Two screens:
  *   - Splash: title + status line + version footer. Used during boot,
  *     provisioning, and "waiting for daemon".
- *   - Agent:  FSD §6.1.6 layout — header (logo placeholder, "USAGE",
+ *   - Agent:  FSD §6.1.6 layout — header (logo placeholder, "Usage",
  *     hidden battery), two rounded rows each carrying a type tag, an
  *     integer percentage, a horizontal progress bar (filled = used_pct
  *     per FR-4.5), and a "resets in …" countdown label.
@@ -33,11 +33,6 @@
 #include "snapshot.h"
 #include "version.h"
 
-/* Apple NewYork serif, baked at 22 px (ASCII printable range) for the
- * agent screen's row labels. Sans-serif (Montserrat) would otherwise be
- * the only built-in choice in LVGL 9.5. */
-LV_FONT_DECLARE(lv_font_newyork_22);
-
 static const char *TAG = "render";
 
 /* Splash widgets. */
@@ -47,7 +42,7 @@ static lv_obj_t *s_status_label  = NULL;
 /* Agent-screen widgets (built once, mutated per snapshot). */
 static lv_obj_t *s_agent_screen  = NULL;
 static lv_obj_t *s_agent_dot     = NULL;     /* header colour swatch */
-static lv_obj_t *s_agent_label   = NULL;     /* "USAGE" or agent name */
+static lv_obj_t *s_agent_label   = NULL;     /* "Usage" or agent name */
 typedef struct {
     lv_obj_t *card;
     lv_obj_t *type_lbl;
@@ -149,7 +144,7 @@ static void build_row(lv_obj_t *parent, int row_idx, int y_offset, int height)
     /* Type tag rendered as a rounded chip with the serif face. */
     lv_obj_t *type_lbl = lv_label_create(card);
     lv_label_set_text(type_lbl, "—");
-    lv_obj_set_style_text_font(type_lbl, &lv_font_newyork_22, 0);
+    lv_obj_set_style_text_font(type_lbl, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(type_lbl, LABEL_GREY, 0);
     lv_obj_set_style_bg_color(type_lbl, CHIP_BG, 0);
     lv_obj_set_style_bg_opa(type_lbl, LV_OPA_COVER, 0);
@@ -160,7 +155,7 @@ static void build_row(lv_obj_t *parent, int row_idx, int y_offset, int height)
 
     lv_obj_t *pct_lbl = lv_label_create(card);
     lv_label_set_text(pct_lbl, "0%");
-    lv_obj_set_style_text_font(pct_lbl, &lv_font_newyork_22, 0);
+    lv_obj_set_style_text_font(pct_lbl, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(pct_lbl, LABEL_GREY, 0);
     lv_obj_align(pct_lbl, LV_ALIGN_TOP_RIGHT, 0, 2);
 
@@ -176,7 +171,7 @@ static void build_row(lv_obj_t *parent, int row_idx, int y_offset, int height)
 
     lv_obj_t *countdown_lbl = lv_label_create(card);
     lv_label_set_text(countdown_lbl, "resets in --");
-    lv_obj_set_style_text_font(countdown_lbl, &lv_font_newyork_22, 0);
+    lv_obj_set_style_text_font(countdown_lbl, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(countdown_lbl, lv_color_hex(0xCCCCCC), 0);
     lv_obj_align(countdown_lbl, LV_ALIGN_BOTTOM_LEFT, 0, 0);
 
@@ -195,7 +190,7 @@ static void build_agent_screen(void)
     lv_obj_set_style_pad_all(scr, 0, 0);
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* Header: 24x24 agent dot top-left, "USAGE" centred, battery slot
+    /* Header: 24x24 agent dot top-left, "Usage" centred, battery slot
      * top-right reserved but hidden (has_battery == false on CYD). */
     s_agent_dot = lv_obj_create(scr);
     lv_obj_set_size(s_agent_dot, 24, 24);
@@ -206,8 +201,8 @@ static void build_agent_screen(void)
     lv_obj_clear_flag(s_agent_dot, LV_OBJ_FLAG_SCROLLABLE);
 
     s_agent_label = lv_label_create(scr);
-    lv_label_set_text(s_agent_label, "USAGE");
-    lv_obj_set_style_text_font(s_agent_label, &lv_font_montserrat_24, 0);
+    lv_label_set_text(s_agent_label, "Usage");
+    lv_obj_set_style_text_font(s_agent_label, &lv_font_montserrat_28, 0);
     lv_obj_align(s_agent_label, LV_ALIGN_TOP_MID, 0, 8);
 
     /* Two body rows. Header takes ~40 px, leaves 200 px for two rows
@@ -232,7 +227,7 @@ static void render_snapshot_locked(const agent_snapshot_t *snap)
 {
     /* Header swatch + label. */
     lv_obj_set_style_bg_color(s_agent_dot, agent_accent(snap->agent), 0);
-    lv_label_set_text(s_agent_label, "USAGE");
+    lv_label_set_text(s_agent_label, "Usage");
 
     /* Pull wall clock once per repaint. May be 0 before SNTP completes;
      * the tick will pick up the right values once the clock is set. */

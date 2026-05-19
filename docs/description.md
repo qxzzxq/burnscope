@@ -31,7 +31,7 @@ Claude Code (and most subscription-based agents) work in fixed usage windows —
 └──────────────────────────┘                         └─────────────────────┘
 ```
 
-- **Python daemon** — probes each supported agent's rate-limit endpoint (a tiny throwaway request whose response headers carry the usage numbers), normalises any per-agent scale (Claude returns `0.0`-`1.0` directly; Codex returns `0`-`100` integers), builds one `AgentSnapshot` per agent, and pushes each to the ESP32. Also tails `~/.claude/projects/**/*.jsonl` as a cheap activity signal that switches probes between an active and an idle cadence. Pushes on every cycle so a freshly-booted display catches up quickly. New agents plug in by subclassing `Agent` and `Credential` — see `CLAUDE.md` for the seam.
+- **Python daemon** — probes each supported agent's rate-limit endpoint (a tiny throwaway request whose response headers carry the usage numbers), normalises any per-agent scale (Claude returns `0.0`-`1.0` directly; Codex returns `0`-`100` integers), builds one `AgentSnapshot` per agent, and pushes each to the ESP32. Each agent declares its own `probe_interval`; a `--probe-interval` CLI flag overrides it globally. Pushes on every cycle so a freshly-booted display catches up quickly. New agents plug in by subclassing `Agent` and `Credential` — see `CLAUDE.md` for the seam.
 - **ESP32 firmware** — advertises itself over mDNS as `_burnscope._tcp.local` on boot, runs a small HTTP server accepting `POST /summary`, and renders the last snapshot it received. Holds no rolling-window state of its own — the daemon does the math.
 - **Discovery** — daemon uses `zeroconf` to find the advertised service. A `--esp32-host` override is accepted for networks where mDNS fails (corporate WiFi, some routers, Docker bridges).
 
@@ -55,7 +55,7 @@ Schemas are hand-written in each language (Python, C++). Schema-as-codegen is de
 | --------------- | ------------------------------------------------------------------- |
 | Firmware        | ESP-IDF v6.x, C, `esp_lcd_ili9341` + LVGL, `mdns`, `esp_http_server` |
 | Board           | Cheap Yellow Display (ESP32-2432S028R), 320×240                     |
-| Daemon          | Python 3.11+ (`watchdog`, `httpx`, `zeroconf`)                      |
+| Daemon          | Python 3.11+ (`httpx`, `zeroconf`)                                  |
 
 WiFi credentials are captured on first boot via a captive portal and persisted to NVS. mDNS handles the rest — no addresses need to be kept in sync between the two sides.
 
@@ -95,11 +95,10 @@ To be written once MVP is implementable end-to-end.
 
 ## Client Daemon
 
-A long-running Python 3.11+ process that lives on the developer's laptop. It owns three jobs and keeps them in one event loop:
+A long-running Python 3.11+ process that lives on the developer's laptop. It owns two jobs and keeps them in one event loop:
 
-1. **Detect activity.** A `watchdog` polling observer tails `~/.claude/projects/**/*.jsonl` and records the wall-clock time of the most recent change. This is the only signal the daemon needs — not the file contents — and it costs nothing when the developer is idle.
-2. **Probe upstream agents.** Each supported agent is an `Agent` subclass that knows how to make a tiny throwaway request to its provider and parse the rate-limit headers in the response. The daemon runs one probe per agent per cycle and normalises the result into an `AgentSnapshot` matching [wire-format.md](./wire-format.md). Probes happen on an **active cadence** (default 60 s) while the JSONL signal is fresh, and an **idle cadence** (default 300 s) otherwise — so a developer typing into Claude Code gets near-realtime numbers, and a developer at lunch doesn't burn quota refreshing a display nobody is looking at.
-3. **Push to the display.** Each cycle, every cached snapshot is POSTed to the ESP32. Discovery is `zeroconf`-based on the `_burnscope._tcp.local` service; a `--esp32-host` override is accepted for networks where mDNS doesn't work (corporate WiFi, some routers, Docker bridges). On a string of push failures from an mDNS-resolved host, the daemon drops the cached address and rediscovers on the next tick.
+1. **Probe upstream agents.** Each supported agent is an `Agent` subclass that knows how to make a tiny throwaway request to its provider and parse the rate-limit headers in the response. The daemon runs one probe per agent per cycle and normalises the result into an `AgentSnapshot` matching [wire-format.md](./wire-format.md). Each agent declares its own `probe_interval` (default 120 s); a `--probe-interval` CLI flag overrides it globally.
+2. **Push to the display.** Each cycle, every cached snapshot is POSTed to the ESP32. Discovery is `zeroconf`-based on the `_burnscope._tcp.local` service; a `--esp32-host` override is accepted for networks where mDNS doesn't work (corporate WiFi, some routers, Docker bridges). On a string of push failures from an mDNS-resolved host, the daemon drops the cached address and rediscovers on the next tick.
 
 Agents are independent: each has its own probe timestamp, cached snapshot, and push-failure flag, so a Codex outage doesn't stop Claude numbers from updating, and a fresh boot of the display catches up within one tick of each running agent.
 

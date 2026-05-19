@@ -1,11 +1,11 @@
 """BurnScope daemon event loop.
 
-Wires the watcher, probe scheduler, mDNS discovery, and HTTP pusher
-together. Runs one or more `Agent` instances concurrently within a
-single event loop: each agent declares its own `active_interval` /
-`idle_interval` (the CLI's `--active-interval` / `--idle-interval`
-flags act as a global override) and caches its own `AgentSnapshot`,
-so a probe failure in one agent does not stall the others.
+Wires the probe scheduler, mDNS discovery, and HTTP pusher together.
+Runs one or more `Agent` instances concurrently within a single event
+loop: each agent declares its own `probe_interval` (the CLI's
+`--probe-interval` flag acts as a global override) and caches its own
+`AgentSnapshot`, so a probe failure in one agent does not stall the
+others.
 """
 
 from __future__ import annotations
@@ -14,19 +14,26 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Awaitable, Callable
 
 import httpx
 
 from . import discovery, pusher
-from .agent import Agent
+from .agent import Agent, AuthError
+from .credentials import CredentialsError
 from .schema import AgentSnapshot
-from .watcher import JsonlActivityWatcher
 
 log = logging.getLogger(__name__)
 
 DiscoverFn = Callable[[], Awaitable[str | None]]
+
+# Per-agent backoff after a failed probe. The first failure waits
+# `_BACKOFF_BASE` seconds; each subsequent consecutive failure multiplies
+# the wait by `_BACKOFF_FACTOR`. After `_MAX_CONSECUTIVE_FAILURES` strikes
+# the agent is parked (no further probes) until the daemon restarts.
+_BACKOFF_BASE: float = 5.0
+_BACKOFF_FACTOR: float = 3.0
+_MAX_CONSECUTIVE_FAILURES: int = 5
 
 
 @dataclass
@@ -40,42 +47,44 @@ class DaemonConfig:
         esp32_host: Pre-resolved ESP32 host (`"hostname"` or
             `"hostname:port"`). When `None`, mDNS discovery runs on
             startup and on push failure.
-        claude_projects_dir: Directory the activity watcher tails for
-            `.jsonl` changes to flip the probe cadence into "active".
-        active_interval, idle_interval: Global cadence overrides
-            (seconds). When `None`, each agent's own class attribute is
-            used; when set, every agent uses this value instead.
-        active_window, tick: Cadence knobs (seconds).
+        probe_interval: Global cadence override (seconds). When `None`,
+            each agent's own class attribute is used; when set, every
+            agent uses this value instead.
+        tick: How often the loop wakes to evaluate per-agent cadences
+            (seconds).
         discovery_timeout: mDNS lookup timeout (seconds).
-        watcher_poll_interval: How often the polling file watcher wakes
-            up (seconds).
     """
 
     agents: list[Agent]
     esp32_host: str | None  # if set, mDNS is skipped
-    claude_projects_dir: Path
-    active_interval: float | None = None
-    idle_interval: float | None = None
-    active_window: float = 300.0
+    probe_interval: float | None = None
     tick: float = 5.0
     discovery_timeout: float = 10.0
-    watcher_poll_interval: float = 1.0
 
 
 @dataclass
 class _AgentState:
     """Mutable per-agent state carried across loop iterations.
 
-    Just the last successful probe and its timestamp — the firmware is the
+    Holds the last successful probe and its timestamp (the firmware is the
     source of truth for "what's currently displayed", so we don't cache a
-    `last_pushed_snapshot` here. Each cycle we read `/health` and re-POST
-    when the firmware-side sessions diverge from `last_snapshot`, which
-    self-heals after an ESP32 reboot, daemon restart, or any other event
-    that desyncs the two sides.
+    `last_pushed_snapshot`), plus a small failure-tracking trio:
+
+    - `consecutive_failures`: count of probe failures since the last
+      success. Reset on success.
+    - `cooldown_until`: monotonic wall-clock seconds before which the
+      next probe must not run; set after each failure to back off
+      exponentially.
+    - `stopped`: latched once `consecutive_failures` reaches
+      `_MAX_CONSECUTIVE_FAILURES`. A stopped agent is skipped forever
+      until the daemon restarts.
     """
 
     last_probe_ts: float = 0.0
     last_snapshot: AgentSnapshot | None = None
+    consecutive_failures: int = 0
+    cooldown_until: float = 0.0
+    stopped: bool = False
 
 
 async def run(
@@ -98,88 +107,125 @@ async def run(
     if not config.agents:
         raise ValueError("DaemonConfig.agents must contain at least one agent")
 
-    watcher = JsonlActivityWatcher(
-        config.claude_projects_dir, poll_interval=config.watcher_poll_interval
-    )
-    watcher.start()
-
     states: dict[str, _AgentState] = {a.name: _AgentState() for a in config.agents}
     cached_host: str | None = config.esp32_host
 
-    try:
-        async with httpx.AsyncClient() as http:
-            while not stop_event.is_set():
-                now = time.time()
+    async with httpx.AsyncClient() as http:
+        while not stop_event.is_set():
+            now = time.time()
 
-                for agent in config.agents:
-                    state = states[agent.name]
-                    interval = _current_interval(
-                        now, watcher.last_change_ts, config, agent
-                    )
-                    if now - state.last_probe_ts < interval:
-                        continue
-                    try:
-                        state.last_snapshot = await agent.probe(http)
-                        state.last_probe_ts = now
-                        log.info(
-                            "probe ok (%s): %s",
-                            agent.name,
-                            ", ".join(
-                                f"{s.type}={s.used_pct:.0%}"
-                                for s in state.last_snapshot.sessions
-                            ),
-                        )
-                    except Exception as exc:
-                        log.warning("probe failed (%s): %s", agent.name, exc)
-                        # Back off one tick before retrying this agent.
-                        state.last_probe_ts = now - interval + config.tick
-
-                if any(s.last_snapshot is not None for s in states.values()):
-                    if cached_host is None:
-                        cached_host = await discover_fn()
-                        if cached_host is None:
-                            log.warning(
-                                "mDNS discovery timed out; "
-                                "will retry next tick"
-                            )
-                    if cached_host is not None:
-                        health = await pusher.fetch_health(cached_host, http)
-                        if health is None:
-                            # Drop an mDNS-discovered host so we rediscover
-                            # next tick; without /health we can't tell what
-                            # the firmware holds.
-                            if config.esp32_host is None:
-                                cached_host = None
-                        else:
-                            all_failed = await _reconcile(
-                                states, cached_host, http, health
-                            )
-                            if config.esp32_host is None and all_failed:
-                                cached_host = None
-
+            for agent in config.agents:
+                state = states[agent.name]
+                if state.stopped:
+                    continue
+                if now < state.cooldown_until:
+                    continue
+                interval = _current_interval(config, agent)
+                if now - state.last_probe_ts < interval:
+                    continue
                 try:
-                    await asyncio.wait_for(stop_event.wait(), timeout=config.tick)
-                except asyncio.TimeoutError:
-                    pass
-    finally:
-        watcher.stop()
+                    state.last_snapshot = await agent.probe(http)
+                    state.last_probe_ts = now
+                    state.consecutive_failures = 0
+                    state.cooldown_until = 0.0
+                    log.info(
+                        "probe ok (%s): %s",
+                        agent.name,
+                        ", ".join(
+                            f"{s.type}={s.used_pct:.0%}"
+                            for s in state.last_snapshot.sessions
+                        ),
+                    )
+                except Exception as exc:
+                    _handle_probe_failure(agent, state, exc, now)
+
+            if any(s.last_snapshot is not None for s in states.values()):
+                if cached_host is None:
+                    cached_host = await discover_fn()
+                    if cached_host is None:
+                        log.warning(
+                            "mDNS discovery timed out; "
+                            "will retry next tick"
+                        )
+                if cached_host is not None:
+                    health = await pusher.fetch_health(cached_host, http)
+                    if health is None:
+                        # Drop an mDNS-discovered host so we rediscover
+                        # next tick; without /health we can't tell what
+                        # the firmware holds.
+                        if config.esp32_host is None:
+                            cached_host = None
+                    else:
+                        all_failed = await _reconcile(
+                            states, cached_host, http, health
+                        )
+                        if config.esp32_host is None and all_failed:
+                            cached_host = None
+
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=config.tick)
+            except asyncio.TimeoutError:
+                pass
 
 
-def _current_interval(
-    now: float,
-    last_change_ts: float | None,
-    config: DaemonConfig,
+def _handle_probe_failure(
     agent: Agent,
-) -> float:
-    """Pick the active or idle probe cadence for one agent.
+    state: _AgentState,
+    exc: BaseException,
+    now: float,
+) -> None:
+    """Record one probe failure: refresh credential on auth, back off, latch.
 
-    `DaemonConfig.active_interval` / `idle_interval` act as global
-    overrides when set; otherwise the agent's own class attributes win.
+    Bumps `consecutive_failures` and parks the agent until
+    `now + _BACKOFF_BASE * _BACKOFF_FACTOR ** (n-1)`. If `exc` is an
+    `AuthError`, also asks the agent to re-read its credential (a credential
+    reload failure does not count as a separate strike — the next probe will
+    just fail again with the stale token and bump the count then). Once the
+    failure count hits `_MAX_CONSECUTIVE_FAILURES`, the agent is stopped and
+    no longer probed until the daemon restarts.
     """
-    is_idle = last_change_ts is None or now - last_change_ts >= config.active_window
-    if is_idle:
-        return config.idle_interval if config.idle_interval is not None else agent.idle_interval
-    return config.active_interval if config.active_interval is not None else agent.active_interval
+    state.consecutive_failures += 1
+    n = state.consecutive_failures
+
+    if isinstance(exc, AuthError):
+        log.warning(
+            "probe failed (%s) [%d/%d, auth]: %s; reloading credential",
+            agent.name, n, _MAX_CONSECUTIVE_FAILURES, exc,
+        )
+        try:
+            agent.reload_credential()
+        except CredentialsError as reload_exc:
+            log.warning(
+                "credential reload failed (%s): %s", agent.name, reload_exc,
+            )
+    else:
+        log.warning(
+            "probe failed (%s) [%d/%d]: %s",
+            agent.name, n, _MAX_CONSECUTIVE_FAILURES, exc,
+        )
+
+    if n >= _MAX_CONSECUTIVE_FAILURES:
+        state.stopped = True
+        log.error(
+            "agent %s stopped after %d consecutive failures; "
+            "will not probe again until daemon restart",
+            agent.name, n,
+        )
+        return
+
+    backoff = _BACKOFF_BASE * (_BACKOFF_FACTOR ** (n - 1))
+    state.cooldown_until = now + backoff
+
+
+def _current_interval(config: DaemonConfig, agent: Agent) -> float:
+    """Pick the probe cadence for one agent.
+
+    `DaemonConfig.probe_interval` acts as a global override when set;
+    otherwise the agent's own class attribute wins.
+    """
+    if config.probe_interval is not None:
+        return config.probe_interval
+    return agent.probe_interval
 
 
 async def _reconcile(

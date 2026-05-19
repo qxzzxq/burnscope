@@ -13,14 +13,11 @@ import asyncio
 import logging
 import signal
 import sys
-from pathlib import Path
 
 from . import discovery
 from .agent import Agent
 from .agents import ClaudeAgent, CodexAgent
 from .daemon import DaemonConfig, run
-
-DEFAULT_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 
 _AGENT_CLASSES: dict[str, type[Agent]] = {
     ClaudeAgent.name: ClaudeAgent,
@@ -51,34 +48,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override mDNS discovery; format host or host:port (default port 80).",
     )
     p.add_argument(
-        "--active-interval",
+        "--probe-interval",
         type=float,
         default=None,
         help=(
-            "Global override (seconds) for every agent's active-cadence default "
-            "when recent activity is detected. Defaults to each agent's own value."
+            "Global override (seconds) for every agent's probe cadence. "
+            "Defaults to each agent's own value."
         ),
-    )
-    p.add_argument(
-        "--idle-interval",
-        type=float,
-        default=None,
-        help=(
-            "Global override (seconds) for every agent's idle-cadence default "
-            "when no recent activity. Defaults to each agent's own value."
-        ),
-    )
-    p.add_argument(
-        "--active-window",
-        type=float,
-        default=300.0,
-        help="How long (seconds) after a JSONL change we keep using active interval.",
-    )
-    p.add_argument(
-        "--claude-projects-dir",
-        type=Path,
-        default=DEFAULT_PROJECTS_DIR,
-        help="Directory to watch for Claude Code session JSONL files.",
     )
     p.add_argument(
         "--log-level",
@@ -108,10 +84,7 @@ def main(argv: list[str] | None = None) -> int:
     config = DaemonConfig(
         agents=agents,
         esp32_host=host,
-        claude_projects_dir=args.claude_projects_dir,
-        active_interval=args.active_interval,
-        idle_interval=args.idle_interval,
-        active_window=args.active_window,
+        probe_interval=args.probe_interval,
     )
 
     asyncio.run(_run_with_signals(config))

@@ -4,7 +4,7 @@ import httpx
 import pytest
 import respx
 
-from burnscope_client.agent import ProbeError
+from burnscope_client.agent import AuthError, ProbeError
 from burnscope_client.agents.claude import ClaudeAgent, ClaudeCredential
 from burnscope_client.schema import AgentSnapshot, SessionSnapshot
 
@@ -143,3 +143,30 @@ def test_agent_snapshot_dataclass_fields():
 
 def test_claude_agent_name():
     assert ClaudeAgent.name == "claude"
+
+
+@respx.mock
+async def test_probe_401_raises_auth_error():
+    """401 must surface as AuthError so the daemon can refresh the token."""
+    respx.post(ANTHROPIC_URL).mock(return_value=httpx.Response(401, json={
+        "type": "error",
+        "error": {"type": "authentication_error", "message": "Invalid"},
+    }))
+    async with httpx.AsyncClient() as client:
+        with pytest.raises(AuthError):
+            await _agent("stale").probe(client)
+
+
+def test_reload_credential_swaps_in_new_token(monkeypatch):
+    """reload_credential() must replace the in-memory access token.
+
+    We patch the classmethod loader so the test does not touch the keychain.
+    """
+    agent = _agent("old-token")
+    monkeypatch.setattr(
+        ClaudeAgent,
+        "load_credential",
+        classmethod(lambda cls: ClaudeCredential(access_token="new-token")),
+    )
+    agent.reload_credential()
+    assert agent._credential.access_token == "new-token"

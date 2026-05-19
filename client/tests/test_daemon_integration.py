@@ -1,7 +1,7 @@
-"""Integration: run the daemon against a real local HTTP server and a real
-JSONL watcher. Upstream probes are stubbed via fake `Agent` subclasses
-(we never hit the network) but the discovery / push / file-watch wiring
-is exercised end-to-end.
+"""Integration: run the daemon against a real local HTTP server.
+
+Upstream probes are stubbed via fake `Agent` subclasses (we never hit
+the network) but the discovery / push wiring is exercised end-to-end.
 """
 
 from __future__ import annotations
@@ -16,7 +16,8 @@ from threading import Thread
 import httpx
 import pytest
 
-from burnscope_client.agent import Agent
+from burnscope_client.agent import Agent, AuthError
+from burnscope_client import daemon as daemon_mod
 from burnscope_client.daemon import DaemonConfig, run
 from burnscope_client.schema import AgentSnapshot, SessionSnapshot
 
@@ -24,24 +25,20 @@ from burnscope_client.schema import AgentSnapshot, SessionSnapshot
 class _StubAgent(Agent):
     """Returns a fixed snapshot and records each probe call's wall-clock."""
 
-    active_interval = 0.05
-    idle_interval = 0.05
+    probe_interval = 0.05
 
     def __init__(
         self,
         name: str,
         snapshot: AgentSnapshot,
         *,
-        active_interval: float | None = None,
-        idle_interval: float | None = None,
+        probe_interval: float | None = None,
     ) -> None:
-        # `name`/intervals are class attributes on real agents; tests need them
+        # `name`/interval are class attributes on real agents; tests need them
         # per-instance so a single test can mix agents with different cadences.
         self.name = name  # type: ignore[misc]
-        if active_interval is not None:
-            self.active_interval = active_interval  # type: ignore[misc]
-        if idle_interval is not None:
-            self.idle_interval = idle_interval  # type: ignore[misc]
+        if probe_interval is not None:
+            self.probe_interval = probe_interval  # type: ignore[misc]
         self._snapshot = snapshot
         self.calls: list[float] = []
 
@@ -154,10 +151,7 @@ async def test_daemon_probes_and_pushes_to_fake_esp(tmp_path: Path, fake_esp):
     config = DaemonConfig(
         agents=[agent],
         esp32_host=host,
-        claude_projects_dir=tmp_path,
-        active_interval=0.05,
-        idle_interval=0.05,
-        active_window=10,
+        probe_interval=0.05,
         tick=0.05,
     )
     stop = asyncio.Event()
@@ -173,42 +167,6 @@ async def test_daemon_probes_and_pushes_to_fake_esp(tmp_path: Path, fake_esp):
 
     assert receiver.bodies, "daemon never pushed to /summary"
     assert receiver.bodies[0] == expected.to_dict()
-
-
-async def test_daemon_uses_active_interval_after_jsonl_change(tmp_path: Path, fake_esp):
-    receiver, host = fake_esp
-
-    snapshot = AgentSnapshot(
-        agent="claude",
-        captured_at=1,
-        sessions=[SessionSnapshot("current", 0.0, 1)],
-    )
-    agent = _StubAgent("claude", snapshot)
-
-    config = DaemonConfig(
-        agents=[agent],
-        esp32_host=host,
-        claude_projects_dir=tmp_path,
-        active_interval=0.1,
-        idle_interval=10.0,    # would not fire during test if idle stays active
-        active_window=5.0,
-        tick=0.05,
-        watcher_poll_interval=0.05,
-    )
-    stop = asyncio.Event()
-    task = asyncio.create_task(run(config, stop_event=stop))
-
-    # Touch a jsonl to switch the daemon into active mode.
-    await asyncio.sleep(0.1)
-    (tmp_path / "session.jsonl").write_text("{}\n")
-
-    # Wait long enough that an idle-only schedule would not yield 3 probes
-    # but an active schedule (0.1s) will.
-    await asyncio.sleep(1.0)
-    stop.set()
-    await asyncio.wait_for(task, timeout=2)
-
-    assert len(agent.calls) >= 3, f"expected active cadence, got {agent.calls}"
 
 
 async def test_daemon_pushes_one_snapshot_per_agent(tmp_path: Path, fake_esp):
@@ -231,10 +189,7 @@ async def test_daemon_pushes_one_snapshot_per_agent(tmp_path: Path, fake_esp):
             _StubAgent("codex", codex_snap),
         ],
         esp32_host=host,
-        claude_projects_dir=tmp_path,
-        active_interval=0.05,
-        idle_interval=0.05,
-        active_window=10,
+        probe_interval=0.05,
         tick=0.05,
     )
     stop = asyncio.Event()
@@ -273,8 +228,7 @@ async def test_daemon_skips_push_when_snapshot_unchanged(tmp_path: Path, fake_es
 
     class _StableAgent(Agent):
         name = "claude"
-        active_interval = 0.05
-        idle_interval = 0.05
+        probe_interval = 0.05
 
         def __init__(self) -> None:
             self.probes = 0
@@ -297,10 +251,7 @@ async def test_daemon_skips_push_when_snapshot_unchanged(tmp_path: Path, fake_es
     config = DaemonConfig(
         agents=[agent],
         esp32_host=host,
-        claude_projects_dir=tmp_path,
-        active_interval=0.05,
-        idle_interval=0.05,
-        active_window=10,
+        probe_interval=0.05,
         tick=0.05,
     )
     stop = asyncio.Event()
@@ -329,8 +280,7 @@ async def test_daemon_pushes_again_when_snapshot_changes(tmp_path: Path, fake_es
 
     class _MutableAgent(Agent):
         name = "claude"
-        active_interval = 0.05
-        idle_interval = 0.05
+        probe_interval = 0.05
 
         def __init__(self) -> None:
             self.probes = 0
@@ -351,10 +301,7 @@ async def test_daemon_pushes_again_when_snapshot_changes(tmp_path: Path, fake_es
     config = DaemonConfig(
         agents=[agent],
         esp32_host=host,
-        claude_projects_dir=tmp_path,
-        active_interval=0.05,
-        idle_interval=0.05,
-        active_window=10,
+        probe_interval=0.05,
         tick=0.05,
     )
     stop = asyncio.Event()
@@ -391,8 +338,7 @@ async def test_daemon_repushes_after_firmware_loses_state(tmp_path: Path, fake_e
 
     class _StableAgent(Agent):
         name = "claude"
-        active_interval = 0.05
-        idle_interval = 0.05
+        probe_interval = 0.05
 
         def __init__(self) -> None:
             self.probes = 0
@@ -413,10 +359,7 @@ async def test_daemon_repushes_after_firmware_loses_state(tmp_path: Path, fake_e
     config = DaemonConfig(
         agents=[agent],
         esp32_host=host,
-        claude_projects_dir=tmp_path,
-        active_interval=0.05,
-        idle_interval=0.05,
-        active_window=10,
+        probe_interval=0.05,
         tick=0.05,
     )
     stop = asyncio.Event()
@@ -477,16 +420,14 @@ async def test_daemon_uses_per_agent_intervals(tmp_path: Path, fake_esp):
         sessions=[SessionSnapshot("primary", 0.2, 2)],
     )
 
-    fast = _StubAgent("claude", fast_snap, active_interval=0.05, idle_interval=0.05)
-    slow = _StubAgent("codex", slow_snap, active_interval=0.25, idle_interval=0.25)
+    fast = _StubAgent("claude", fast_snap, probe_interval=0.05)
+    slow = _StubAgent("codex", slow_snap, probe_interval=0.25)
 
     config = DaemonConfig(
         agents=[fast, slow],
         esp32_host=host,
-        claude_projects_dir=tmp_path,
-        # active_interval / idle_interval intentionally omitted so each
-        # agent's own class attrs drive the cadence.
-        active_window=10,
+        # probe_interval intentionally omitted so each agent's own class
+        # attr drives the cadence.
         tick=0.05,
     )
     stop = asyncio.Event()
@@ -509,8 +450,7 @@ async def test_daemon_isolates_probe_failures(tmp_path: Path, fake_esp):
 
     class _FailingAgent(Agent):
         name = "claude"
-        active_interval = 0.05
-        idle_interval = 0.05
+        probe_interval = 0.05
 
         def __init__(self) -> None:
             pass
@@ -531,10 +471,7 @@ async def test_daemon_isolates_probe_failures(tmp_path: Path, fake_esp):
     config = DaemonConfig(
         agents=[_FailingAgent(), _StubAgent("codex", good_snap)],
         esp32_host=host,
-        claude_projects_dir=tmp_path,
-        active_interval=0.05,
-        idle_interval=0.05,
-        active_window=10,
+        probe_interval=0.05,
         tick=0.05,
     )
     stop = asyncio.Event()
@@ -550,3 +487,150 @@ async def test_daemon_isolates_probe_failures(tmp_path: Path, fake_esp):
 
     pushed = {b["agent"] for b in receiver.bodies}
     assert pushed == {"codex"}, f"failing agent should not push; got {pushed}"
+
+
+async def test_daemon_calls_reload_credential_on_auth_error(tmp_path: Path, fake_esp, monkeypatch):
+    """An AuthError from probe() must trigger Agent.reload_credential().
+
+    Backoff constants are shrunk so the test does not have to wait the
+    real 5-second base.
+    """
+    receiver, host = fake_esp
+    monkeypatch.setattr(daemon_mod, "_BACKOFF_BASE", 0.05)
+    monkeypatch.setattr(daemon_mod, "_BACKOFF_FACTOR", 1.0)
+
+    class _AuthFailingAgent(Agent):
+        name = "claude"
+        probe_interval = 0.05
+
+        def __init__(self) -> None:
+            self.reloads = 0
+            self.probes = 0
+
+        async def probe(self, client: httpx.AsyncClient) -> AgentSnapshot:
+            self.probes += 1
+            raise AuthError("401")
+
+        def reload_credential(self) -> None:
+            self.reloads += 1
+
+        @classmethod
+        def load_credential(cls):  # pragma: no cover
+            return None
+
+    agent = _AuthFailingAgent()
+    config = DaemonConfig(
+        agents=[agent],
+        esp32_host=host,
+        probe_interval=0.05,
+        tick=0.05,
+    )
+    stop = asyncio.Event()
+    task = asyncio.create_task(run(config, stop_event=stop))
+
+    await asyncio.sleep(0.5)
+    stop.set()
+    await asyncio.wait_for(task, timeout=2)
+
+    assert agent.reloads >= 1, "AuthError must trigger reload_credential()"
+    # One reload per probe failure, never more.
+    assert agent.reloads == agent.probes, (
+        f"expected one reload per auth failure; probes={agent.probes} reloads={agent.reloads}"
+    )
+
+
+async def test_daemon_stops_agent_after_max_consecutive_failures(tmp_path: Path, fake_esp, monkeypatch):
+    """After _MAX_CONSECUTIVE_FAILURES, the agent must be parked forever."""
+    receiver, host = fake_esp
+    monkeypatch.setattr(daemon_mod, "_BACKOFF_BASE", 0.02)
+    monkeypatch.setattr(daemon_mod, "_BACKOFF_FACTOR", 1.0)
+    monkeypatch.setattr(daemon_mod, "_MAX_CONSECUTIVE_FAILURES", 3)
+
+    class _AlwaysFailing(Agent):
+        name = "claude"
+        probe_interval = 0.02
+
+        def __init__(self) -> None:
+            self.probes = 0
+
+        async def probe(self, client: httpx.AsyncClient) -> AgentSnapshot:
+            self.probes += 1
+            raise RuntimeError("boom")
+
+        @classmethod
+        def load_credential(cls):  # pragma: no cover
+            return None
+
+    agent = _AlwaysFailing()
+    config = DaemonConfig(
+        agents=[agent],
+        esp32_host=host,
+        probe_interval=0.02,
+        tick=0.02,
+    )
+    stop = asyncio.Event()
+    task = asyncio.create_task(run(config, stop_event=stop))
+
+    # Wait long enough for >>3 attempts under base=0.02s, factor=1.0.
+    await asyncio.sleep(1.0)
+    stop.set()
+    await asyncio.wait_for(task, timeout=2)
+
+    assert agent.probes == 3, (
+        f"agent should stop after 3 failures; got {agent.probes} probes"
+    )
+
+
+async def test_daemon_success_resets_failure_count(tmp_path: Path, fake_esp, monkeypatch):
+    """A successful probe must clear the strike count so transient blips
+    don't accumulate toward the kill switch.
+    """
+    receiver, host = fake_esp
+    monkeypatch.setattr(daemon_mod, "_BACKOFF_BASE", 0.02)
+    monkeypatch.setattr(daemon_mod, "_BACKOFF_FACTOR", 1.0)
+    monkeypatch.setattr(daemon_mod, "_MAX_CONSECUTIVE_FAILURES", 3)
+
+    snapshot = AgentSnapshot(
+        agent="claude",
+        captured_at=1,
+        sessions=[SessionSnapshot("current", 0.1, 100)],
+    )
+
+    class _FlakyAgent(Agent):
+        name = "claude"
+        probe_interval = 0.02
+
+        def __init__(self) -> None:
+            self.probes = 0
+
+        async def probe(self, client: httpx.AsyncClient) -> AgentSnapshot:
+            self.probes += 1
+            # fail, fail, succeed, fail, fail, fail — should NOT stop
+            # because the success in between resets the counter.
+            if self.probes in (1, 2, 4, 5, 6):
+                raise RuntimeError("blip")
+            return snapshot
+
+        @classmethod
+        def load_credential(cls):  # pragma: no cover
+            return None
+
+    agent = _FlakyAgent()
+    config = DaemonConfig(
+        agents=[agent],
+        esp32_host=host,
+        probe_interval=0.02,
+        tick=0.02,
+    )
+    stop = asyncio.Event()
+    task = asyncio.create_task(run(config, stop_event=stop))
+
+    await asyncio.sleep(1.0)
+    stop.set()
+    await asyncio.wait_for(task, timeout=2)
+
+    # Without the reset, 5 cumulative failures would have stopped the agent
+    # before probe #6 could land. With the reset, probes keep coming.
+    assert agent.probes >= 6, (
+        f"flaky agent should keep probing past 5 cumulative failures; got {agent.probes}"
+    )

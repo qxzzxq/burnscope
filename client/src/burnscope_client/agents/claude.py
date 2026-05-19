@@ -21,7 +21,7 @@ from typing import ClassVar
 
 import httpx
 
-from ..agent import Agent, ProbeError
+from ..agent import Agent, AuthError, ProbeError
 from ..credentials import Credential, CredentialsError
 from ..schema import AgentSnapshot, SessionSnapshot
 
@@ -86,8 +86,7 @@ class ClaudeAgent(Agent):
     """
 
     name = "claude"
-    active_interval: ClassVar[float] = 60.0
-    idle_interval: ClassVar[float] = 300.0
+    probe_interval: ClassVar[float] = 120.0
     KEYCHAIN_SERVICE: ClassVar[str] = "Claude Code-credentials"
     CREDENTIALS_PATH: ClassVar[Path] = Path.home() / ".claude" / ".credentials.json"
 
@@ -116,6 +115,12 @@ class ClaudeAgent(Agent):
         except httpx.HTTPError as exc:
             raise ProbeError(f"HTTP error talking to Anthropic: {exc}") from exc
 
+        if response.status_code == 401:
+            # Surface 401 distinctly so the daemon can refresh credentials
+            # from the keychain before scheduling the next probe.
+            raise AuthError(
+                f"Anthropic returned 401: {response.text[:200]}"
+            )
         if response.status_code >= 400:
             raise ProbeError(
                 f"Anthropic returned {response.status_code}: {response.text[:200]}"

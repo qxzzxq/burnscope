@@ -643,10 +643,10 @@ A successful flash + boot yields the "Setup mode — connect to
 ### 7.3 Normal Operation
 
 - The daemon discovers the device via mDNS. It probes each upstream
-  agent on its own cadence (60 s "active" / 300 s "idle" by default,
-  flipped by the JSONL watcher). After every probe it compares the
-  fresh `(agent, sessions)` to what the firmware last successfully
-  received and POSTs `/summary` only when they differ.
+  agent on its own cadence (`probe_interval`, default 120 s; the
+  `--probe-interval` CLI flag overrides every agent). After every probe
+  it compares the fresh `(agent, sessions)` to what the firmware last
+  successfully received and POSTs `/summary` only when they differ.
 - Between content changes the daemon GETs `/health` once per tick
   (default 5 s) so a dead device is noticed and rediscovery is
   triggered — without forcing a firmware repaint.

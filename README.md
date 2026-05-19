@@ -21,8 +21,8 @@ The daemon auto-detects which agents are logged in and runs all of them concurre
 ┌──────────────────────────┐   HTTP POST /summary    ┌─────────────────────┐
 │ Python daemon (laptop)   │ ──────────────────────▶ │  ESP32 (CYD)        │
 │ - probes each agent      │   AgentSnapshot JSON    │  - advertises mDNS  │
-│ - tails activity         │                         │  - tiny HTTP server │
-│ - discovers ESP32 (mDNS) │                         │  - renders TFT      │
+│ - discovers ESP32 (mDNS) │                         │  - tiny HTTP server │
+│                          │                         │  - renders TFT      │
 └──────────────────────────┘                         └─────────────────────┘
 ```
 

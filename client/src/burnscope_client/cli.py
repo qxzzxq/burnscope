@@ -53,14 +53,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--active-interval",
         type=float,
-        default=60.0,
-        help="Probe interval in seconds while recent agent activity is detected.",
+        default=None,
+        help=(
+            "Global override (seconds) for every agent's active-cadence default "
+            "when recent activity is detected. Defaults to each agent's own value."
+        ),
     )
     p.add_argument(
         "--idle-interval",
         type=float,
-        default=300.0,
-        help="Probe interval in seconds when no recent activity.",
+        default=None,
+        help=(
+            "Global override (seconds) for every agent's idle-cadence default "
+            "when no recent activity. Defaults to each agent's own value."
+        ),
     )
     p.add_argument(
         "--active-window",

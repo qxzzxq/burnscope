@@ -2,9 +2,10 @@
 
 Wires the watcher, probe scheduler, mDNS discovery, and HTTP pusher
 together. Runs one or more `Agent` instances concurrently within a
-single event loop: each agent has an independent probe cadence and its
-own cached `AgentSnapshot`, so a probe failure in one agent does not
-stall the others.
+single event loop: each agent declares its own `active_interval` /
+`idle_interval` (the CLI's `--active-interval` / `--idle-interval`
+flags act as a global override) and caches its own `AgentSnapshot`,
+so a probe failure in one agent does not stall the others.
 """
 
 from __future__ import annotations
@@ -41,8 +42,10 @@ class DaemonConfig:
             startup and on push failure.
         claude_projects_dir: Directory the activity watcher tails for
             `.jsonl` changes to flip the probe cadence into "active".
-        active_interval, idle_interval, active_window, tick: Cadence
-            knobs (seconds).
+        active_interval, idle_interval: Global cadence overrides
+            (seconds). When `None`, each agent's own class attribute is
+            used; when set, every agent uses this value instead.
+        active_window, tick: Cadence knobs (seconds).
         discovery_timeout: mDNS lookup timeout (seconds).
         watcher_poll_interval: How often the polling file watcher wakes
             up (seconds).
@@ -51,8 +54,8 @@ class DaemonConfig:
     agents: list[Agent]
     esp32_host: str | None  # if set, mDNS is skipped
     claude_projects_dir: Path
-    active_interval: float = 60.0
-    idle_interval: float = 300.0
+    active_interval: float | None = None
+    idle_interval: float | None = None
     active_window: float = 300.0
     tick: float = 5.0
     discovery_timeout: float = 10.0
@@ -107,10 +110,12 @@ async def run(
         async with httpx.AsyncClient() as http:
             while not stop_event.is_set():
                 now = time.time()
-                interval = _current_interval(now, watcher.last_change_ts, config)
 
                 for agent in config.agents:
                     state = states[agent.name]
+                    interval = _current_interval(
+                        now, watcher.last_change_ts, config, agent
+                    )
                     if now - state.last_probe_ts < interval:
                         continue
                     try:
@@ -161,14 +166,20 @@ async def run(
 
 
 def _current_interval(
-    now: float, last_change_ts: float | None, config: DaemonConfig
+    now: float,
+    last_change_ts: float | None,
+    config: DaemonConfig,
+    agent: Agent,
 ) -> float:
-    """Pick the active or idle probe cadence based on watcher activity."""
-    if last_change_ts is None:
-        return config.idle_interval
-    if now - last_change_ts < config.active_window:
-        return config.active_interval
-    return config.idle_interval
+    """Pick the active or idle probe cadence for one agent.
+
+    `DaemonConfig.active_interval` / `idle_interval` act as global
+    overrides when set; otherwise the agent's own class attributes win.
+    """
+    is_idle = last_change_ts is None or now - last_change_ts >= config.active_window
+    if is_idle:
+        return config.idle_interval if config.idle_interval is not None else agent.idle_interval
+    return config.active_interval if config.active_interval is not None else agent.active_interval
 
 
 async def _reconcile(

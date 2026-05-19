@@ -41,6 +41,8 @@ class Agent(ABC):
     """
 
     name: ClassVar[str]
+    active_interval: ClassVar[float]
+    idle_interval: ClassVar[float]
 
     @abstractmethod
     def __init__(self, credential: Any) -> None:

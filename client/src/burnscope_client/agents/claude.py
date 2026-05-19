@@ -86,6 +86,8 @@ class ClaudeAgent(Agent):
     """
 
     name = "claude"
+    active_interval: ClassVar[float] = 60.0
+    idle_interval: ClassVar[float] = 300.0
     KEYCHAIN_SERVICE: ClassVar[str] = "Claude Code-credentials"
     CREDENTIALS_PATH: ClassVar[Path] = Path.home() / ".claude" / ".credentials.json"
 

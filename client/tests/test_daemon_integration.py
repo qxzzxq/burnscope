@@ -24,9 +24,24 @@ from burnscope_client.schema import AgentSnapshot, SessionSnapshot
 class _StubAgent(Agent):
     """Returns a fixed snapshot and records each probe call's wall-clock."""
 
-    def __init__(self, name: str, snapshot: AgentSnapshot) -> None:
-        # `name` is a class attribute on real agents; tests need it per-instance.
+    active_interval = 0.05
+    idle_interval = 0.05
+
+    def __init__(
+        self,
+        name: str,
+        snapshot: AgentSnapshot,
+        *,
+        active_interval: float | None = None,
+        idle_interval: float | None = None,
+    ) -> None:
+        # `name`/intervals are class attributes on real agents; tests need them
+        # per-instance so a single test can mix agents with different cadences.
         self.name = name  # type: ignore[misc]
+        if active_interval is not None:
+            self.active_interval = active_interval  # type: ignore[misc]
+        if idle_interval is not None:
+            self.idle_interval = idle_interval  # type: ignore[misc]
         self._snapshot = snapshot
         self.calls: list[float] = []
 
@@ -258,6 +273,8 @@ async def test_daemon_skips_push_when_snapshot_unchanged(tmp_path: Path, fake_es
 
     class _StableAgent(Agent):
         name = "claude"
+        active_interval = 0.05
+        idle_interval = 0.05
 
         def __init__(self) -> None:
             self.probes = 0
@@ -312,6 +329,8 @@ async def test_daemon_pushes_again_when_snapshot_changes(tmp_path: Path, fake_es
 
     class _MutableAgent(Agent):
         name = "claude"
+        active_interval = 0.05
+        idle_interval = 0.05
 
         def __init__(self) -> None:
             self.probes = 0
@@ -372,6 +391,8 @@ async def test_daemon_repushes_after_firmware_loses_state(tmp_path: Path, fake_e
 
     class _StableAgent(Agent):
         name = "claude"
+        active_interval = 0.05
+        idle_interval = 0.05
 
         def __init__(self) -> None:
             self.probes = 0
@@ -436,11 +457,60 @@ async def test_daemon_repushes_after_firmware_loses_state(tmp_path: Path, fake_e
     ), "the re-pushed payload should carry the same content"
 
 
+async def test_daemon_uses_per_agent_intervals(tmp_path: Path, fake_esp):
+    """With no global override, each agent ticks on its own cadence.
+
+    The fast agent (50ms) should be probed many more times than the slow
+    one (250ms) over a fixed window — proving the loop no longer locks
+    every agent to one shared `interval`.
+    """
+    receiver, host = fake_esp
+
+    fast_snap = AgentSnapshot(
+        agent="claude",
+        captured_at=1,
+        sessions=[SessionSnapshot("current", 0.1, 1)],
+    )
+    slow_snap = AgentSnapshot(
+        agent="codex",
+        captured_at=1,
+        sessions=[SessionSnapshot("primary", 0.2, 2)],
+    )
+
+    fast = _StubAgent("claude", fast_snap, active_interval=0.05, idle_interval=0.05)
+    slow = _StubAgent("codex", slow_snap, active_interval=0.25, idle_interval=0.25)
+
+    config = DaemonConfig(
+        agents=[fast, slow],
+        esp32_host=host,
+        claude_projects_dir=tmp_path,
+        # active_interval / idle_interval intentionally omitted so each
+        # agent's own class attrs drive the cadence.
+        active_window=10,
+        tick=0.05,
+    )
+    stop = asyncio.Event()
+    task = asyncio.create_task(run(config, stop_event=stop))
+
+    await asyncio.sleep(0.7)
+    stop.set()
+    await asyncio.wait_for(task, timeout=2)
+
+    assert len(fast.calls) >= 3, f"fast agent under-probed: {fast.calls}"
+    assert len(slow.calls) >= 1, f"slow agent never probed: {slow.calls}"
+    assert len(fast.calls) >= 2 * len(slow.calls), (
+        f"fast/slow ratio too tight to prove independent cadence: "
+        f"fast={len(fast.calls)}, slow={len(slow.calls)}"
+    )
+
+
 async def test_daemon_isolates_probe_failures(tmp_path: Path, fake_esp):
     receiver, host = fake_esp
 
     class _FailingAgent(Agent):
         name = "claude"
+        active_interval = 0.05
+        idle_interval = 0.05
 
         def __init__(self) -> None:
             pass

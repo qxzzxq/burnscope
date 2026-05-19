@@ -42,18 +42,55 @@ label.
 
 ## `POST /summary`
 
-Daemon → ESP32. One snapshot per request. Sent on every JSONL change and on a
-~30 s keepalive so a freshly-booted display catches up without waiting for the
-next agent action.
+Daemon → ESP32. One snapshot per request. **Edge-triggered**: the daemon
+only POSTs when the content of an agent's snapshot — `(agent, sessions)`,
+ignoring `captured_at` — differs from what the firmware currently holds.
+The firmware is the source of truth: every cycle the daemon `GET`s
+`/health` (see below) to read the device's stored `sessions` and POSTs
+whenever its latest probe diverges. This self-heals after an ESP32
+reboot (RAM-only store wiped → next cycle re-POSTs), a daemon restart,
+or any other event that desyncs the two sides.
 
 **Request body:** a single `AgentSnapshot` (see `examples/summary-push.json`).
 
 **Response:** `204 No Content` on success.
 
-The firmware overwrites its in-memory "latest snapshot" on receipt and
-repaints. No history is kept. No auth (LAN trust). The ESP32 syncs its
-wall-clock over NTP and computes "last update Xs ago" locally against
-`captured_at` — there is no server timestamp on the wire.
+The firmware overwrites its in-memory "latest snapshot" for that
+`agent` on receipt. The screen swaps off the "waiting for daemon..."
+splash on the very first push; subsequent pushes only update the
+in-memory store — the firmware's 1 Hz LVGL tick re-renders the
+currently visible agent against the updated store and handles
+between-agent cycling. This means a Codex push does not yank rotation
+away from a currently-visible Claude row (and vice versa). No history
+is kept. No auth (LAN trust). The ESP32 syncs its wall-clock over NTP
+and computes "resets in X" locally against `resets_at` — there is no
+server timestamp on the wire.
+
+## `GET /health`
+
+Daemon → ESP32. Called every cycle. Drives both liveness detection
+(failure → drop the mDNS-cached host and rediscover) and edge-trigger
+reconciliation (compare firmware-side `sessions` against the latest
+probe; re-POST `/summary` on divergence).
+
+Response is JSON:
+
+| Field              | Type    | Description |
+|--------------------|---------|-------------|
+| `firmware_version` | string  | Built-in version string. |
+| `uptime_s`         | integer | Seconds since boot. |
+| `free_heap_b`      | integer | Free heap in bytes. |
+| `agents`           | object  | Map of agent name → entry (see below). Agents with no stored snapshot — e.g. immediately after a reboot — are omitted; the daemon treats absence as "must push". |
+
+Each entry under `agents`:
+
+| Field                     | Type    | Description |
+|---------------------------|---------|-------------|
+| `seconds_since_last_push` | integer | Age of the stored snapshot in seconds. |
+| `sessions`                | array of `SessionSnapshot` | Same shape as `POST /summary`'s `sessions`. Lets the daemon detect when the firmware's stored content has diverged from the latest upstream probe without waiting for a content change to push. |
+
+The firmware does not act on the request beyond responding —
+receiving `/health` does not refresh the snapshot store or the display.
 
 ---
 

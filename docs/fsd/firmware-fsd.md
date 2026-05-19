@@ -59,8 +59,13 @@ glance.
 
 - OTA firmware updates.
 - Authentication on `POST /summary` (LAN-trust only).
-- Persisting snapshots across reboots (RAM-only — the daemon re-pushes
-  within ~30 s anyway, per `wire-format.md`).
+- Persisting snapshots across reboots (RAM-only). The daemon's pushes
+  are edge-triggered (see `docs/wire-format.md`), so after a firmware
+  reboot the device will sit on the "waiting for daemon..." splash
+  until each agent's snapshot *content* next changes. Today the daemon
+  does not yet detect a firmware reboot via `GET /health` and
+  re-prime, so the snapshot may take one full quota-change cycle to
+  reappear (logged as a known gap; see § 5.5).
 - Aggregating across multiple machines.
 - Rendering a third quota bucket (overage / credits) — schema allows it
   but the MVP layout only has room for two rows.
@@ -80,12 +85,16 @@ Power-on
    ▼
 STA connect → mDNS advertise (_burnscope._tcp) + NTP sync
    │
-   ├──◄ POST /summary  (one AgentSnapshot)            from daemon
+   ├──◄ POST /summary  (one AgentSnapshot, edge-triggered)   from daemon
    │       │
    │       ▼
-   │   parse → store per-agent snapshot → repaint UI
+   │   parse → store per-agent snapshot → (first push only) swap
+   │                                       off splash; 1 Hz UI tick
+   │                                       re-renders & cycles agents
    │
    └──◄ GET /health    (firmware version / uptime / last-snapshot-age)
+        — sent by the daemon between content changes as the heartbeat;
+          the firmware just replies and does not touch the UI.
 ```
 
 ---
@@ -105,13 +114,18 @@ Subsystems, runtime-only:
 | **NTP client**       | Syncs wall clock at boot and every 6 h. Used for "X s ago" and "resets in Y" math. |
 | **HTTP server**      | Two routes: `POST /summary`, `GET /health`. No middleware, no auth. |
 | **Snapshot store**   | RAM-only `map<agent, AgentSnapshot>` (max two agents in MVP — `claude`, `codex`). |
-| **Renderer**         | LVGL repaint on snapshot change *and* once a second for countdowns. Uses the **Display** abstraction. |
+| **Renderer**         | A 1 Hz LVGL timer re-reads the snapshot store, refreshes the visible agent's bars + countdowns, and cycles between agents (FR-4.10). A `POST /summary` only forces a screen change on the *first* push (splash → agent view). Uses the **Display** abstraction. |
 | **Display abstraction** | `display_t` virtual interface; concrete `cyd2usb_st7789_display` for the MVP panel. |
 | **Watchdog**         | Software task-heartbeat WDT plus IDF Task Watchdog (TWDT). |
 
 Data flow on the hot path is a straight line: HTTP → parser → snapshot
-store → UI dirty flag → next LVGL tick repaints. No queues, no tasks
-fighting for locks beyond the LVGL port mutex.
+store update. The store's listener swaps the display off the splash on
+the *first* push only; after that the screen change is driven by the
+1 Hz LVGL timer, which reads the (already-updated) store. No queues,
+no tasks fighting for locks beyond the LVGL port mutex. Pushes from a
+non-visible agent never preempt the active rotation — they just land
+in the store and get picked up the next time the rotation reaches
+that agent.
 
 ### 2.2 Hardware / Platform Architecture
 
@@ -320,16 +334,29 @@ unit-testable on the host).
   bar (filled proportionally to `used_pct`), the integer percentage
   (`round(used_pct × 100)` followed by `%`), and the session's `type`
   string rendered verbatim as a tag.
-- **FR-4.6** [Must]: When a `POST /summary` arrives, the firmware shall
-  re-render the affected agent's view within 100 ms.
+- **FR-4.6** [Must]: When the *first* `POST /summary` arrives after
+  boot (or the first one after the splash has reappeared due to a
+  WiFi state change), the firmware shall transition from the splash
+  to the agent view within 100 ms. Subsequent pushes update the
+  snapshot store immediately but the on-screen redraw happens at the
+  next 1 Hz tick — i.e. within ≤ 1 s of receipt. This is deliberate:
+  re-rendering on every push would override the agent rotation when a
+  different agent pushes (FR-4.10).
 - **FR-4.7** [Should]: The two progress bars shall use distinct accent
   colours so the rows are visually distinguishable; the exact palette is
   an implementation detail.
 - **FR-4.8** [Should]: A countdown derived from `resets_at − now()` shall
   be displayed inside each row and updated at least once per second.
-- **FR-4.9** [Should]: If no snapshot has been received within
-  `2 × keepalive` (default keepalive ≈ 30 s per `wire-format.md`), the
-  firmware shall visually mark the data as "stale" (e.g. dimmed bars).
+- **FR-4.9** [Deferred — see § 5.5]: Originally specified "if no
+  snapshot has been received within `2 × keepalive`, dim the bars as
+  stale". The keepalive anchor went away when the daemon moved to
+  edge-triggered `POST /summary` + `GET /health` heartbeat — a
+  snapshot-receipt timestamp no longer correlates with daemon
+  liveness (usage may legitimately not change for hours). The
+  firmware still tracks `received_at_us` per agent for the `GET
+  /health` response, but the UI dimming behaviour is not implemented
+  pending a re-anchor (e.g. a heartbeat-touched timestamp updated by
+  `/health` instead of `/summary`).
 - **FR-4.10** [May]: When multiple agents have pushed snapshots, the
   firmware shall cycle between agents on a slow timer (default 5 s).
   When only one agent has pushed, that view shall be permanent.
@@ -418,6 +445,7 @@ unit-testable on the host).
   in MVP.
 - **A-5** (assumed): The keepalive interval used to detect "stale"
   in FR-4.9 is the daemon's ~30 s figure from `docs/wire-format.md`.
+  **Stale as of the edge-triggered push refactor** — see § 5.5.
 
 ### 5.3 Documentation conflict to resolve
 
@@ -437,6 +465,18 @@ needed to remove the stale paragraph.
 - `lvgl/lvgl` 9.5.x (`dependencies.lock`).
 - Public NTP infrastructure (`pool.ntp.org` by default).
 
+### 5.5 Known gaps (post edge-triggered push refactor)
+
+- **No firmware-reboot detection on the daemon side.** After a
+  firmware reboot, the daemon's per-agent `last_pushed_snapshot` is
+  still populated, so an unchanged probe will not re-POST `/summary`
+  and the device sits on the splash. `GET /health` succeeds (so the
+  daemon doesn't drop the mDNS host) but its response — which carries
+  `uptime_s` and an empty `agents` object — is not yet inspected to
+  invalidate the cache. Fixing this is a daemon-side change (no
+  firmware change required) and is the natural next step.
+- **Staleness dimming (FR-4.9) is unanchored.** See FR-4.9.
+
 ---
 
 ## 6. Interface Specifications
@@ -452,6 +492,14 @@ needed to remove the stale paragraph.
   Payload Too Large` (> 16 KiB), `405 Method Not Allowed` (non-POST).
 - Idempotency: each request overwrites the previous snapshot for that
   `agent` key. The firmware keeps no history.
+- **Cadence (informational, daemon-side):** the daemon POSTs only
+  when `(agent, sessions)` differs from the last successful push;
+  unchanged probes are silent. See `docs/wire-format.md`.
+- **UI side-effect:** receipt of a snapshot updates the in-memory
+  store unconditionally. The display only swaps screens when the
+  splash was currently visible (the "first push" transition); a
+  push for an agent that isn't currently on screen lands silently
+  and is picked up by the next 1 Hz tick / rotation slot.
 
 #### 6.1.2 `GET /health` (daemon → firmware)
 
@@ -594,12 +642,19 @@ A successful flash + boot yields the "Setup mode — connect to
 
 ### 7.3 Normal Operation
 
-- The daemon discovers the device via mDNS and sends `POST /summary` on
-  every JSONL change plus a ~30 s keepalive.
+- The daemon discovers the device via mDNS. It probes each upstream
+  agent on its own cadence (60 s "active" / 300 s "idle" by default,
+  flipped by the JSONL watcher). After every probe it compares the
+  fresh `(agent, sessions)` to what the firmware last successfully
+  received and POSTs `/summary` only when they differ.
+- Between content changes the daemon GETs `/health` once per tick
+  (default 5 s) so a dead device is noticed and rediscovery is
+  triggered — without forcing a firmware repaint.
 - The device renders the latest per-agent snapshot continuously. The
-  countdown timer ticks locally — no traffic needed between pushes.
-- If no snapshot arrives within `2 × keepalive`, the UI dims to indicate
-  staleness (FR-4.9).
+  1 Hz LVGL tick refreshes bars + countdowns from the in-memory store
+  and rotates between agents (FR-4.10); no traffic is needed between
+  pushes.
+- Staleness dimming (FR-4.9) is currently unimplemented — see § 5.5.
 
 ### 7.4 Maintenance
 

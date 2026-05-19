@@ -310,18 +310,60 @@ typedef struct {
     bool   first;
 } agents_writer_t;
 
+/* Append one agent entry to the /health JSON. Each entry carries both
+ * `seconds_since_last_push` (for diagnostics) and `sessions` (the same
+ * shape the daemon POSTs). The daemon uses `sessions` to detect when
+ * firmware-side state diverges from its latest probe — for instance after
+ * an ESP32 reboot — and re-POSTs without waiting for an upstream change.
+ *
+ * Worst case under SNAPSHOT_MAX_SESSIONS=3:
+ *   "claude":{"seconds_since_last_push":<int64>,"sessions":[
+ *      {"type":"<16ch>","used_pct":<%g>,"resets_at":<int64>}, ... x3]}
+ * comfortably fits in ~240 bytes. The 1024-byte body buffer holds two of
+ * those plus the outer envelope.
+ */
 static void append_agent(const agent_snapshot_t *snap, void *user)
 {
     agents_writer_t *w = (agents_writer_t *)user;
+    if (w->off >= w->cap) return;
+
     int64_t age = snapshot_store_age_s(snap->agent);
+    size_t saved_off = w->off;
+    bool saved_first = w->first;
+
     int n = snprintf(w->body + w->off, w->cap - w->off,
-                     "%s\"%s\":{\"seconds_since_last_push\":%lld}",
+                     "%s\"%s\":{\"seconds_since_last_push\":%lld,\"sessions\":[",
                      w->first ? "" : ",",
                      snap->agent,
                      (long long)age);
-    if (n > 0 && (size_t)n < w->cap - w->off) {
+    if (n <= 0 || (size_t)n >= w->cap - w->off) goto overflow;
+    w->off += n;
+
+    for (uint8_t i = 0; i < snap->session_count; ++i) {
+        const session_snapshot_t *s = &snap->sessions[i];
+        n = snprintf(w->body + w->off, w->cap - w->off,
+                     "%s{\"type\":\"%s\",\"used_pct\":%.6g,\"resets_at\":%lld}",
+                     i == 0 ? "" : ",",
+                     s->type,
+                     (double)s->used_pct,
+                     (long long)s->resets_at);
+        if (n <= 0 || (size_t)n >= w->cap - w->off) goto overflow;
         w->off += n;
-        w->first = false;
+    }
+
+    n = snprintf(w->body + w->off, w->cap - w->off, "]}");
+    if (n <= 0 || (size_t)n >= w->cap - w->off) goto overflow;
+    w->off += n;
+
+    w->first = false;
+    return;
+
+overflow:
+    /* Roll back any partial write so the outer JSON stays valid. */
+    w->off = saved_off;
+    w->first = saved_first;
+    if (w->off < w->cap) {
+        w->body[w->off] = '\0';
     }
 }
 
@@ -331,7 +373,7 @@ static esp_err_t health_get_handler(httpd_req_t *req)
     uint32_t uptime_s = (uint32_t)(uptime_us / 1000000);
     uint32_t free_heap = esp_get_free_heap_size();
 
-    char body[512];
+    char body[1024];
     int off = snprintf(body, sizeof(body),
                        "{\"firmware_version\":\"%s\","
                        "\"uptime_s\":%lu,"

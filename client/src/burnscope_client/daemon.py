@@ -63,14 +63,16 @@ class DaemonConfig:
 class _AgentState:
     """Mutable per-agent state carried across loop iterations.
 
-    `last_push_failed` is reset to `False` on every successful push and
-    set `True` on every failure; the daemon uses it to decide whether
-    to drop an mDNS-discovered host and rediscover.
+    Just the last successful probe and its timestamp — the firmware is the
+    source of truth for "what's currently displayed", so we don't cache a
+    `last_pushed_snapshot` here. Each cycle we read `/health` and re-POST
+    when the firmware-side sessions diverge from `last_snapshot`, which
+    self-heals after an ESP32 reboot, daemon restart, or any other event
+    that desyncs the two sides.
     """
 
     last_probe_ts: float = 0.0
     last_snapshot: AgentSnapshot | None = None
-    last_push_failed: bool = False
 
 
 async def run(
@@ -136,14 +138,19 @@ async def run(
                                 "will retry next tick"
                             )
                     if cached_host is not None:
-                        await _push_all(states, cached_host, http)
-                        # Drop an mDNS-discovered host when every agent's
-                        # push just failed, so we rediscover next tick.
-                        if (
-                            config.esp32_host is None
-                            and _all_pushes_failed(states)
-                        ):
-                            cached_host = None
+                        health = await pusher.fetch_health(cached_host, http)
+                        if health is None:
+                            # Drop an mDNS-discovered host so we rediscover
+                            # next tick; without /health we can't tell what
+                            # the firmware holds.
+                            if config.esp32_host is None:
+                                cached_host = None
+                        else:
+                            all_failed = await _reconcile(
+                                states, cached_host, http, health
+                            )
+                            if config.esp32_host is None and all_failed:
+                                cached_host = None
 
                 try:
                     await asyncio.wait_for(stop_event.wait(), timeout=config.tick)
@@ -164,27 +171,78 @@ def _current_interval(
     return config.idle_interval
 
 
-async def _push_all(
+async def _reconcile(
     states: dict[str, _AgentState],
     host: str,
     http: httpx.AsyncClient,
-) -> None:
-    """Push the latest snapshot for every agent that has one."""
+    health: dict,
+) -> bool:
+    """Push every agent whose latest probe diverges from firmware-side state.
+
+    Compares each `state.last_snapshot.sessions` against
+    `health["agents"][name]["sessions"]`. A missing agent on the firmware
+    side counts as a divergence — that's how we self-heal after an ESP32
+    restart. Returns True iff every attempted push failed (the caller uses
+    this to trigger mDNS rediscovery).
+    """
+    fw_agents = health.get("agents") or {}
+    if not isinstance(fw_agents, dict):
+        fw_agents = {}
+
+    attempted = 0
+    failed = 0
     for name, state in states.items():
         if state.last_snapshot is None:
             continue
+        fw_entry = fw_agents.get(name) or {}
+        fw_sessions = fw_entry.get("sessions") if isinstance(fw_entry, dict) else None
+        if _sessions_match(state.last_snapshot.sessions, fw_sessions):
+            continue
+        attempted += 1
         try:
             await pusher.push(state.last_snapshot, host, http)
             log.debug("pushed %s snapshot to %s", name, host)
-            state.last_push_failed = False
         except Exception as exc:
             log.warning("push %s to %s failed: %s", name, host, exc)
-            state.last_push_failed = True
+            failed += 1
+    return attempted > 0 and failed == attempted
 
 
-def _all_pushes_failed(states: dict[str, _AgentState]) -> bool:
-    """True iff every agent that has a snapshot just failed to push."""
-    pushed = [s for s in states.values() if s.last_snapshot is not None]
-    if not pushed:
+# Tolerance below the on-device display resolution. Avoids spurious
+# re-pushes from float round-trips through the firmware's `float`
+# storage and `%g` JSON formatting.
+_USED_PCT_TOL = 1e-3
+
+
+def _sessions_match(
+    local: list,
+    firmware: list | None,
+) -> bool:
+    """Content-equality for sessions, tolerant of float round-trip noise.
+
+    `local` is a list of `SessionSnapshot`; `firmware` is the JSON-decoded
+    `sessions` array from `GET /health`. Order is not significant — wire
+    format says clients look up by `type`.
+    """
+    if firmware is None or not isinstance(firmware, list):
         return False
-    return all(s.last_push_failed for s in pushed)
+    if len(local) != len(firmware):
+        return False
+    local_by_type = {s.type: s for s in local}
+    for entry in firmware:
+        if not isinstance(entry, dict):
+            return False
+        t = entry.get("type")
+        peer = local_by_type.get(t)
+        if peer is None:
+            return False
+        try:
+            fw_pct = float(entry.get("used_pct"))
+            fw_reset = int(entry.get("resets_at"))
+        except (TypeError, ValueError):
+            return False
+        if abs(peer.used_pct - fw_pct) > _USED_PCT_TOL:
+            return False
+        if peer.resets_at != fw_reset:
+            return False
+    return True

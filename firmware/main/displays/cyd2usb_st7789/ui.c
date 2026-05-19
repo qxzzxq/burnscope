@@ -262,9 +262,12 @@ static void render_snapshot_locked(const agent_snapshot_t *snap)
 
     const agent_palette_t *pal = palette_for(snap->agent);
 
-    /* Pull wall clock once per repaint. May be 0 before SNTP completes;
-     * the tick will pick up the right values once the clock is set. */
+    /* Pull wall clock once per repaint. Before SNTP completes time(NULL)
+     * is ~0 (seconds since boot), which would render countdowns like
+     * "resets in 20000d". Treat anything before 2023-11-14 as unsynced
+     * and substitute a placeholder until NTP catches up. */
     int64_t now = (int64_t)time(NULL);
+    const bool clock_synced = now > 1700000000;
 
     for (int i = 0; i < SNAPSHOT_MAX_SESSIONS; ++i) {
         ui_row_t *r = &s_rows[i];
@@ -290,7 +293,11 @@ static void render_snapshot_locked(const agent_snapshot_t *snap)
         lv_obj_set_style_bg_color(r->bar, lv_color_hex(pal->rows[i]), LV_PART_INDICATOR);
 
         char buf[32];
-        format_countdown(s->resets_at - now, buf, sizeof(buf));
+        if (clock_synced) {
+            format_countdown(s->resets_at - now, buf, sizeof(buf));
+        } else {
+            snprintf(buf, sizeof(buf), "syncing...");
+        }
         lv_label_set_text(r->countdown_lbl, buf);
     }
 }
@@ -398,6 +405,13 @@ void display_profile_show_agent(const agent_snapshot_t *snap)
         ESP_LOGE(TAG, "lvgl_port_lock failed in show_agent");
         return;
     }
-    show_agent_locked(snap);
+    /* Only force a screen swap when we're still on the splash — that's the
+     * "first push" transition out of "Waiting for daemon...". Subsequent
+     * pushes just refresh the snapshot store (already done by the caller);
+     * the 1 Hz tick picks up new values and handles agent cycling, so
+     * arrivals from a different agent must not yank the rotation. */
+    if (s_visible_agent[0] == '\0') {
+        show_agent_locked(snap);
+    }
     lvgl_port_unlock();
 }

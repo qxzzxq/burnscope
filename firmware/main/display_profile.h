@@ -30,11 +30,14 @@ void display_profile_init(void);
 void display_profile_show_status(const char *text);
 
 /**
- * Show the agent screen for `snap`. Replaces any current splash. If `snap`
- * is NULL the splash returns. Safe from any task.
+ * Notify the display that a fresh snapshot has landed in the store. Only
+ * the *first* such call transitions off the splash onto the agent screen;
+ * subsequent calls leave the visible screen untouched so a Codex push
+ * doesn't yank rotation away from a currently-visible Claude row (and
+ * vice versa). The 1 Hz LVGL timer installed during init handles
+ * re-render against the (already-updated) snapshot store and cycling
+ * between agents (FR-4.10), so callers don't need to drive ticks.
  *
- * The profile installs its own 1 Hz LVGL timer during init to advance the
- * countdown labels and cycle between agents (FR-4.10); callers don't need
- * to drive ticks manually.
+ * If `snap` is NULL the splash returns. Safe from any task.
  */
 void display_profile_show_agent(const agent_snapshot_t *snap);

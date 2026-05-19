@@ -174,7 +174,11 @@
   mDNS (overridable). A <code>JsonlActivityWatcher</code> tails
   <code>~/.claude/projects/**/*.jsonl</code> as a cheap activity signal that
   flips the probe cadence between an <em>active</em> and an <em>idle</em>
-  interval.
+  interval. Pushes to <code>POST /summary</code> are
+  <strong>edge-triggered</strong>: identical-content probes don't
+  re-POST. Between content changes the daemon hits
+  <code>GET /health</code> as the heartbeat / liveness probe so a dead
+  device is noticed without forcing a firmware repaint.
 </p>
 
 <div class="diagram">
@@ -193,7 +197,7 @@ flowchart LR
   end
 
   upstream[("Upstream APIs<br/>Anthropic / ChatGPT")]
-  esp32[("ESP32<br/>POST /summary")]
+  esp32[("ESP32<br/>POST /summary · GET /health")]
 
   cli -->|builds agents| daemon
   keychain -.->|"Credential.load()"| agents
@@ -203,8 +207,9 @@ flowchart LR
   jsonl -.->|file events| watcher
   daemon -->|"if host unknown"| discovery
   discovery -.->|"host:port"| daemon
-  daemon -->|"AgentSnapshot per agent"| pusher
-  pusher -->|HTTP POST| esp32
+  daemon -->|"changed AgentSnapshot only"| pusher
+  pusher -->|"HTTP POST /summary"| esp32
+  daemon -->|"heartbeat when no change"| esp32
 </pre>
 </div>
 
@@ -247,6 +252,10 @@ flowchart LR
     <tr><td><code>pusher.py</code></td>
         <td>—</td>
         <td><code>POST http://&lt;host&gt;/summary</code></td></tr>
+    <tr><td><code>daemon.py</code> (heartbeat)</td>
+        <td><code>GET http://&lt;host&gt;/health</code> (when no agent's
+            payload changed this tick)</td>
+        <td>—</td></tr>
   </tbody>
 </table>
 
@@ -939,13 +948,32 @@ classDiagram
 <p><strong>Discovery.</strong> If <code>cached_host is None</code> and
    <em>any</em> agent has a snapshot to push, call
    <code>discover_fn()</code>. <code>config.esp32_host</code> (when set)
-   is treated as a permanent cache — never invalidated on push failure.
-   An mDNS-discovered host is dropped (and rediscovered next tick) only
-   when <em>every</em> agent's most recent push attempt failed.</p>
+   is treated as a permanent cache — never invalidated on push or
+   health failure. An mDNS-discovered host is dropped (and rediscovered
+   next tick) when this tick's network attempt failed: either every
+   push attempted this tick failed, or no push was needed and the
+   <code>/health</code> heartbeat failed.</p>
 
-<p><strong>Pushing.</strong> One push per agent per cycle. Per-agent
-   <code>last_push_failed</code> is reset on success / set on failure.
-   No retries within a cycle — the loop's natural cadence retries.</p>
+<p><strong>Pushing (edge-triggered).</strong> For each agent with a
+   cached snapshot, compare its <em>payload</em>
+   (<code>(agent, sessions)</code> — <code>captured_at</code> is
+   excluded because it changes every probe) to
+   <code>state.last_pushed_snapshot</code>. POST only if they differ.
+   On success, <code>last_pushed_snapshot</code> is updated to the
+   just-pushed value and <code>last_push_failed</code> is cleared. No
+   retries within a cycle — if the comparison still shows a delta
+   next tick, the push runs again. This prevents the firmware from
+   being repainted at the daemon's probe cadence (which would
+   override its on-device agent rotation; see firmware FSD § FR-4.6
+   and § FR-4.10).</p>
+
+<p><strong>Heartbeat.</strong> On any tick where no agent's payload
+   changed (so no <code>/summary</code> went out), the daemon does a
+   single <code>GET /health</code> via <code>_check_health</code>.
+   Failures are logged at WARNING and flip the same
+   "drop the cached host" path as a push failure. The firmware does
+   not act on <code>/health</code> beyond returning JSON, so this
+   request has no visible side-effect on the device.</p>
 
 <p><strong>Validation.</strong> An empty <code>agents</code> list raises
    <code>ValueError</code>. The CLI is responsible for never passing
@@ -973,7 +1001,11 @@ classDiagram
     <tr><td>swallows all probe exceptions</td>
         <td>Logged at WARNING; agent backs off one tick.</td></tr>
     <tr><td>swallows all push exceptions</td>
-        <td>Logged at WARNING; mDNS host invalidated only if every push failed.</td></tr>
+        <td>Logged at WARNING; mDNS host invalidated when every push
+            attempted this tick failed (no push attempts → not counted).</td></tr>
+    <tr><td>swallows all health exceptions</td>
+        <td>Logged at WARNING; an mDNS-discovered host is dropped so it
+            is rediscovered next tick.</td></tr>
     <tr><td>swallows mDNS discovery exceptions</td>
         <td><code>discover_fn</code> failure means
             <code>cached_host</code> stays <code>None</code>; retried next tick.</td></tr>
@@ -990,6 +1022,12 @@ classDiagram
       — two agents push independently to the same ESP32.</li>
   <li><code>test_daemon_integration.py::test_daemon_isolates_probe_failures</code>
       — failing agent never pushes; healthy agent still does.</li>
+  <li><code>test_daemon_integration.py::test_daemon_skips_push_when_snapshot_unchanged</code>
+      — under repeated identical probes (different
+      <code>captured_at</code>) exactly one POST lands, and
+      <code>/health</code> is hit on subsequent ticks.</li>
+  <li><code>test_daemon_integration.py::test_daemon_pushes_again_when_snapshot_changes</code>
+      — every content change yields one POST, in order.</li>
 </ul>
 
 <!-- ---------------- cli.py ---------------- -->
@@ -1113,9 +1151,20 @@ sequenceDiagram
     end
     opt cached_host known
       loop per agent with snapshot
-        Daemon->>Pusher: push(snapshot, host, http)
-        Pusher->>ESP32: POST /summary
-        ESP32-->>Pusher: 204
+        alt payload differs from last_pushed_snapshot
+          Daemon->>Pusher: push(snapshot, host, http)
+          Pusher->>ESP32: POST /summary
+          ESP32-->>Pusher: 204
+        else unchanged
+          Daemon-->>Daemon: skip (no POST)
+        end
+      end
+      opt no agent pushed this tick
+        Daemon->>ESP32: GET /health (heartbeat)
+        ESP32-->>Daemon: 200 JSON / transport error
+      end
+      opt all attempts failed AND host was mDNS-discovered
+        Daemon-->>Daemon: cached_host = None (rediscover next tick)
       end
     end
     Daemon->>Daemon: await stop_event.wait(timeout=tick)
@@ -1128,7 +1177,7 @@ sequenceDiagram
 <h2 id="test-matrix">6. Test matrix</h2>
 
 <p>
-  48 tests, all passing in CI on Python 3.11+. Test framework:
+  50 tests, all passing in CI on Python 3.11+. Test framework:
   <code>pytest</code> with <code>pytest-asyncio</code> in auto mode and
   <code>respx</code> for HTTP mocking. mDNS discovery uses a real
   loopback zeroconf advertiser to avoid stubbing the protocol.
@@ -1176,9 +1225,11 @@ sequenceDiagram
             error mapping to <code>PushError</code>.</td></tr>
     <tr><td><code>daemon.py</code></td>
         <td><code>test_daemon_integration.py</code></td>
-        <td>4</td>
+        <td>6</td>
         <td>End-to-end probe→push, active-cadence switch, multi-agent
-            isolation, failing-agent isolation. Uses a real local HTTP
+            isolation, failing-agent isolation, edge-triggered push
+            (unchanged payload → no POST + <code>/health</code> hits),
+            and re-push on content change. Uses a real local HTTP
             server + real JSONL watcher; only the probe is stubbed via
             a <code>_StubAgent</code> subclass.</td></tr>
     <tr><td><code>cli.py</code></td>
@@ -1196,10 +1247,11 @@ sequenceDiagram
 <hr>
 
 <p class="small">
-  Generated alongside the multi-agent refactor that introduced the
-  <code>Agent</code> and <code>Credential</code> abstract base classes.
+  Last revised alongside the edge-triggered <code>/summary</code> +
+  <code>/health</code> heartbeat refactor in <code>daemon.py</code>
+  (see <code>docs/wire-format.md</code> for the contract change).
   Update this document whenever a new agent module is added or the
-  wire format changes.
+  wire format / push cadence semantics change.
 </p>
 
 </body>

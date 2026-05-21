@@ -45,7 +45,7 @@ from dataclasses import dataclass  # noqa: E402
 
 import httpx  # noqa: E402
 
-from . import host_cache, identity  # noqa: E402
+from . import host_cache  # noqa: E402
 from ._log import configure_logging  # noqa: E402
 from .discovery import discover_esp32  # noqa: E402
 from .pusher import PushAuthError, PushError, fetch_health, push  # noqa: E402
@@ -165,12 +165,12 @@ class CodexDaemon:
         email = _extract_email(account)
         if not email:
             raise CodexProtocolError("account/read returned no email")
-        derived = identity.client_id_for_agent(AGENT_NAME, email)
+        # The email itself is the plaintext wire-level identifier — no hash.
         cached = host_cache.read_client_id(AGENT_NAME)
-        if cached != derived:
-            host_cache.write_client_id(AGENT_NAME, derived)
-        self._client_id = derived
-        log.info("codex client_id derived from email")
+        if cached != email:
+            host_cache.write_client_id(AGENT_NAME, email)
+        self._client_id = email
+        log.info("codex identifier resolved: %s", email)
 
         rl = await self._request("account/rateLimits/read", {})
         snapshot = _snapshot_from_rate_limits(rl.get("rateLimits"))

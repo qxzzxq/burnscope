@@ -15,7 +15,7 @@ v2 abandons v1's unified `Agent` ABC + asyncio daemon-loop. Each collector now r
 
 - `client/src/burnscope_client/schema.py` — `SessionSnapshot` and `AgentSnapshot` (frozen dataclasses). Unchanged from v1. Matches `docs/wire-format.md`.
 - `client/src/burnscope_client/discovery.py` — mDNS browse for `_burnscope._tcp.local.`.
-- `client/src/burnscope_client/identity.py` — Derives the per-agent `X-BurnScope-Client-Id` (SHA-256). `claude_org_uuid()` reads the system keyring with a `~/.claude/.credentials.json` fallback. Codex's email comes via the app-server `account/read` call in `codex_daemon.py`.
+- `client/src/burnscope_client/identity.py` — Returns Claude's plaintext identifier for the `X-BurnScope-Client-Id` header. `claude_user_identifier()` prefers `oauthAccount.emailAddress` from `~/.claude.json`, falls back to top-level `userID`. No hashing — the ESP32 displays the value on screen. Codex's email comes via the app-server `account/read` call in `codex_daemon.py` and is also sent plaintext.
 - `client/src/burnscope_client/host_cache.py` — Atomic file-backed state in `~/.burnscope/` (override with `BURNSCOPE_STATE_DIR`): cached host, per-agent `last-push.*` indicator.
 - `client/src/burnscope_client/pusher.py` — `POST /summary` and `GET /health`, both sending the client-id header. `PushAuthError` (401) is distinct from `PushError` (transport / other) so callers know whether to invalidate the host cache.
 - `client/src/burnscope_client/claude_statusline.py` — Claude Code statusline hook. Foreground mode renders the line and forks a detached `--push` child; `--push` mode resolves the host, derives the client_id, POSTs, and writes `last-push.claude`.

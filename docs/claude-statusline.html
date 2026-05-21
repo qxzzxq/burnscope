@@ -271,9 +271,9 @@ print(f"5h {five_hour.get('used_percentage', '—')}%")</code></pre>
 
 <p>
   There is <strong>no</strong> user-, account-, or organization-level
-  identifier in the payload. For that, read
-  <code>organizationUuid</code> from the keychain entry
-  <code>Claude Code-credentials</code> directly — see
+  identifier in the statusline payload. For that, read
+  <code>oauthAccount.emailAddress</code> (or top-level <code>userID</code>
+  as a fallback) from <code>~/.claude.json</code> — see
   <a href="./client-spec-v2.html#identity">client-spec-v2.html § Identity &amp; pairing</a>.
 </p>
 

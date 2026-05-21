@@ -39,11 +39,11 @@ async def push(
     url = f"http://{host}/summary"
     headers = {CLIENT_ID_HEADER: client_id}
     log.debug(
-        "POST %s agent=%s sessions=%d client_id=%s…",
+        "POST %s agent=%s sessions=%d client_id=%s",
         url,
         snapshot.agent,
         len(snapshot.sessions),
-        client_id[:8],
+        client_id,
     )
     try:
         response = await client.post(

@@ -5,97 +5,76 @@ import pytest
 from burnscope_client import identity
 
 
-def test_client_id_for_agent_is_deterministic():
-    h1 = identity.client_id_for_agent("claude", "abc-123")
-    h2 = identity.client_id_for_agent("claude", "abc-123")
-    assert h1 == h2
-    assert len(h1) == 64
+def _write_settings(monkeypatch, tmp_path, payload):
+    path = tmp_path / ".claude.json"
+    path.write_text(json.dumps(payload))
+    monkeypatch.setattr(identity, "CLAUDE_SETTINGS_FILE", path)
+    return path
 
 
-def test_client_id_for_agent_namespaces_by_agent():
-    assert identity.client_id_for_agent(
-        "claude", "abc"
-    ) != identity.client_id_for_agent("codex", "abc")
-
-
-def test_client_id_for_agent_lowercases_agent_name():
-    assert identity.client_id_for_agent(
-        "CLAUDE", "abc"
-    ) == identity.client_id_for_agent("claude", "abc")
-
-
-def test_client_id_for_agent_known_vector():
-    # SHA256 of "burnscope:claude:abc-123" — locks the wire format down.
-    import hashlib
-
-    expected = hashlib.sha256(b"burnscope:claude:abc-123").hexdigest()
-    assert identity.client_id_for_agent("claude", "abc-123") == expected
-
-
-def test_claude_org_uuid_prefers_keyring(monkeypatch):
-    monkeypatch.setattr(
-        identity,
-        "_try_keyring",
-        lambda: {"organizationUuid": "from-keyring"},
+def test_returns_oauth_email_when_present(monkeypatch, tmp_path):
+    _write_settings(
+        monkeypatch,
+        tmp_path,
+        {"oauthAccount": {"emailAddress": "you@example.com"}, "userID": "fallback-id"},
     )
-    monkeypatch.setattr(
-        identity,
-        "_try_file",
-        lambda: {"organizationUuid": "from-file"},
+    assert identity.claude_user_identifier() == "you@example.com"
+
+
+def test_falls_back_to_user_id_when_email_missing(monkeypatch, tmp_path):
+    _write_settings(
+        monkeypatch,
+        tmp_path,
+        {"oauthAccount": {"organizationUuid": "org-x"}, "userID": "abc123"},
     )
-    assert identity.claude_org_uuid() == "from-keyring"
+    assert identity.claude_user_identifier() == "abc123"
 
 
-def test_claude_org_uuid_falls_back_to_file(monkeypatch):
-    monkeypatch.setattr(identity, "_try_keyring", lambda: None)
-    monkeypatch.setattr(
-        identity,
-        "_try_file",
-        lambda: {"organizationUuid": "from-file"},
+def test_falls_back_to_user_id_when_oauth_account_missing(monkeypatch, tmp_path):
+    _write_settings(monkeypatch, tmp_path, {"userID": "abc123"})
+    assert identity.claude_user_identifier() == "abc123"
+
+
+def test_falls_back_when_email_is_empty_string(monkeypatch, tmp_path):
+    _write_settings(
+        monkeypatch,
+        tmp_path,
+        {"oauthAccount": {"emailAddress": ""}, "userID": "fallback"},
     )
-    assert identity.claude_org_uuid() == "from-file"
+    assert identity.claude_user_identifier() == "fallback"
 
 
-def test_claude_org_uuid_accepts_nested_layout(monkeypatch):
-    monkeypatch.setattr(identity, "_try_keyring", lambda: None)
+def test_raises_when_neither_present(monkeypatch, tmp_path):
+    _write_settings(monkeypatch, tmp_path, {"numStartups": 7})
+    with pytest.raises(identity.IdentityError, match="neither"):
+        identity.claude_user_identifier()
+
+
+def test_raises_when_file_missing(monkeypatch, tmp_path):
     monkeypatch.setattr(
-        identity,
-        "_try_file",
-        lambda: {"claudeAiOauth": {"organizationUuid": "nested-uuid"}},
+        identity, "CLAUDE_SETTINGS_FILE", tmp_path / "absent.json"
     )
-    assert identity.claude_org_uuid() == "nested-uuid"
+    with pytest.raises(identity.IdentityError, match="Could not read"):
+        identity.claude_user_identifier()
 
 
-def test_claude_org_uuid_raises_when_no_source(monkeypatch):
-    monkeypatch.setattr(identity, "_try_keyring", lambda: None)
-    monkeypatch.setattr(identity, "_try_file", lambda: None)
+def test_raises_when_json_invalid(monkeypatch, tmp_path):
+    path = tmp_path / ".claude.json"
+    path.write_text("not json")
+    monkeypatch.setattr(identity, "CLAUDE_SETTINGS_FILE", path)
+    with pytest.raises(identity.IdentityError, match="not valid JSON"):
+        identity.claude_user_identifier()
+
+
+def test_raises_when_root_not_object(monkeypatch, tmp_path):
+    path = tmp_path / ".claude.json"
+    path.write_text("[1, 2, 3]")
+    monkeypatch.setattr(identity, "CLAUDE_SETTINGS_FILE", path)
+    with pytest.raises(identity.IdentityError, match="not a JSON object"):
+        identity.claude_user_identifier()
+
+
+def test_user_id_must_be_non_empty_string(monkeypatch, tmp_path):
+    _write_settings(monkeypatch, tmp_path, {"userID": ""})
     with pytest.raises(identity.IdentityError):
-        identity.claude_org_uuid()
-
-
-def test_claude_org_uuid_raises_when_field_missing(monkeypatch):
-    monkeypatch.setattr(identity, "_try_keyring", lambda: {"other": "x"})
-    monkeypatch.setattr(identity, "_try_file", lambda: None)
-    with pytest.raises(identity.IdentityError):
-        identity.claude_org_uuid()
-
-
-def test_try_file_reads_credentials_file(monkeypatch, tmp_path):
-    creds = tmp_path / ".credentials.json"
-    creds.write_text(json.dumps({"organizationUuid": "real-uuid"}))
-    monkeypatch.setattr(identity, "CLAUDE_CREDENTIALS_FILE", creds)
-    assert identity._try_file() == {"organizationUuid": "real-uuid"}
-
-
-def test_try_file_returns_none_when_missing(monkeypatch, tmp_path):
-    monkeypatch.setattr(
-        identity, "CLAUDE_CREDENTIALS_FILE", tmp_path / "nope.json"
-    )
-    assert identity._try_file() is None
-
-
-def test_try_file_returns_none_for_invalid_json(monkeypatch, tmp_path):
-    creds = tmp_path / ".credentials.json"
-    creds.write_text("not json")
-    monkeypatch.setattr(identity, "CLAUDE_CREDENTIALS_FILE", creds)
-    assert identity._try_file() is None
+        identity.claude_user_identifier()

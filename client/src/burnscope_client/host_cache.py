@@ -92,20 +92,27 @@ def write_push_state(agent: str, ok: bool) -> None:
     _atomic_write(state_dir() / f"{_LAST_PUSH_PREFIX}{agent}", payload)
 
 
-def read_client_id(agent: str) -> str | None:
-    """Return the cached per-agent SHA-256 client_id, or None.
+_MAX_CLIENT_ID_LEN = 254  # RFC 5321 email cap; leaves headroom for userIDs.
 
-    Cached on first derive so we don't hit the OS keyring on every Claude
-    statusline fire (each fire spawns a fresh process and would otherwise
-    re-prompt for Keychain access on macOS).
+
+def read_client_id(agent: str) -> str | None:
+    """Return the cached per-agent identifier, or None.
+
+    Cached on first derive so we don't re-read `~/.claude.json` on every
+    Claude statusline fire (each fire spawns a fresh process; the file
+    parse is cheap but skipping it keeps `--push` work to the minimum).
+
+    The value is the plaintext identifier (email or userID), so we only
+    reject obviously corrupt content: empty, too long, or containing
+    control characters that would break the HTTP header line.
     """
     path = state_dir() / f"{_CLIENT_ID_PREFIX}{agent}"
     try:
         raw = path.read_text().strip()
     except OSError:
         return None
-    if len(raw) != 64 or any(c not in "0123456789abcdef" for c in raw):
-        log.warning("client-id.%s contained malformed hash; ignoring", agent)
+    if not raw or len(raw) > _MAX_CLIENT_ID_LEN or any(ord(c) < 0x20 for c in raw):
+        log.warning("client-id.%s contained malformed identifier; ignoring", agent)
         return None
     return raw
 

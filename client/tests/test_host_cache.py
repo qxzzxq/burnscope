@@ -75,36 +75,45 @@ def test_read_push_state_returns_none_for_invalid_json(_state_dir):
     assert host_cache.read_push_state("claude") is None
 
 
-def test_client_id_round_trip():
-    cid = "a" * 64
-    host_cache.write_client_id("claude", cid)
-    assert host_cache.read_client_id("claude") == cid
+def test_client_id_round_trip_with_email():
+    host_cache.write_client_id("claude", "you@example.com")
+    assert host_cache.read_client_id("claude") == "you@example.com"
+
+
+def test_client_id_round_trip_with_user_id():
+    host_cache.write_client_id("claude", "abc" * 20)
+    assert host_cache.read_client_id("claude") == "abc" * 20
 
 
 def test_client_id_is_per_agent():
-    host_cache.write_client_id("claude", "a" * 64)
-    host_cache.write_client_id("codex", "b" * 64)
-    assert host_cache.read_client_id("claude") == "a" * 64
-    assert host_cache.read_client_id("codex") == "b" * 64
+    host_cache.write_client_id("claude", "you@example.com")
+    host_cache.write_client_id("codex", "other@example.com")
+    assert host_cache.read_client_id("claude") == "you@example.com"
+    assert host_cache.read_client_id("codex") == "other@example.com"
 
 
 def test_read_client_id_returns_none_when_missing():
     assert host_cache.read_client_id("claude") is None
 
 
-def test_read_client_id_rejects_malformed_hash(_state_dir):
-    (_state_dir / "client-id.claude").write_text("not-a-hash")
+def test_read_client_id_rejects_empty(_state_dir):
+    (_state_dir / "client-id.claude").write_text("   \n")
     assert host_cache.read_client_id("claude") is None
 
 
-def test_read_client_id_rejects_wrong_length(_state_dir):
-    (_state_dir / "client-id.claude").write_text("abcd")
+def test_read_client_id_rejects_overlong(_state_dir):
+    (_state_dir / "client-id.claude").write_text("x" * 500)
+    assert host_cache.read_client_id("claude") is None
+
+
+def test_read_client_id_rejects_control_characters(_state_dir):
+    (_state_dir / "client-id.claude").write_text("inner\tcontrol")
     assert host_cache.read_client_id("claude") is None
 
 
 def test_invalidate_client_id_is_idempotent():
     host_cache.invalidate_client_id("claude")  # missing — no-op
-    host_cache.write_client_id("claude", "c" * 64)
+    host_cache.write_client_id("claude", "you@example.com")
     host_cache.invalidate_client_id("claude")
     assert host_cache.read_client_id("claude") is None
 

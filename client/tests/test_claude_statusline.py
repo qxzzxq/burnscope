@@ -102,12 +102,12 @@ def test_push_mode_writes_ok_on_successful_push(monkeypatch):
     }
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(snapshot_dict)))
     monkeypatch.setattr(
-        claude_statusline.identity, "claude_org_uuid", lambda: "uuid-xyz"
+        claude_statusline.identity, "claude_user_identifier", lambda: "uuid-xyz"
     )
 
     async def fake_push(snap, host, client_id, client):
         assert host == "esp.local:80"
-        assert len(client_id) == 64
+        assert client_id == "uuid-xyz"  # passed through as plaintext
         assert snap.agent == "claude"
 
     monkeypatch.setattr(claude_statusline, "push", fake_push)
@@ -121,7 +121,7 @@ def test_push_mode_writes_ok_on_successful_push(monkeypatch):
     assert host_cache.read_client_id("claude") is not None
 
 
-def test_push_mode_uses_cached_client_id_without_touching_keyring(monkeypatch):
+def test_push_mode_uses_cached_client_id_without_re_reading_claude_json(monkeypatch):
     snapshot_dict = {
         "agent": "claude",
         "captured_at": 1779050146,
@@ -135,10 +135,10 @@ def test_push_mode_uses_cached_client_id_without_touching_keyring(monkeypatch):
 
     def boom():
         raise AssertionError(
-            "claude_org_uuid should NOT be called when client_id is cached"
+            "claude_user_identifier should NOT be called when client_id is cached"
         )
 
-    monkeypatch.setattr(claude_statusline.identity, "claude_org_uuid", boom)
+    monkeypatch.setattr(claude_statusline.identity, "claude_user_identifier", boom)
     monkeypatch.setattr(
         claude_statusline.host_cache, "load_host", lambda: "esp.local:80"
     )
@@ -166,7 +166,7 @@ def test_push_mode_writes_fail_and_invalidates_host_on_push_error(monkeypatch):
     host_cache.store_host("esp.local:80")
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(snapshot_dict)))
     monkeypatch.setattr(
-        claude_statusline.identity, "claude_org_uuid", lambda: "uuid-xyz"
+        claude_statusline.identity, "claude_user_identifier", lambda: "uuid-xyz"
     )
 
     async def fake_push(*args, **kwargs):
@@ -191,7 +191,7 @@ def test_push_mode_preserves_host_cache_on_auth_error(monkeypatch):
     host_cache.store_host("esp.local:80")
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(snapshot_dict)))
     monkeypatch.setattr(
-        claude_statusline.identity, "claude_org_uuid", lambda: "uuid-xyz"
+        claude_statusline.identity, "claude_user_identifier", lambda: "uuid-xyz"
     )
 
     async def fake_push(*args, **kwargs):
@@ -219,7 +219,7 @@ def test_push_mode_writes_fail_when_identity_unavailable(monkeypatch):
     def boom():
         raise claude_statusline.identity.IdentityError("no credentials")
 
-    monkeypatch.setattr(claude_statusline.identity, "claude_org_uuid", boom)
+    monkeypatch.setattr(claude_statusline.identity, "claude_user_identifier", boom)
 
     rc = claude_statusline.main(["--push"])
     assert rc == 1

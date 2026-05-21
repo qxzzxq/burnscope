@@ -261,8 +261,8 @@ async def test_bootstrap_sends_initialize_then_account_then_ratelimits():
 
     methods = [line["method"] for line in stdin.lines]
     assert methods == ["initialize", "account/read", "account/rateLimits/read"]
-    assert daemon._client_id is not None
-    assert len(daemon._client_id) == 64
+    # Email is passed through plaintext, not hashed.
+    assert daemon._client_id == "user@example.com"
 
     # Initial rateLimits/read result was enqueued for the pusher.
     queued = daemon._snapshot_queue.get_nowait()

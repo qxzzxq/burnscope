@@ -1,123 +1,77 @@
-"""Derive the per-agent `X-BurnScope-Client-Id` from local credential material.
+"""Derive the per-agent identifier shipped in `X-BurnScope-Client-Id`.
 
-Pure module. The only side effects are reading the keyring (where available)
-and the plaintext credential file fallback. See `docs/client-spec-v2.html` § 3.
+Pure module. The only side effect is reading `~/.claude.json`.
 
-Claude:  organizationUuid → sha256("burnscope:claude:<uuid>")
-Codex:   email (from app-server `account/read`, looked up at daemon bootstrap)
-         → sha256("burnscope:codex:<email>")
+Claude: prefers `oauthAccount.emailAddress`; falls back to top-level
+        `userID` when the account is not yet OAuth-signed-in but Claude Code
+        has assigned a local user ID.
+Codex:  `account.email` from the app-server `account/read` response — the
+        resolver lives in `codex_daemon.py` because it needs an open
+        subprocess.
 
-The Codex resolver lives in `codex_daemon.py` because it needs an open
-app-server connection. This module only provides the Claude resolver and the
-shared hash helper.
+The value is sent plaintext over the LAN so the ESP32 can display the
+operator's email/userID on screen. No hashing.
 """
 
 from __future__ import annotations
 
-import getpass
-import hashlib
 import json
 import logging
 from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials"
-CLAUDE_CREDENTIALS_FILE = Path.home() / ".claude" / ".credentials.json"
+CLAUDE_SETTINGS_FILE = Path.home() / ".claude.json"
 
 
 class IdentityError(RuntimeError):
-    """Raised when no credential source yields the required identifier."""
+    """Raised when ~/.claude.json is missing, malformed, or has no identifier."""
 
 
-def client_id_for_agent(agent: str, raw: str) -> str:
-    """Return the namespaced SHA-256 hex of `raw` under `agent`.
-
-    The `"burnscope:"` namespace prefix prevents collisions with hashes of the
-    same identifier produced for other purposes.
-    """
-    payload = f"burnscope:{agent.lower()}:{raw}".encode()
-    return hashlib.sha256(payload).hexdigest()
-
-
-def claude_org_uuid() -> str:
-    """Return Claude's `organizationUuid` from keyring or the fallback file.
+def claude_user_identifier() -> str:
+    """Return Claude's plaintext identifier from `~/.claude.json`.
 
     Resolution order:
-      1. System keyring entry `Claude Code-credentials` (macOS Keychain,
-         Linux Secret Service via `libsecret`).
-      2. Plaintext file `~/.claude/.credentials.json` — written by Claude Code
-         when no keyring is available.
+      1. `oauthAccount.emailAddress` (preferred — human-readable).
+      2. Top-level `userID` (fallback when emailAddress is absent).
 
-    Raises `IdentityError` if both sources fail or the JSON lacks the field.
+    Raises `IdentityError` if neither yields a non-empty string.
     """
-    source = "keyring"
-    blob = _try_keyring()
-    if blob is None:
-        source = "file"
-        blob = _try_file()
-    if blob is None:
-        raise IdentityError(
-            "No Claude credentials found in keyring or "
-            f"{CLAUDE_CREDENTIALS_FILE}"
-        )
+    data = _read_settings()
 
-    uuid = _extract_org_uuid(blob)
-    if not uuid:
-        raise IdentityError(
-            "Claude credentials JSON did not contain a non-empty "
-            "`organizationUuid` field"
-        )
-    # Log a short prefix only — full UUID is the input to the client_id hash.
-    log.debug("resolved Claude organizationUuid via %s (%s…)", source, uuid[:8])
-    return uuid
+    oauth = data.get("oauthAccount")
+    if isinstance(oauth, dict):
+        email = oauth.get("emailAddress")
+        if isinstance(email, str) and email:
+            log.debug("resolved Claude identifier via oauthAccount.emailAddress")
+            return email
+
+    user_id = data.get("userID")
+    if isinstance(user_id, str) and user_id:
+        log.debug("resolved Claude identifier via userID fallback")
+        return user_id
+
+    raise IdentityError(
+        f"{CLAUDE_SETTINGS_FILE} has neither "
+        "`oauthAccount.emailAddress` nor a top-level `userID`"
+    )
 
 
-def _try_keyring() -> dict | None:
+def _read_settings() -> dict:
     try:
-        import keyring  # imported lazily — optional dependency at runtime
-    except ImportError:
-        return None
-    try:
-        raw = keyring.get_password(CLAUDE_KEYCHAIN_SERVICE, getpass.getuser())
-    except Exception as exc:  # keyring backends raise their own exceptions
-        log.debug("keyring lookup failed: %s", exc)
-        return None
-    if not raw:
-        return None
-    try:
-        return json.loads(raw)
-    except ValueError as exc:
-        log.warning("keyring entry was not valid JSON: %s", exc)
-        return None
-
-
-def _try_file() -> dict | None:
-    try:
-        raw = CLAUDE_CREDENTIALS_FILE.read_text()
+        raw = CLAUDE_SETTINGS_FILE.read_text()
     except OSError as exc:
-        log.debug("credentials file unavailable: %s", exc)
-        return None
+        raise IdentityError(
+            f"Could not read {CLAUDE_SETTINGS_FILE}: {exc}"
+        ) from exc
     try:
-        return json.loads(raw)
+        parsed = json.loads(raw)
     except ValueError as exc:
-        log.warning("credentials file was not valid JSON: %s", exc)
-        return None
-
-
-def _extract_org_uuid(blob: dict) -> str | None:
-    """Pull `organizationUuid` out of one of the documented shapes.
-
-    Claude Code has shipped two layouts: top-level (`{"organizationUuid": ...}`)
-    and nested under `claudeAiOauth` (`{"claudeAiOauth": {"organizationUuid":
-    ...}}`). Try both; whichever wins.
-    """
-    direct = blob.get("organizationUuid")
-    if isinstance(direct, str) and direct:
-        return direct
-    nested = blob.get("claudeAiOauth")
-    if isinstance(nested, dict):
-        val = nested.get("organizationUuid")
-        if isinstance(val, str) and val:
-            return val
-    return None
+        raise IdentityError(
+            f"{CLAUDE_SETTINGS_FILE} is not valid JSON: {exc}"
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise IdentityError(
+            f"{CLAUDE_SETTINGS_FILE} root is not a JSON object"
+        )
+    return parsed

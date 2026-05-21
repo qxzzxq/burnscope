@@ -10,10 +10,10 @@ Two modes, selected by `--push`:
   same module with `--push`.
 
 * **`--push` (detached child)** — reads the AgentSnapshot JSON from stdin,
-  resolves the host via the mDNS cache, derives the client_id from the
-  Claude keyring credentials, POSTs to the ESP32, and writes the outcome to
-  `~/.burnscope/last-push.claude` for the next foreground fire to render
-  as the ✓/✗ indicator.
+  resolves the host via the mDNS cache, derives the client_id from
+  `~/.claude.json` (`oauthAccount.organizationUuid`), POSTs to the ESP32,
+  and writes the outcome to `~/.burnscope/last-push.claude` for the next
+  foreground fire to render as the ✓/✗ indicator.
 
 See `docs/client-spec-v2.html` § 6 for the per-fire lifecycle.
 
@@ -188,19 +188,17 @@ def _push_mode() -> int:
 
     client_id = host_cache.read_client_id("claude")
     if client_id is None:
-        log.debug("client_id cache miss; deriving from credentials")
+        log.debug("client_id cache miss; reading ~/.claude.json")
         try:
-            client_id = identity.client_id_for_agent(
-                "claude", identity.claude_org_uuid()
-            )
+            client_id = identity.claude_user_identifier()
         except identity.IdentityError as exc:
             log.error("could not derive client_id: %s", exc)
             host_cache.write_push_state("claude", ok=False)
             return 1
         host_cache.write_client_id("claude", client_id)
-        log.debug("client_id derived and cached (%s…)", client_id[:8])
+        log.debug("client_id resolved and cached: %s", client_id)
     else:
-        log.debug("client_id cache hit (%s…)", client_id[:8])
+        log.debug("client_id cache hit: %s", client_id)
 
     try:
         asyncio.run(_do_push(snapshot, client_id))

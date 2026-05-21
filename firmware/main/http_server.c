@@ -1,6 +1,18 @@
+/*
+ * Production HTTP server. Parses POST /summary into the snapshot store,
+ * exposes GET /health for the daemon to age-check, and POST /factory-reset
+ * to wipe creds remotely (mirror of the BOOT-button long-press).
+ *
+ * JSON parsing is hand-rolled against the very tight schema in
+ * `docs/wire-format.md`. cJSON is not in ESP-IDF v6 and pulling it in as
+ * a managed dependency for one ~200-byte payload didn't earn its keep.
+ */
+
 #include "http_server.h"
 
+#include <ctype.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_err.h"
@@ -9,45 +21,350 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 
+#include "nvs_store.h"
+#include "snapshot.h"
 #include "version.h"
 
 static const char *TAG = "http";
 
-#define SUMMARY_MAX_BODY (16 * 1024)
-#define SUMMARY_CHUNK    512
+#define SUMMARY_MAX_BODY  (16 * 1024)
 
 static httpd_handle_t s_server = NULL;
 
-static esp_err_t summary_post_handler(httpd_req_t *req)
+/* --------------------------------------------------------------------- */
+/* Minimal JSON cursor — parses the AgentSnapshot shape and nothing else.*/
+/* --------------------------------------------------------------------- */
+
+typedef struct {
+    const char *p;
+    const char *end;
+    bool        err;
+} cursor_t;
+
+static void skip_ws(cursor_t *c)
 {
-    char chunk[SUMMARY_CHUNK];
-    int remaining = req->content_len;
-    if (remaining < 0) {
-        remaining = 0;
-    }
-    /* Phase 2 will parse the body. Phase 1 only proves the route shape. */
-    int total_drained = 0;
-    while (remaining > 0) {
-        int want = remaining > (int)sizeof(chunk) ? (int)sizeof(chunk) : remaining;
-        int got = httpd_req_recv(req, chunk, want);
-        if (got <= 0) {
-            if (got == HTTPD_SOCK_ERR_TIMEOUT) {
-                continue;
+    while (c->p < c->end && isspace((unsigned char)*c->p)) c->p++;
+}
+
+static bool eat(cursor_t *c, char ch)
+{
+    skip_ws(c);
+    if (c->p < c->end && *c->p == ch) { c->p++; return true; }
+    c->err = true;
+    return false;
+}
+
+/* Read a string. Stores into out[out_len] with NUL. Supports only
+ * printable ASCII + the standard backslash escapes; rejects \uXXXX since
+ * the wire schema never uses them in MVP. */
+static bool read_string(cursor_t *c, char *out, size_t out_len)
+{
+    skip_ws(c);
+    if (c->p >= c->end || *c->p != '"') { c->err = true; return false; }
+    c->p++;
+    size_t i = 0;
+    while (c->p < c->end && *c->p != '"') {
+        char ch = *c->p++;
+        if (ch == '\\') {
+            if (c->p >= c->end) { c->err = true; return false; }
+            char esc = *c->p++;
+            switch (esc) {
+            case '"': case '\\': case '/': ch = esc; break;
+            case 'n': ch = '\n'; break;
+            case 't': ch = '\t'; break;
+            case 'r': ch = '\r'; break;
+            default: c->err = true; return false;
             }
-            return ESP_FAIL;
         }
-        remaining -= got;
-        total_drained += got;
-        if (total_drained > SUMMARY_MAX_BODY) {
-            ESP_LOGW(TAG, "body too large (>%d bytes); dropping", SUMMARY_MAX_BODY);
-            httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE, "body too large");
-            return ESP_OK;
+        if (i + 1 < out_len) out[i++] = ch;
+    }
+    if (c->p >= c->end) { c->err = true; return false; }
+    c->p++;
+    if (out_len > 0) out[i] = '\0';
+    return true;
+}
+
+/* Read a numeric value as a double (covers integers + 0.0..1.0 floats). */
+static bool read_number(cursor_t *c, double *out)
+{
+    skip_ws(c);
+    char *endp = NULL;
+    /* strtod operates on a NUL-terminated buffer; the body is already
+     * NUL-terminated by the caller. */
+    double v = strtod(c->p, &endp);
+    if (endp == c->p) { c->err = true; return false; }
+    c->p = endp;
+    *out = v;
+    return true;
+}
+
+/* Read a key at the current position into out (no value). Used at every
+ * object key — the wire format isn't strict about ordering. */
+static bool peek_key(cursor_t *c, char *out, size_t out_len)
+{
+    skip_ws(c);
+    if (c->p >= c->end || *c->p != '"') return false;
+    const char *save = c->p;
+    if (!read_string(c, out, out_len)) {
+        c->p = save; return false;
+    }
+    skip_ws(c);
+    if (c->p >= c->end || *c->p != ':') { c->err = true; return false; }
+    c->p++;
+    return true;
+}
+
+/* --------------------------------------------------------------------- */
+/* POST /summary                                                          */
+/* --------------------------------------------------------------------- */
+
+static esp_err_t reject_400(httpd_req_t *req, const char *reason)
+{
+    ESP_LOGW(TAG, "rejecting /summary: %s", reason);
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, reason);
+    return ESP_OK;
+}
+
+static bool is_known_agent(const char *s)
+{
+    return s != NULL && (strcmp(s, "claude") == 0 || strcmp(s, "codex") == 0);
+}
+
+/* Parse one {"type":..,"used_pct":..,"resets_at":..} object. Accepts the
+ * three keys in any order. */
+static bool parse_session(cursor_t *c, session_snapshot_t *out)
+{
+    if (!eat(c, '{')) return false;
+    bool have_type = false, have_pct = false, have_reset = false;
+    memset(out, 0, sizeof(*out));
+
+    for (;;) {
+        skip_ws(c);
+        if (c->p < c->end && *c->p == '}') { c->p++; break; }
+
+        char key[16];
+        if (!peek_key(c, key, sizeof(key))) return false;
+
+        if (strcmp(key, "type") == 0) {
+            if (!read_string(c, out->type, sizeof(out->type))) return false;
+            have_type = true;
+        } else if (strcmp(key, "used_pct") == 0) {
+            double v;
+            if (!read_number(c, &v)) return false;
+            if (v < 0.0 || v > 1.0) { c->err = true; return false; }
+            out->used_pct = (float)v;
+            have_pct = true;
+        } else if (strcmp(key, "resets_at") == 0) {
+            double v;
+            if (!read_number(c, &v)) return false;
+            out->resets_at = (int64_t)v;
+            have_reset = true;
+        } else {
+            /* Unknown key — bail; wire format is strict. */
+            c->err = true;
+            return false;
         }
+
+        skip_ws(c);
+        if (c->p < c->end && *c->p == ',') { c->p++; continue; }
+        if (c->p < c->end && *c->p == '}') { c->p++; break; }
+        c->err = true;
+        return false;
     }
 
+    if (!have_type || !have_pct || !have_reset || out->type[0] == '\0') {
+        return false;
+    }
+    return true;
+}
+
+static bool parse_snapshot(cursor_t *c, agent_snapshot_t *out)
+{
+    if (!eat(c, '{')) return false;
+    memset(out, 0, sizeof(*out));
+    bool have_agent = false, have_captured = false, have_sessions = false;
+
+    for (;;) {
+        skip_ws(c);
+        if (c->p < c->end && *c->p == '}') { c->p++; break; }
+
+        char key[16];
+        if (!peek_key(c, key, sizeof(key))) return false;
+
+        if (strcmp(key, "agent") == 0) {
+            if (!read_string(c, out->agent, sizeof(out->agent))) return false;
+            if (!is_known_agent(out->agent)) { c->err = true; return false; }
+            have_agent = true;
+        } else if (strcmp(key, "captured_at") == 0) {
+            double v;
+            if (!read_number(c, &v)) return false;
+            out->captured_at = (int64_t)v;
+            have_captured = true;
+        } else if (strcmp(key, "sessions") == 0) {
+            if (!eat(c, '[')) return false;
+            out->session_count = 0;
+            for (;;) {
+                skip_ws(c);
+                if (c->p < c->end && *c->p == ']') { c->p++; break; }
+                if (out->session_count >= SNAPSHOT_MAX_SESSIONS) {
+                    /* Drop extras silently — schema allows future tiers. */
+                    /* Skip remaining entries by counting braces. */
+                    int depth = 0;
+                    while (c->p < c->end) {
+                        char ch = *c->p++;
+                        if (ch == '{') depth++;
+                        else if (ch == '}') {
+                            if (depth == 0) { c->err = true; return false; }
+                            depth--;
+                        } else if (ch == ']' && depth == 0) {
+                            goto sessions_done;
+                        }
+                    }
+                    c->err = true;
+                    return false;
+                }
+                if (!parse_session(c, &out->sessions[out->session_count])) {
+                    return false;
+                }
+                out->session_count++;
+                skip_ws(c);
+                if (c->p < c->end && *c->p == ',') { c->p++; continue; }
+                if (c->p < c->end && *c->p == ']') { c->p++; break; }
+                c->err = true;
+                return false;
+            }
+sessions_done:
+            have_sessions = true;
+        } else {
+            c->err = true;
+            return false;
+        }
+
+        skip_ws(c);
+        if (c->p < c->end && *c->p == ',') { c->p++; continue; }
+        if (c->p < c->end && *c->p == '}') { c->p++; break; }
+        c->err = true;
+        return false;
+    }
+
+    return have_agent && have_captured && have_sessions && out->session_count > 0;
+}
+
+static esp_err_t summary_post_handler(httpd_req_t *req)
+{
+    int content_len = req->content_len;
+    if (content_len < 0) content_len = 0;
+    if (content_len > SUMMARY_MAX_BODY) {
+        ESP_LOGW(TAG, "body too large (%d bytes); dropping", content_len);
+        httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE, "body too large");
+        return ESP_OK;
+    }
+    if (content_len == 0) {
+        return reject_400(req, "empty body");
+    }
+
+    char *buf = malloc(content_len + 1);
+    if (buf == NULL) {
+        return httpd_resp_send_500(req);
+    }
+    int got_total = 0;
+    while (got_total < content_len) {
+        int got = httpd_req_recv(req, buf + got_total, content_len - got_total);
+        if (got <= 0) {
+            if (got == HTTPD_SOCK_ERR_TIMEOUT) continue;
+            free(buf);
+            return ESP_FAIL;
+        }
+        got_total += got;
+    }
+    buf[got_total] = '\0';
+
+    agent_snapshot_t snap;
+    cursor_t cur = { .p = buf, .end = buf + got_total, .err = false };
+    bool ok = parse_snapshot(&cur, &snap);
+    free(buf);
+
+    if (!ok || cur.err) {
+        return reject_400(req, "invalid AgentSnapshot");
+    }
+
+    if (!snapshot_store_put(&snap)) {
+        return httpd_resp_send_500(req);
+    }
+
+    ESP_LOGI(TAG, "snapshot accepted: agent=%s sessions=%d",
+             snap.agent, snap.session_count);
     httpd_resp_set_status(req, "204 No Content");
     httpd_resp_send(req, NULL, 0);
     return ESP_OK;
+}
+
+/* --------------------------------------------------------------------- */
+/* GET /health                                                            */
+/* --------------------------------------------------------------------- */
+
+typedef struct {
+    char  *body;
+    size_t cap;
+    size_t off;
+    bool   first;
+} agents_writer_t;
+
+/* Append one agent entry to the /health JSON. Each entry carries both
+ * `seconds_since_last_push` (for diagnostics) and `sessions` (the same
+ * shape the daemon POSTs). The daemon uses `sessions` to detect when
+ * firmware-side state diverges from its latest probe — for instance after
+ * an ESP32 reboot — and re-POSTs without waiting for an upstream change.
+ *
+ * Worst case under SNAPSHOT_MAX_SESSIONS=3:
+ *   "claude":{"seconds_since_last_push":<int64>,"sessions":[
+ *      {"type":"<16ch>","used_pct":<%g>,"resets_at":<int64>}, ... x3]}
+ * comfortably fits in ~240 bytes. The 1024-byte body buffer holds two of
+ * those plus the outer envelope.
+ */
+static void append_agent(const agent_snapshot_t *snap, void *user)
+{
+    agents_writer_t *w = (agents_writer_t *)user;
+    if (w->off >= w->cap) return;
+
+    int64_t age = snapshot_store_age_s(snap->agent);
+    size_t saved_off = w->off;
+    bool saved_first = w->first;
+
+    int n = snprintf(w->body + w->off, w->cap - w->off,
+                     "%s\"%s\":{\"seconds_since_last_push\":%lld,\"sessions\":[",
+                     w->first ? "" : ",",
+                     snap->agent,
+                     (long long)age);
+    if (n <= 0 || (size_t)n >= w->cap - w->off) goto overflow;
+    w->off += n;
+
+    for (uint8_t i = 0; i < snap->session_count; ++i) {
+        const session_snapshot_t *s = &snap->sessions[i];
+        n = snprintf(w->body + w->off, w->cap - w->off,
+                     "%s{\"type\":\"%s\",\"used_pct\":%.6g,\"resets_at\":%lld}",
+                     i == 0 ? "" : ",",
+                     s->type,
+                     (double)s->used_pct,
+                     (long long)s->resets_at);
+        if (n <= 0 || (size_t)n >= w->cap - w->off) goto overflow;
+        w->off += n;
+    }
+
+    n = snprintf(w->body + w->off, w->cap - w->off, "]}");
+    if (n <= 0 || (size_t)n >= w->cap - w->off) goto overflow;
+    w->off += n;
+
+    w->first = false;
+    return;
+
+overflow:
+    /* Roll back any partial write so the outer JSON stays valid. */
+    w->off = saved_off;
+    w->first = saved_first;
+    if (w->off < w->cap) {
+        w->body[w->off] = '\0';
+    }
 }
 
 static esp_err_t health_get_handler(httpd_req_t *req)
@@ -56,16 +373,63 @@ static esp_err_t health_get_handler(httpd_req_t *req)
     uint32_t uptime_s = (uint32_t)(uptime_us / 1000000);
     uint32_t free_heap = esp_get_free_heap_size();
 
-    char body[160];
-    int n = snprintf(body, sizeof(body),
-                     "{\"firmware_version\":\"%s\",\"uptime_s\":%lu,\"free_heap_b\":%lu}",
-                     BURNSCOPE_FW_VERSION,
-                     (unsigned long)uptime_s,
-                     (unsigned long)free_heap);
+    char body[1024];
+    int off = snprintf(body, sizeof(body),
+                       "{\"firmware_version\":\"%s\","
+                       "\"uptime_s\":%lu,"
+                       "\"free_heap_b\":%lu,"
+                       "\"agents\":{",
+                       BURNSCOPE_FW_VERSION,
+                       (unsigned long)uptime_s,
+                       (unsigned long)free_heap);
+
+    agents_writer_t w = { .body = body, .cap = sizeof(body), .off = (size_t)off, .first = true };
+    snapshot_store_foreach(append_agent, &w);
+    if (w.off + 3 < w.cap) {
+        w.body[w.off++] = '}';
+        w.body[w.off++] = '}';
+        w.body[w.off]   = '\0';
+    }
+
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, body, n);
+    httpd_resp_send(req, body, w.off);
     return ESP_OK;
 }
+
+/* --------------------------------------------------------------------- */
+/* POST /factory-reset                                                    */
+/* --------------------------------------------------------------------- */
+
+static void delayed_restart_cb(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "factory-reset commanded; rebooting");
+    esp_restart();
+}
+
+static esp_err_t factory_reset_handler(httpd_req_t *req)
+{
+    nvs_store_erase_creds();
+
+    httpd_resp_set_status(req, "202 Accepted");
+    httpd_resp_send(req, NULL, 0);
+
+    const esp_timer_create_args_t targs = {
+        .callback = delayed_restart_cb,
+        .name = "factory_reboot",
+    };
+    esp_timer_handle_t t;
+    if (esp_timer_create(&targs, &t) == ESP_OK) {
+        esp_timer_start_once(t, 500 * 1000);
+    } else {
+        esp_restart();
+    }
+    return ESP_OK;
+}
+
+/* --------------------------------------------------------------------- */
+/* Startup                                                                */
+/* --------------------------------------------------------------------- */
 
 void http_server_start(void)
 {
@@ -80,18 +444,19 @@ void http_server_start(void)
     ESP_ERROR_CHECK(httpd_start(&s_server, &config));
 
     const httpd_uri_t summary = {
-        .uri = "/summary",
-        .method = HTTP_POST,
-        .handler = summary_post_handler,
+        .uri = "/summary", .method = HTTP_POST, .handler = summary_post_handler,
     };
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &summary));
 
     const httpd_uri_t health = {
-        .uri = "/health",
-        .method = HTTP_GET,
-        .handler = health_get_handler,
+        .uri = "/health", .method = HTTP_GET, .handler = health_get_handler,
     };
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &health));
+
+    const httpd_uri_t factory_reset = {
+        .uri = "/factory-reset", .method = HTTP_POST, .handler = factory_reset_handler,
+    };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &factory_reset));
 
     ESP_LOGI(TAG, "HTTP server listening on :80");
 }

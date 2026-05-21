@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude statusline — rate-limit procedure</title>
+<style>
+  :root {
+    --accent: #2c5aa0;
+    --accent-soft: #eef3fa;
+    --border: #e1e4e8;
+    --bg-soft: #fafbfc;
+    --bg-code: #f4f4f7;
+    --text: #24292f;
+    --muted: #57606a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    max-width: 1040px;
+    margin: 2em auto;
+    padding: 0 1.5em;
+    color: var(--text);
+    line-height: 1.55;
+  }
+  h1 { border-bottom: 2px solid var(--accent); padding-bottom: .35em; }
+  h2 { border-bottom: 1px solid var(--border); padding-bottom: .25em; margin-top: 2.2em; }
+  h3 { color: var(--accent); margin-top: 1.8em; }
+  h4 { margin-top: 1.4em; margin-bottom: .4em; color: var(--muted); text-transform: uppercase;
+       font-size: .82em; letter-spacing: .05em; }
+  p { margin: .6em 0; }
+  code, pre { font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace; }
+  code {
+    background: var(--bg-code);
+    padding: .1em .35em;
+    border-radius: 3px;
+    font-size: .92em;
+  }
+  pre {
+    background: var(--bg-code);
+    padding: 1em 1.2em;
+    border-radius: 6px;
+    overflow-x: auto;
+    border-left: 3px solid var(--accent);
+    font-size: .87em;
+    line-height: 1.5;
+  }
+  pre code { background: transparent; padding: 0; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 1em 0;
+    font-size: .92em;
+  }
+  th, td {
+    border: 1px solid var(--border);
+    padding: .55em .8em;
+    text-align: left;
+    vertical-align: top;
+  }
+  th { background: var(--bg-soft); font-weight: 600; }
+  td.mono, table.mono td:first-child {
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: .9em;
+    white-space: nowrap;
+  }
+  .toc {
+    background: var(--bg-soft);
+    border: 1px solid var(--border);
+    padding: 1em 1.5em;
+    border-radius: 6px;
+  }
+  .toc ul { margin: .3em 0; padding-left: 1.4em; }
+  .toc li { margin: .15em 0; }
+  .tag {
+    display: inline-block;
+    background: var(--accent-soft);
+    color: var(--accent);
+    padding: .12em .55em;
+    border-radius: 3px;
+    font-size: .78em;
+    font-weight: 600;
+    margin-right: .4em;
+    vertical-align: middle;
+  }
+  blockquote {
+    border-left: 3px solid #ccc;
+    margin: 1em 0;
+    padding: .35em 1em;
+    color: var(--muted);
+    background: var(--bg-soft);
+    border-radius: 0 4px 4px 0;
+  }
+  .small { font-size: .88em; color: var(--muted); }
+  hr { border: 0; border-top: 1px solid var(--border); margin: 2.5em 0; }
+</style>
+</head>
+<body>
+
+<h1>Claude statusline — rate-limit procedure</h1>
+
+<p class="small">
+  How the BurnScope client reads Anthropic Claude usage data via Claude Code's
+  built-in statusline hook, in place of HTTP probes against
+  <code>api.anthropic.com</code>. Pairs with
+  <a href="./codex-app-server.html">codex-app-server.html</a> (the Codex
+  equivalent) and <a href="./wire-format.md">wire-format.md</a>.
+</p>
+
+<div class="toc">
+  <strong>Contents</strong>
+  <ul>
+    <li><a href="#why">1. Why statusline</a></li>
+    <li><a href="#prereqs">2. Prerequisites</a></li>
+    <li><a href="#configure">3. Configure the hook</a></li>
+    <li><a href="#protocol">4. Hook protocol</a>
+      <ul>
+        <li><a href="#triggers">4.1 When the hook fires</a></li>
+        <li><a href="#stdin-payload">4.2 stdin payload (JSON)</a></li>
+        <li><a href="#stdout-output">4.3 stdout expectations</a></li>
+      </ul>
+    </li>
+    <li><a href="#rate-limits">5. Rate-limit fields</a></li>
+    <li><a href="#sample">6. Sample payload</a></li>
+    <li><a href="#mapping">7. Mapping to <code>AgentSnapshot</code></a></li>
+    <li><a href="#caveats">8. Caveats</a></li>
+  </ul>
+</div>
+
+<!-- =============================================================== -->
+<h2 id="why">1. Why statusline</h2>
+
+<p>
+  The historical Claude probe (<a href="./probe-claude.sh"><code>docs/probe-claude.sh</code></a>)
+  authenticates with the user's OAuth token and POSTs a near-empty request
+  to <code>https://api.anthropic.com/v1/messages</code>, then reads
+  <code>anthropic-ratelimit-unified-{5h,7d}-{utilization,reset}</code> from
+  the response headers. That issues a real (token-costing) API call on the
+  user's account and reuses an authentication channel intended for the
+  official client — it works, but is on shaky ground vs. Anthropic's
+  terms of use.
+</p>
+
+<p>
+  Claude Code ships a documented extension point, the <strong>statusline</strong>,
+  designed for tools like <code>ccstatusline</code>, <code>claude-powerline</code>,
+  and <code>Tokemon</code> to render live session telemetry in the user's
+  terminal. The statusline command receives a JSON payload on stdin that
+  already contains <code>rate_limits.five_hour.*</code> and
+  <code>rate_limits.seven_day.*</code> — the exact data we need.
+  <strong>No upstream API call is made, no tokens are consumed</strong>;
+  the data is sourced from the most recent API response Claude Code itself
+  observed during normal usage.
+</p>
+
+<!-- =============================================================== -->
+<h2 id="prereqs">2. Prerequisites</h2>
+
+<ul>
+  <li>Claude Code installed and signed into a Claude.ai account.</li>
+  <li>Active Pro or Max subscription. The
+      <code>rate_limits</code> object is only populated for Claude.ai
+      subscribers; API-key-only accounts will never see it.</li>
+  <li>At least one message exchanged in the current session — the
+      <code>rate_limits</code> object appears only after the first API
+      response.</li>
+</ul>
+
+<!-- =============================================================== -->
+<h2 id="configure">3. Configure the hook</h2>
+
+<p>
+  Add a <code>statusLine</code> field to <code>~/.claude/settings.json</code>:
+</p>
+
+<pre><code>{
+  "statusLine": {
+    "type": "command",
+    "command": "~/.burnscope/claude-statusline.py",
+    "padding": 0
+  }
+}</code></pre>
+
+<table>
+  <tr><th>Field</th><th>Value</th></tr>
+  <tr><td class="mono">type</td><td>Always <code>"command"</code> (the only supported kind).</td></tr>
+  <tr><td class="mono">command</td><td>Absolute path or shell command. Runs in a subshell, so inline pipes/jq are fine.</td></tr>
+  <tr><td class="mono">padding</td><td>Optional. Horizontal padding (chars) added to the rendered line. <code>0</code> for compact.</td></tr>
+  <tr><td class="mono">refreshInterval</td><td>Optional. Re-runs the command every N seconds (minimum 1) in addition to event-driven fires. Useful for time-based displays; not needed for our use.</td></tr>
+  <tr><td class="mono">hideVimModeIndicator</td><td>Optional. Set true if the script renders <code>vim.mode</code> itself.</td></tr>
+</table>
+
+<p>
+  Changes are picked up at the next event tick — no Claude Code restart
+  needed.
+</p>
+
+<!-- =============================================================== -->
+<h2 id="protocol">4. Hook protocol</h2>
+
+<h3 id="triggers">4.1 When the hook fires</h3>
+
+<p>Event-driven, with 300ms debounce. Triggers:</p>
+
+<ul>
+  <li>After each new assistant message.</li>
+  <li>After <code>/compact</code> finishes.</li>
+  <li>When the permission mode changes.</li>
+  <li>When vim mode toggles.</li>
+  <li>On the <code>refreshInterval</code> timer (if configured).</li>
+</ul>
+
+<blockquote>
+  If a new event triggers while your script is still running, the in-flight
+  execution is <strong>cancelled</strong>. Scripts must be fast or do their
+  heavy work in a detached background process.
+</blockquote>
+
+<h3 id="stdin-payload">4.2 stdin payload (JSON)</h3>
+
+<p>
+  A single JSON object piped to the command's stdin. Fields are documented
+  in <a href="#rate-limits">section 5</a>. Read with:
+</p>
+
+<pre><code>#!/usr/bin/env python3
+import json, sys
+payload = json.load(sys.stdin)
+five_hour = payload.get("rate_limits", {}).get("five_hour", {})
+print(f"5h {five_hour.get('used_percentage', '—')}%")</code></pre>
+
+<h3 id="stdout-output">4.3 stdout expectations</h3>
+
+<ul>
+  <li>Each line printed becomes one row of the rendered statusline.</li>
+  <li>ANSI color escapes are honored (terminal must support them).</li>
+  <li>OSC 8 hyperlinks are honored.</li>
+  <li>stderr is discarded — log there if you need to.</li>
+  <li>Exit code is ignored.</li>
+</ul>
+
+<!-- =============================================================== -->
+<h2 id="rate-limits">5. Rate-limit fields</h2>
+
+<p>
+  The two fields BurnScope cares about, both under
+  <code>payload.rate_limits</code>:
+</p>
+
+<table>
+  <tr><th>Field</th><th>Type</th><th>Description</th></tr>
+  <tr><td class="mono">five_hour.used_percentage</td><td>float (0–100)</td><td>% of the 5-hour rolling window consumed.</td></tr>
+  <tr><td class="mono">five_hour.resets_at</td><td>int (unix sec)</td><td>UTC unix seconds when the 5-hour window rolls over.</td></tr>
+  <tr><td class="mono">seven_day.used_percentage</td><td>float (0–100)</td><td>% of the 7-day rolling window consumed.</td></tr>
+  <tr><td class="mono">seven_day.resets_at</td><td>int (unix sec)</td><td>UTC unix seconds when the 7-day window rolls over.</td></tr>
+</table>
+
+<p>
+  Other useful fields the same payload contains (not consumed today, but
+  listed for reference):
+</p>
+
+<table>
+  <tr><th>Field</th><th>Notes</th></tr>
+  <tr><td class="mono">model.id, model.display_name</td><td>Current model.</td></tr>
+  <tr><td class="mono">session_id, transcript_path</td><td>Per-session identifiers. Not stable across restarts.</td></tr>
+  <tr><td class="mono">cost.total_cost_usd</td><td>Client-side cost estimate.</td></tr>
+  <tr><td class="mono">context_window.used_percentage</td><td>Per-conversation context fill (separate from rate limits).</td></tr>
+  <tr><td class="mono">version</td><td>Claude Code version string.</td></tr>
+</table>
+
+<p>
+  There is <strong>no</strong> user-, account-, or organization-level
+  identifier in the payload. For that, read
+  <code>organizationUuid</code> from the keychain entry
+  <code>Claude Code-credentials</code> directly — see
+  <a href="./client-spec-v2.html#identity">client-spec-v2.html § Identity &amp; pairing</a>.
+</p>
+
+<!-- =============================================================== -->
+<h2 id="sample">6. Sample payload</h2>
+
+<p>Abridged but real-shaped:</p>
+
+<pre><code>{
+  "cwd": "/Users/you/Projects/burnscope",
+  "session_id": "abc123...",
+  "transcript_path": "/Users/you/.claude/projects/.../session.jsonl",
+  "model": { "id": "claude-opus-4-7", "display_name": "Opus" },
+  "version": "2.1.90",
+  "cost": {
+    "total_cost_usd": 0.01234,
+    "total_duration_ms": 45000,
+    "total_api_duration_ms": 2300,
+    "total_lines_added": 156,
+    "total_lines_removed": 23
+  },
+  "context_window": {
+    "total_input_tokens": 15500,
+    "total_output_tokens": 1200,
+    "context_window_size": 200000,
+    "used_percentage": 8,
+    "remaining_percentage": 92
+  },
+  "rate_limits": {
+    "five_hour":  { "used_percentage": 23.5, "resets_at": 1738425600 },
+    "seven_day":  { "used_percentage": 41.2, "resets_at": 1738857600 }
+  }
+}</code></pre>
+
+<!-- =============================================================== -->
+<h2 id="mapping">7. Mapping to <code>AgentSnapshot</code></h2>
+
+<table>
+  <tr><th>Source</th><th>→</th><th><code>SessionSnapshot</code></th></tr>
+  <tr>
+    <td class="mono">rate_limits.five_hour</td>
+    <td>→</td>
+    <td><code>{ type: "current", used_pct: used_percentage / 100, resets_at: resets_at }</code></td>
+  </tr>
+  <tr>
+    <td class="mono">rate_limits.seven_day</td>
+    <td>→</td>
+    <td><code>{ type: "weekly", used_pct: used_percentage / 100, resets_at: resets_at }</code></td>
+  </tr>
+</table>
+
+<p>
+  The <code>type</code> labels (<code>"current"</code>, <code>"weekly"</code>)
+  match what the previous header-based probe produced — see the header→session
+  table at the bottom of <a href="./wire-format.md">wire-format.md</a>. No
+  firmware change required; the swap is source-side only.
+</p>
+
+<p>
+  Per <a href="./client-spec-v2.html">client-spec-v2.html</a>, the Claude
+  collector lives in the user's <code>~/.claude/settings.json</code> as a
+  statusline command — not a long-running daemon. <code>captured_at</code>
+  is stamped at the moment stdin is read; the snapshot is then posted to
+  the ESP32 in a detached background process so the rendered statusline
+  isn't blocked by network I/O.
+</p>
+
+<!-- =============================================================== -->
+<h2 id="caveats">8. Caveats</h2>
+
+<ul>
+  <li>
+    <strong>Cancellation.</strong> If a new event fires before your
+    script finishes, the script is killed mid-execution. Always print
+    the statusline first, then fork the ESP32 POST off into a
+    detached background process. The main script must exit fast.
+  </li>
+  <li>
+    <strong>Rate-limit absence.</strong> The <code>rate_limits</code>
+    object is missing entirely for the first message of a fresh session
+    (before any API response) and for non-subscriber accounts. Treat
+    <code>None</code> as "no data yet" — don't post a partial
+    <code>AgentSnapshot</code>; just print the statusline with dashes
+    where the percentages would be.
+  </li>
+  <li>
+    <strong>Idle behavior.</strong> The hook only fires while Claude Code
+    is open. When you close Claude Code, no further pushes happen — the
+    ESP32 will show the last successful snapshot indefinitely (per the
+    wire format's per-agent in-memory store). Acceptable; the user
+    isn't watching the display when they're not using Claude.
+  </li>
+  <li>
+    <strong>Multi-session concurrency.</strong> Running N parallel
+    Claude Code windows means N statusline scripts fire on every update,
+    all posting independently. The wire format's per-agent monotonic
+    <code>captured_at</code> guard (see
+    <a href="./wire-format.md">wire-format.md</a>) ensures the freshest
+    snapshot wins; older arrivals are 204-acked without state change.
+  </li>
+  <li>
+    <strong>Throttling.</strong> 300ms debounce on the Claude Code side
+    means at most ~3 fires/sec under continuous activity. The ESP32
+    handles this fine; no client-side rate limiting is needed.
+  </li>
+  <li>
+    <strong>Format stability.</strong> The statusline JSON shape is
+    documented and stable, but Anthropic may add fields. Always
+    null-check; never crash on unknown keys.
+  </li>
+</ul>
+
+<hr>
+
+<p class="small">
+  References:
+  <a href="https://code.claude.com/docs/en/statusline">Anthropic — Customize your status line</a>
+  ·
+  <a href="https://github.com/sirmalloc/ccstatusline">ccstatusline</a>
+  ·
+  <a href="https://github.com/Owloops/claude-powerline">claude-powerline</a>.
+</p>
+
+</body>
+</html>

@@ -151,7 +151,6 @@
         <li><a href="#agent"><code>agent.py</code></a></li>
         <li><a href="#agents-claude"><code>agents/claude.py</code></a></li>
         <li><a href="#agents-codex"><code>agents/codex.py</code></a></li>
-        <li><a href="#watcher"><code>watcher.py</code></a></li>
         <li><a href="#discovery"><code>discovery.py</code></a></li>
         <li><a href="#pusher"><code>pusher.py</code></a></li>
         <li><a href="#daemon"><code>daemon.py</code></a></li>
@@ -171,10 +170,13 @@
   upstream AI-agent rate-limit endpoints, normalises each into an
   agent-agnostic <code>AgentSnapshot</code>, and pushes each snapshot to a
   BurnScope ESP32 display over HTTP. The ESP32 is discovered on the LAN via
-  mDNS (overridable). A <code>JsonlActivityWatcher</code> tails
-  <code>~/.claude/projects/**/*.jsonl</code> as a cheap activity signal that
-  flips the probe cadence between an <em>active</em> and an <em>idle</em>
-  interval.
+  mDNS (overridable). Each agent declares its own <code>probe_interval</code>
+  class attribute; a <code>--probe-interval</code> CLI flag overrides every
+  agent globally. Pushes to <code>POST /summary</code> are
+  <strong>edge-triggered</strong>: identical-content probes don't
+  re-POST. Between content changes the daemon hits
+  <code>GET /health</code> as the heartbeat / liveness probe so a dead
+  device is noticed without forcing a firmware repaint.
 </p>
 
 <div class="diagram">
@@ -183,28 +185,25 @@ flowchart LR
   subgraph Local["laptop"]
     direction LR
     keychain[("macOS keychain<br/>~/.codex/auth.json<br/>~/.claude/.credentials.json")]
-    jsonl[("~/.claude/projects/**/*.jsonl")]
     cli["cli.py<br/>(entry point)"]
     daemon["daemon.py<br/>(event loop)"]
     agents["agents/*<br/>(probe + parse)"]
-    watcher["watcher.py"]
     discovery["discovery.py<br/>(mDNS)"]
     pusher["pusher.py"]
   end
 
   upstream[("Upstream APIs<br/>Anthropic / ChatGPT")]
-  esp32[("ESP32<br/>POST /summary")]
+  esp32[("ESP32<br/>POST /summary · GET /health")]
 
   cli -->|builds agents| daemon
   keychain -.->|"Credential.load()"| agents
   daemon -->|"agent.probe(http)"| agents
   agents -->|HTTP probe| upstream
-  daemon -->|"last_change_ts"| watcher
-  jsonl -.->|file events| watcher
   daemon -->|"if host unknown"| discovery
   discovery -.->|"host:port"| daemon
-  daemon -->|"AgentSnapshot per agent"| pusher
-  pusher -->|HTTP POST| esp32
+  daemon -->|"changed AgentSnapshot only"| pusher
+  pusher -->|"HTTP POST /summary"| esp32
+  daemon -->|"heartbeat when no change"| esp32
 </pre>
 </div>
 
@@ -232,9 +231,6 @@ flowchart LR
         <td>macOS keychain, <code>~/.claude/.credentials.json</code>,
             <code>~/.codex/auth.json</code></td>
         <td>—</td></tr>
-    <tr><td><code>watcher.py</code></td>
-        <td><code>~/.claude/projects/**/*.jsonl</code> (file system events)</td>
-        <td>—</td></tr>
     <tr><td><code>agents/claude.py</code></td>
         <td><code>POST https://api.anthropic.com/v1/messages</code></td>
         <td>—</td></tr>
@@ -247,6 +243,10 @@ flowchart LR
     <tr><td><code>pusher.py</code></td>
         <td>—</td>
         <td><code>POST http://&lt;host&gt;/summary</code></td></tr>
+    <tr><td><code>daemon.py</code> (heartbeat)</td>
+        <td><code>GET http://&lt;host&gt;/health</code> (when no agent's
+            payload changed this tick)</td>
+        <td>—</td></tr>
   </tbody>
 </table>
 
@@ -723,60 +723,6 @@ classDiagram
   <li><code>test_credentials.py::test_codex_agent_class_constants_match_expected_location</code></li>
 </ul>
 
-<!-- ---------------- watcher.py ---------------- -->
-<div class="module-header">
-  <h3 id="watcher"><code>watcher.py</code></h3>
-  <span class="path">client/src/burnscope_client/watcher.py</span>
-</div>
-
-<h4>Purpose</h4>
-<p>
-  Tails <code>~/.claude/projects/**/*.jsonl</code> as a binary signal
-  ("did anything happen recently?") used by the daemon to switch between
-  the active and idle probe cadences.
-</p>
-
-<h4>Public surface</h4>
-<table class="surface">
-  <thead><tr><th>Name</th><th>Kind</th><th>Description</th></tr></thead>
-  <tbody>
-    <tr><td>JsonlActivityWatcher(root, poll_interval=1.0)</td><td>class</td>
-        <td>Wraps <code>watchdog.PollingObserver</code>.</td></tr>
-    <tr><td>watcher.last_change_ts</td><td>property</td>
-        <td><code>float | None</code> — wall-clock unix seconds of the
-            most recent <code>*.jsonl</code> create / modify / move beneath
-            <code>root</code>, or <code>None</code> if nothing yet.</td></tr>
-    <tr><td>watcher.start() / watcher.stop()</td><td>method</td>
-        <td>Idempotent. <code>start()</code> also creates
-            <code>root</code> if missing.</td></tr>
-  </tbody>
-</table>
-
-<h4>Behaviour</h4>
-<p>
-  Uses <code>PollingObserver</code> (not the native one) for cross-platform
-  determinism, especially under CI. Only <code>*.jsonl</code> file events
-  count; directories and other extensions are ignored. The internal
-  <code>_last_change_ts</code> is guarded by a <code>threading.Lock</code>
-  because the observer runs in its own thread.
-</p>
-
-<h4>Error handling</h4>
-<p>
-  No exceptions are raised from observer callbacks (watchdog suppresses
-  them); pathological errors are logged by watchdog and the
-  <code>last_change_ts</code> simply doesn't update.
-</p>
-
-<h4>Tests</h4>
-<ul class="tests">
-  <li><code>test_watcher.py::test_initial_last_change_is_none</code></li>
-  <li><code>test_watcher.py::test_jsonl_modification_updates_last_change</code></li>
-  <li><code>test_watcher.py::test_non_jsonl_files_are_ignored</code></li>
-  <li><code>test_watcher.py::test_nested_jsonl_modifications_detected</code></li>
-  <li><code>test_watcher.py::test_stop_is_idempotent</code></li>
-</ul>
-
 <!-- ---------------- discovery.py ---------------- -->
 <div class="module-header">
   <h3 id="discovery"><code>discovery.py</code></h3>
@@ -896,8 +842,8 @@ classDiagram
 
 <h4>Purpose</h4>
 <p>
-  Orchestrates probe scheduling, mDNS discovery, JSONL activity sensing,
-  and push delivery for one or more agents inside a single asyncio loop.
+  Orchestrates probe scheduling, mDNS discovery, and push delivery for
+  one or more agents inside a single asyncio loop.
 </p>
 
 <h4>Public surface</h4>
@@ -907,11 +853,9 @@ classDiagram
     <tr><td>DaemonConfig</td><td>dataclass</td>
         <td><code>agents: list[Agent]</code>,
             <code>esp32_host: str | None</code>,
-            <code>claude_projects_dir: Path</code>,
-            cadence knobs (<code>active_interval</code>,
-            <code>idle_interval</code>, <code>active_window</code>,
-            <code>tick</code>, <code>discovery_timeout</code>,
-            <code>watcher_poll_interval</code>).</td></tr>
+            <code>probe_interval: float | None</code> (optional global
+            cadence override), <code>tick</code>,
+            <code>discovery_timeout</code>.</td></tr>
     <tr><td>DiscoverFn</td><td>type alias</td>
         <td><code>Callable[[], Awaitable[str | None]]</code> — injection
             point for tests.</td></tr>
@@ -923,10 +867,11 @@ classDiagram
 <h4>Behaviour</h4>
 
 <p><strong>Cadence.</strong>
-   <code>_current_interval</code> picks <code>active_interval</code> if
-   <code>now - watcher.last_change_ts &lt; active_window</code>, else
-   <code>idle_interval</code>. The loop wakes every <code>tick</code>
-   seconds (or earlier if <code>stop_event</code> fires).</p>
+   <code>_current_interval</code> returns
+   <code>config.probe_interval</code> when set (global override),
+   otherwise the agent's own <code>probe_interval</code> class attribute.
+   The loop wakes every <code>tick</code> seconds (or earlier if
+   <code>stop_event</code> fires).</p>
 
 <p><strong>Probing.</strong> For each agent, if
    <code>now - last_probe_ts &ge; interval</code>, await
@@ -939,13 +884,32 @@ classDiagram
 <p><strong>Discovery.</strong> If <code>cached_host is None</code> and
    <em>any</em> agent has a snapshot to push, call
    <code>discover_fn()</code>. <code>config.esp32_host</code> (when set)
-   is treated as a permanent cache — never invalidated on push failure.
-   An mDNS-discovered host is dropped (and rediscovered next tick) only
-   when <em>every</em> agent's most recent push attempt failed.</p>
+   is treated as a permanent cache — never invalidated on push or
+   health failure. An mDNS-discovered host is dropped (and rediscovered
+   next tick) when this tick's network attempt failed: either every
+   push attempted this tick failed, or no push was needed and the
+   <code>/health</code> heartbeat failed.</p>
 
-<p><strong>Pushing.</strong> One push per agent per cycle. Per-agent
-   <code>last_push_failed</code> is reset on success / set on failure.
-   No retries within a cycle — the loop's natural cadence retries.</p>
+<p><strong>Pushing (edge-triggered).</strong> For each agent with a
+   cached snapshot, compare its <em>payload</em>
+   (<code>(agent, sessions)</code> — <code>captured_at</code> is
+   excluded because it changes every probe) to
+   <code>state.last_pushed_snapshot</code>. POST only if they differ.
+   On success, <code>last_pushed_snapshot</code> is updated to the
+   just-pushed value and <code>last_push_failed</code> is cleared. No
+   retries within a cycle — if the comparison still shows a delta
+   next tick, the push runs again. This prevents the firmware from
+   being repainted at the daemon's probe cadence (which would
+   override its on-device agent rotation; see firmware FSD § FR-4.6
+   and § FR-4.10).</p>
+
+<p><strong>Heartbeat.</strong> On any tick where no agent's payload
+   changed (so no <code>/summary</code> went out), the daemon does a
+   single <code>GET /health</code> via <code>_check_health</code>.
+   Failures are logged at WARNING and flip the same
+   "drop the cached host" path as a push failure. The firmware does
+   not act on <code>/health</code> beyond returning JSON, so this
+   request has no visible side-effect on the device.</p>
 
 <p><strong>Validation.</strong> An empty <code>agents</code> list raises
    <code>ValueError</code>. The CLI is responsible for never passing
@@ -973,7 +937,11 @@ classDiagram
     <tr><td>swallows all probe exceptions</td>
         <td>Logged at WARNING; agent backs off one tick.</td></tr>
     <tr><td>swallows all push exceptions</td>
-        <td>Logged at WARNING; mDNS host invalidated only if every push failed.</td></tr>
+        <td>Logged at WARNING; mDNS host invalidated when every push
+            attempted this tick failed (no push attempts → not counted).</td></tr>
+    <tr><td>swallows all health exceptions</td>
+        <td>Logged at WARNING; an mDNS-discovered host is dropped so it
+            is rediscovered next tick.</td></tr>
     <tr><td>swallows mDNS discovery exceptions</td>
         <td><code>discover_fn</code> failure means
             <code>cached_host</code> stays <code>None</code>; retried next tick.</td></tr>
@@ -984,12 +952,19 @@ classDiagram
 <ul class="tests">
   <li><code>test_daemon_integration.py::test_daemon_probes_and_pushes_to_fake_esp</code>
       — single-agent happy path.</li>
-  <li><code>test_daemon_integration.py::test_daemon_uses_active_interval_after_jsonl_change</code>
-      — activity-driven cadence switch.</li>
+  <li><code>test_daemon_integration.py::test_daemon_uses_per_agent_intervals</code>
+      — without a global override, fast and slow agents tick on their
+      own <code>probe_interval</code>.</li>
   <li><code>test_daemon_integration.py::test_daemon_pushes_one_snapshot_per_agent</code>
       — two agents push independently to the same ESP32.</li>
   <li><code>test_daemon_integration.py::test_daemon_isolates_probe_failures</code>
       — failing agent never pushes; healthy agent still does.</li>
+  <li><code>test_daemon_integration.py::test_daemon_skips_push_when_snapshot_unchanged</code>
+      — under repeated identical probes (different
+      <code>captured_at</code>) exactly one POST lands, and
+      <code>/health</code> is hit on subsequent ticks.</li>
+  <li><code>test_daemon_integration.py::test_daemon_pushes_again_when_snapshot_changes</code>
+      — every content change yields one POST, in order.</li>
 </ul>
 
 <!-- ---------------- cli.py ---------------- -->
@@ -1023,9 +998,8 @@ classDiagram
 
 <p><strong>Flags.</strong>
    <code>--agent {claude,codex}</code> (repeatable),
-   <code>--esp32-host</code>, <code>--active-interval</code>,
-   <code>--idle-interval</code>, <code>--active-window</code>,
-   <code>--claude-projects-dir</code>, <code>--log-level</code>.</p>
+   <code>--esp32-host</code>, <code>--probe-interval</code>,
+   <code>--log-level</code>.</p>
 
 <p><strong>Agent build.</strong>
    <em>With</em> <code>--agent</code>: every named agent must have
@@ -1085,7 +1059,6 @@ classDiagram
 sequenceDiagram
   participant CLI as cli.py
   participant Daemon as daemon.run()
-  participant Watcher as JsonlActivityWatcher
   participant Agent as Agent.probe()
   participant Upstream as Anthropic / ChatGPT
   participant Discovery as discover_esp32()
@@ -1093,12 +1066,9 @@ sequenceDiagram
   participant ESP32 as ESP32 /summary
 
   CLI->>Daemon: run(config, stop_event)
-  Daemon->>Watcher: start()
   loop while not stop_event.is_set()
-    Daemon->>Watcher: last_change_ts
-    Daemon->>Daemon: pick interval (active/idle)
     par per agent
-      alt now - last_probe_ts ≥ interval
+      alt now - last_probe_ts ≥ probe_interval
         Daemon->>Agent: await probe(http)
         Agent->>Upstream: POST (single token / streaming)
         Upstream-->>Agent: rate-limit headers
@@ -1112,15 +1082,23 @@ sequenceDiagram
       Discovery-->>Daemon: "host:port" or None
     end
     opt cached_host known
+      Daemon->>ESP32: GET /health
+      ESP32-->>Daemon: 200 JSON (firmware-side sessions) / transport error
       loop per agent with snapshot
-        Daemon->>Pusher: push(snapshot, host, http)
-        Pusher->>ESP32: POST /summary
-        ESP32-->>Pusher: 204
+        alt payload differs from firmware-side sessions
+          Daemon->>Pusher: push(snapshot, host, http)
+          Pusher->>ESP32: POST /summary
+          ESP32-->>Pusher: 204
+        else unchanged
+          Daemon-->>Daemon: skip (no POST)
+        end
+      end
+      opt all push attempts failed AND host was mDNS-discovered
+        Daemon-->>Daemon: cached_host = None (rediscover next tick)
       end
     end
     Daemon->>Daemon: await stop_event.wait(timeout=tick)
   end
-  Daemon->>Watcher: stop()
 </pre>
 </div>
 
@@ -1128,7 +1106,7 @@ sequenceDiagram
 <h2 id="test-matrix">6. Test matrix</h2>
 
 <p>
-  48 tests, all passing in CI on Python 3.11+. Test framework:
+  51 tests, all passing in CI on Python 3.11+. Test framework:
   <code>pytest</code> with <code>pytest-asyncio</code> in auto mode and
   <code>respx</code> for HTTP mocking. mDNS discovery uses a real
   loopback zeroconf advertiser to avoid stubbing the protocol.
@@ -1159,11 +1137,6 @@ sequenceDiagram
         <td>÷100 scaling, optional <code>account_id</code> header,
             streaming response handling, partial-headers, every
             credential failure mode.</td></tr>
-    <tr><td><code>watcher.py</code></td>
-        <td><code>test_watcher.py</code></td>
-        <td>5</td>
-        <td>Initial state, modification detection, non-jsonl filtering,
-            recursive descent, idempotent stop.</td></tr>
     <tr><td><code>discovery.py</code></td>
         <td><code>test_discovery.py</code></td>
         <td>4</td>
@@ -1176,11 +1149,15 @@ sequenceDiagram
             error mapping to <code>PushError</code>.</td></tr>
     <tr><td><code>daemon.py</code></td>
         <td><code>test_daemon_integration.py</code></td>
-        <td>4</td>
-        <td>End-to-end probe→push, active-cadence switch, multi-agent
-            isolation, failing-agent isolation. Uses a real local HTTP
-            server + real JSONL watcher; only the probe is stubbed via
-            a <code>_StubAgent</code> subclass.</td></tr>
+        <td>10</td>
+        <td>End-to-end probe→push, per-agent independent cadence,
+            multi-agent isolation, failing-agent isolation,
+            edge-triggered push (unchanged payload → no POST +
+            <code>/health</code> hits), re-push on content change,
+            re-push after firmware loses state, auth-error credential
+            reload, failure backoff + kill-switch, success resets the
+            strike count. Uses a real local HTTP server; only the probe
+            is stubbed via a <code>_StubAgent</code> subclass.</td></tr>
     <tr><td><code>cli.py</code></td>
         <td>—</td>
         <td>0</td>
@@ -1196,10 +1173,11 @@ sequenceDiagram
 <hr>
 
 <p class="small">
-  Generated alongside the multi-agent refactor that introduced the
-  <code>Agent</code> and <code>Credential</code> abstract base classes.
+  Last revised alongside the edge-triggered <code>/summary</code> +
+  <code>/health</code> heartbeat refactor in <code>daemon.py</code>
+  (see <code>docs/wire-format.md</code> for the contract change).
   Update this document whenever a new agent module is added or the
-  wire format changes.
+  wire format / push cadence semantics change.
 </p>
 
 </body>

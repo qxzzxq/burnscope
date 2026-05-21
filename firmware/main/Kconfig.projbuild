@@ -1,0 +1,17 @@
+menu "BurnScope display"
+
+choice BURNSCOPE_DISPLAY
+    prompt "Display profile"
+    default BURNSCOPE_DISPLAY_CYD2USB_ST7789
+    help
+        Picks one panel-driver-plus-UI bundle. Each profile lives under
+        `main/displays/<name>/` and owns both its panel bring-up and its
+        LVGL layout because UI design is geometry-bound. Add new screens
+        by dropping in a sibling directory and a new option here.
+
+    config BURNSCOPE_DISPLAY_CYD2USB_ST7789
+        bool "Cheap Yellow Display (cyd2usb, ST7789 320x240 landscape)"
+
+endchoice
+
+endmenu

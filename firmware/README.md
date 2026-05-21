@@ -1,23 +1,14 @@
 # BurnScope Firmware
 
 ESP-IDF firmware for the Cheap Yellow Display (CYD, cyd2usb variant).
-Phase 1 — boot + networking — corresponds to FSD § 3.1.
+Phase 2 — captive-portal provisioning + snapshot rendering — corresponds
+to FSD § 3.2.
 
 ## Prerequisites
 
 - ESP-IDF v6.0.1 at `~/.espressif/v6.0.1/esp-idf` (run its
   `export.sh`/`export.fish` to put `idf.py` on `$PATH`).
 - A 2.4 GHz WPA2/WPA3-PSK network the device can reach.
-
-## One-time setup
-
-Phase 1 reads WiFi credentials from a private compile-time header. Copy
-the template, fill it in, and **do not commit it** (it's gitignored).
-
-```sh
-cp main/wifi_creds.h.example main/wifi_creds.h
-$EDITOR main/wifi_creds.h
-```
 
 ## Build, flash, monitor
 
@@ -27,26 +18,90 @@ idf.py build
 idf.py -p <PORT> flash monitor
 ```
 
-On a healthy boot the panel walks through:
+No WiFi credentials are baked into the image — the device captures them
+over a captive portal on first boot.
+
+## First-time provisioning
+
+On a fresh (or freshly-reset) device:
+
+1. The panel shows `Setup mode — connect to BURNSCOPE-XXXX`.
+2. From a phone/laptop, join the open WiFi network
+   **`BURNSCOPE-XXXX`** where `XXXX` is the last four hex digits of the
+   board's MAC.
+3. The OS captive-portal popup opens the form automatically (Apple/
+   Android probes are intercepted). If not, browse to
+   <http://192.168.4.1/>.
+4. Pick your network from the scanned list, enter the password, hit
+   **Save & reboot**.
+5. The device persists the credentials to NVS and restarts. Subsequent
+   boots skip the portal and join STA directly.
+
+The panel walks through:
 
 ```
 Booting…  ──►  Connecting…  ──►  Waiting for daemon…
 ```
 
-## Verifying Phase 1
+…and switches to the agent screen the moment the first
+`POST /summary` arrives.
 
-| Check         | Command / action                                                                  |
-|---------------|------------------------------------------------------------------------------------|
-| mDNS visible  | `dns-sd -B _burnscope._tcp` (macOS) — service appears within a few seconds.       |
-| Health route  | `curl http://burnscope-XXXX.local/health` — JSON with `firmware_version`, `uptime_s`, `free_heap_b`. |
-| Summary route | `curl -i -X POST http://burnscope-XXXX.local/summary -d '{}'` — `204 No Content`. |
-| Watchdog      | Build once with `-DBURNSCOPE_WDT_INJECT_HANG`; device reboots within ~10 s, next boot logs `rst:0xc`. |
+## Re-provisioning
 
-`XXXX` is the last 4 hex digits of the WiFi STA MAC, lowercased.
+Two equivalent paths:
 
-## Out of scope for Phase 1
+- **Long-press the BOOT button** (GPIO0) for ≥ 5 s. The device wipes
+  NVS and reboots back into the captive portal.
+- **Remote:** `curl -X POST http://burnscope-XXXX.local/factory-reset` —
+  responds 202 then reboots.
 
-Captive-portal provisioning, `AgentSnapshot` parsing, the full UI with
-progress bars and countdowns, `POST /factory-reset`, and the `display_t`
-abstraction all live in later phases — see
-`../docs/fsd/firmware-fsd.md` § 3.2 / § 3.3.
+## Display profiles (build parameter)
+
+The panel driver and the UI layout ship together as a build-time profile
+under `main/displays/<name>/`. The active profile is chosen via Kconfig
+(`menuconfig` → *BurnScope display* → *Display profile*) and pinned in
+`sdkconfig.defaults`. Phase 2 ships one profile:
+
+| Kconfig symbol                            | Profile path                       |
+|-------------------------------------------|------------------------------------|
+| `CONFIG_BURNSCOPE_DISPLAY_CYD2USB_ST7789` | `main/displays/cyd2usb_st7789/`    |
+
+Adding a new screen (e.g. an OLED or e-paper variant): drop
+`main/displays/<name>/{driver.c,ui.c}` implementing
+`display_profile_init`/`show_status`/`show_agent`, add a `bool` Kconfig
+option under the `BURNSCOPE_DISPLAY` choice in
+`main/Kconfig.projbuild`, and gate the source list in
+`main/CMakeLists.txt`. UI layout belongs in the profile because layout
+choices are geometry-bound (FR-5 in the FSD).
+
+## Verifying Phase 2
+
+The on-device smoke test:
+
+```sh
+HOST=burnscope-XXXX.local        # or the IP if mDNS is blocked
+./scripts/phase2_smoke.sh "$HOST"
+```
+
+The script covers TC-SUM-100/101/102/103/104/105 and TC-HEALTH-100.
+Visual checks remain a manual pass against FSD § 6.1.6 (two rounded
+rows, integer percentage, "resets in HH:MM" countdown ticking once a
+second).
+
+| Test       | What it checks                                                           |
+|------------|---------------------------------------------------------------------------|
+| TC-CP-100  | Erase NVS, boot, walk through portal → STA-connected without re-flash.   |
+| TC-NVS-102 | BOOT button held ≥ 5 s ⇒ portal returns on the next boot.                |
+| TC-NVS-103 | `POST /factory-reset` ⇒ 202 + portal returns.                            |
+| TC-SUM-100 | `POST /summary` with `docs/examples/summary-push.json` → 204, UI repaints.|
+| TC-SUM-101 | Push claude, then codex — UI cycles between them every ~5 s.             |
+| TC-SUM-104 | `used_pct = 1.5` ⇒ 400.                                                  |
+| TC-SUM-105 | 20 KiB body ⇒ 413.                                                       |
+| TC-UI-101  | Push `resets_at = now() + 3600`, countdown decrements once per second.   |
+
+## Out of scope for Phase 2
+
+Phase-3 hardening — 24 h soak (AT-1), AP-mode fall-back after N=5 STA
+auth failures (FR-1.6 / EC-CP-200), NVS-corruption recovery
+(EC-NVS-200), "stale" dimming (FR-4.9), and the host-runnable
+`mock_display` profile (FR-5.3 / AT-2) — see FSD § 3.3.

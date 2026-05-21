@@ -30,6 +30,14 @@ class ProbeError(RuntimeError):
     """Raised when an upstream probe fails or returns unparseable data."""
 
 
+class AuthError(ProbeError):
+    """Raised when an upstream probe is rejected for auth reasons (401).
+
+    A separate subclass so the daemon can react with credential reload
+    in addition to its generic per-agent backoff.
+    """
+
+
 class Agent(ABC):
     """Base class for an upstream agent.
 
@@ -41,6 +49,7 @@ class Agent(ABC):
     """
 
     name: ClassVar[str]
+    probe_interval: ClassVar[float]
 
     @abstractmethod
     def __init__(self, credential: Any) -> None:
@@ -64,6 +73,25 @@ class Agent(ABC):
 
         Raises `CredentialsError` if no credential is available.
         """
+
+    def reload_credential(self) -> None:
+        """Re-read this agent's credential from local storage in-place.
+
+        Called by the daemon after an `AuthError` to pick up a token that
+        another process (e.g. the upstream agent's own CLI) has rotated
+        in the keychain. The default implementation calls
+        `load_credential()` and replaces `self._credential` if the
+        subclass uses that attribute name; subclasses that store the
+        credential elsewhere should override.
+
+        Raises `CredentialsError` if the credential cannot be reloaded;
+        the caller is responsible for catching and counting the failure.
+        """
+        new_cred = type(self).load_credential()
+        # Subclasses conventionally hold the credential on `_credential`;
+        # if a future subclass diverges, it will override this method.
+        if hasattr(self, "_credential"):
+            self._credential = new_cred  # type: ignore[attr-defined]
 
     @classmethod
     def try_create(cls) -> "Agent | None":

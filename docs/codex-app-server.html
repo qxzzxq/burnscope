@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Codex app-server — rate-limit procedure</title>
+<style>
+  :root {
+    --accent: #2c5aa0;
+    --accent-soft: #eef3fa;
+    --border: #e1e4e8;
+    --bg-soft: #fafbfc;
+    --bg-code: #f4f4f7;
+    --text: #24292f;
+    --muted: #57606a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    max-width: 1040px;
+    margin: 2em auto;
+    padding: 0 1.5em;
+    color: var(--text);
+    line-height: 1.55;
+  }
+  h1 { border-bottom: 2px solid var(--accent); padding-bottom: .35em; }
+  h2 { border-bottom: 1px solid var(--border); padding-bottom: .25em; margin-top: 2.2em; }
+  h3 { color: var(--accent); margin-top: 1.8em; }
+  h4 { margin-top: 1.4em; margin-bottom: .4em; color: var(--muted); text-transform: uppercase;
+       font-size: .82em; letter-spacing: .05em; }
+  p { margin: .6em 0; }
+  code, pre { font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace; }
+  code {
+    background: var(--bg-code);
+    padding: .1em .35em;
+    border-radius: 3px;
+    font-size: .92em;
+  }
+  pre {
+    background: var(--bg-code);
+    padding: 1em 1.2em;
+    border-radius: 6px;
+    overflow-x: auto;
+    border-left: 3px solid var(--accent);
+    font-size: .87em;
+    line-height: 1.5;
+  }
+  pre code { background: transparent; padding: 0; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 1em 0;
+    font-size: .92em;
+  }
+  th, td {
+    border: 1px solid var(--border);
+    padding: .55em .8em;
+    text-align: left;
+    vertical-align: top;
+  }
+  th { background: var(--bg-soft); font-weight: 600; }
+  td.mono, table.mono td:first-child {
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: .9em;
+    white-space: nowrap;
+  }
+  .toc {
+    background: var(--bg-soft);
+    border: 1px solid var(--border);
+    padding: 1em 1.5em;
+    border-radius: 6px;
+  }
+  .toc ul { margin: .3em 0; padding-left: 1.4em; }
+  .toc li { margin: .15em 0; }
+  .tag {
+    display: inline-block;
+    background: var(--accent-soft);
+    color: var(--accent);
+    padding: .12em .55em;
+    border-radius: 3px;
+    font-size: .78em;
+    font-weight: 600;
+    margin-right: .4em;
+    vertical-align: middle;
+  }
+  blockquote {
+    border-left: 3px solid #ccc;
+    margin: 1em 0;
+    padding: .35em 1em;
+    color: var(--muted);
+    background: var(--bg-soft);
+    border-radius: 0 4px 4px 0;
+  }
+  .note {
+    background: var(--accent-soft);
+    border-left: 3px solid var(--accent);
+    padding: .6em 1em;
+    margin: 1em 0;
+    border-radius: 0 4px 4px 0;
+    font-size: .92em;
+  }
+  .small { font-size: .88em; color: var(--muted); }
+  hr { border: 0; border-top: 1px solid var(--border); margin: 2.5em 0; }
+</style>
+</head>
+<body>
+
+<h1>Codex app-server — rate-limit procedure</h1>
+
+<p class="small">
+  How the BurnScope client reads OpenAI Codex usage data via the
+  <code>codex app-server</code> JSON-RPC subprocess, in place of HTTP probes
+  against <code>chatgpt.com/backend-api/codex/responses</code>. Pairs with
+  <a href="./wire-format.md">wire-format.md</a> (the daemon ↔ firmware
+  contract).
+</p>
+
+<div class="toc">
+  <strong>Contents</strong>
+  <ul>
+    <li><a href="#why">1. Why app-server</a></li>
+    <li><a href="#prereqs">2. Prerequisites</a></li>
+    <li><a href="#quick-try">3. Quick try</a></li>
+    <li><a href="#protocol">4. Protocol</a>
+      <ul>
+        <li><a href="#transport">4.1 Transport &amp; framing</a></li>
+        <li><a href="#handshake">4.2 Initialize handshake</a></li>
+        <li><a href="#read-method">4.3 <code>account/rateLimits/read</code></a></li>
+        <li><a href="#updated-notification">4.4 <code>account/rateLimits/updated</code></a></li>
+      </ul>
+    </li>
+    <li><a href="#sample">5. Sample response (annotated)</a></li>
+    <li><a href="#mapping">6. Mapping to <code>AgentSnapshot</code></a></li>
+    <li><a href="#schemas">7. Generating schemas locally</a></li>
+    <li><a href="#caveats">8. Caveats</a></li>
+  </ul>
+</div>
+
+<!-- =============================================================== -->
+<h2 id="why">1. Why app-server</h2>
+
+<p>
+  The historical Codex probe (<a href="./probe-codex.sh"><code>docs/probe-codex.sh</code></a>)
+  authenticates with the user's OAuth token and POSTs a near-empty request to
+  <code>https://chatgpt.com/backend-api/codex/responses</code>, then reads
+  <code>x-codex-{primary,secondary}-{used-percent,reset-at}</code> from the
+  response headers. That issues a real (token-costing) API call on the user's
+  account and reuses an authentication channel intended for the official
+  client — it works, but is on shaky ground vs. OpenAI's terms of use.
+</p>
+
+<p>
+  Codex CLI v0.124+ ships a documented subprocess, <code>codex app-server</code>,
+  that exposes a JSON-RPC 2.0 surface for first-party integrations
+  (CodexMonitor, CodexBar, the official VS Code extension, etc.). Its
+  <code>account/rateLimits/read</code> method returns the same primary/secondary
+  window data we want, sourced from the locally cached state the CLI already
+  maintains. <strong>No upstream API call is made, no tokens are consumed,
+  and the integration surface is sanctioned.</strong>
+</p>
+
+<!-- =============================================================== -->
+<h2 id="prereqs">2. Prerequisites</h2>
+
+<ul>
+  <li>Codex CLI installed: <code>codex --version</code> reports at least
+      <code>codex-cli 0.124.0</code> (any 0.130+ is verified).</li>
+  <li>The CLI is signed in to a ChatGPT account
+      (<code>~/.codex/auth.json</code> exists). The app-server uses the same
+      auth blob; no extra setup needed.</li>
+  <li>No network connectivity required <em>to OpenAI</em> for the rate-limit
+      read itself — the data comes from the local cache populated by prior
+      CLI activity.</li>
+</ul>
+
+<!-- =============================================================== -->
+<h2 id="quick-try">3. Quick try</h2>
+
+<p>
+  Pipe two JSON-RPC lines into <code>codex app-server</code> and read the
+  responses:
+</p>
+
+<pre><code>{ printf '%s\n%s\n' \
+  '{"id":1,"method":"initialize","params":{"clientInfo":{"name":"burnscope","version":"0.0.1"}}}' \
+  '{"id":2,"method":"account/rateLimits/read","params":{}}'; sleep 1; } \
+  | codex app-server | head -3</code></pre>
+
+<p>
+  The first line on stdout is the <code>initialize</code> response, the second
+  is usually an unsolicited notification (e.g. <code>remoteControl/status/changed</code>),
+  and the third is the rate-limits result. A real client demultiplexes by
+  matching the <code>id</code> field, not by line position.
+</p>
+
+<p>
+  The trailing <code>sleep 1</code> is load-bearing: without it,
+  <code>printf</code> closes its stdout the instant it finishes writing, the
+  server sees EOF on stdin, and shuts down before it has a chance to flush
+  the response to request <code>2</code>. You'll see lines 1 and 2 but the
+  rate-limits reply gets lost. The <code>head -3</code> is only there to let
+  the pipeline exit cleanly once enough data has arrived. In production code,
+  keep stdin open for the lifetime of the subprocess and demux responses
+  asynchronously — see <code>/tmp/codex-probe.py</code> for a reference
+  read-loop.
+</p>
+
+<!-- =============================================================== -->
+<h2 id="protocol">4. Protocol</h2>
+
+<h3 id="transport">4.1 Transport &amp; framing</h3>
+
+<table class="mono">
+  <tr><th>Wire</th><td>JSONL — one JSON object per line on stdin/stdout</td></tr>
+  <tr><th>Encoding</th><td>UTF-8</td></tr>
+  <tr><th>Dialect</th><td>JSON-RPC 2.0, with the <code>"jsonrpc":"2.0"</code> envelope field omitted</td></tr>
+  <tr><th>Direction</th><td>Bidirectional. Server may emit notifications at any time, interleaved with responses to your requests.</td></tr>
+  <tr><th>Start command</th><td><code>codex app-server</code> (defaults to <code>--listen stdio://</code>)</td></tr>
+  <tr><th>Alternative transports</th><td><code>--listen unix://PATH</code>, <code>--listen ws://IP:PORT</code></td></tr>
+</table>
+
+<p>
+  Every line on stdout is either a <em>response</em> (has an <code>id</code>
+  matching one of your requests) or a <em>notification</em> (has a
+  <code>method</code> but no <code>id</code>). A read loop must check both.
+</p>
+
+<h3 id="handshake">4.2 Initialize handshake</h3>
+
+<p>
+  The first request on a fresh connection must be <code>initialize</code>.
+  The server replies with platform metadata and starts emitting state-change
+  notifications.
+</p>
+
+<h4>Request</h4>
+<pre><code>{
+  "id": 1,
+  "method": "initialize",
+  "params": {
+    "clientInfo": { "name": "burnscope", "version": "0.0.1" },
+    "capabilities": {
+      "experimentalApi": false,
+      "optOutNotificationMethods": []
+    }
+  }
+}</code></pre>
+
+<table>
+  <tr><th>Field</th><th>Required</th><th>Description</th></tr>
+  <tr><td class="mono">clientInfo.name</td><td>yes</td><td>Identifier embedded in <code>User-Agent</code>.</td></tr>
+  <tr><td class="mono">clientInfo.version</td><td>yes</td><td>Client version string.</td></tr>
+  <tr><td class="mono">capabilities.experimentalApi</td><td>no</td><td>Opt into experimental methods. We don't need this for rate limits.</td></tr>
+  <tr><td class="mono">capabilities.optOutNotificationMethods</td><td>no</td><td>Notification methods to suppress, e.g. <code>["thread/started"]</code> to silence per-turn chatter we don't care about.</td></tr>
+</table>
+
+<h4>Response</h4>
+<pre><code>{
+  "id": 1,
+  "result": {
+    "userAgent": "burnscope/0.130.0 (Mac OS 26.3.1; arm64) ...",
+    "codexHome": "/Users/you/.codex",
+    "platformFamily": "unix",
+    "platformOs": "macos"
+  }
+}</code></pre>
+
+<h3 id="read-method">4.3 <code>account/rateLimits/read</code></h3>
+
+<p>
+  <span class="tag">stable</span>
+  One-shot query for the current rate-limit snapshot. Use this immediately
+  after <code>initialize</code> for the seed value, then rely on
+  <a href="#updated-notification">notifications</a> for live updates.
+</p>
+
+<h4>Request</h4>
+<pre><code>{ "id": 2, "method": "account/rateLimits/read", "params": {} }</code></pre>
+
+<h4>Response shape</h4>
+
+<p>
+  The result has two views of the same data: <code>rateLimits</code>
+  (backward-compatible single-bucket) and <code>rateLimitsByLimitId</code>
+  (multi-bucket, keyed by metered <code>limit_id</code>). For the
+  <code>codex</code> CLI plan, both contain the same entry. We read the
+  top-level <code>rateLimits</code> for simplicity.
+</p>
+
+<pre><code>{
+  "id": 2,
+  "result": {
+    "rateLimits": &lt;RateLimitSnapshot&gt;,
+    "rateLimitsByLimitId": {
+      "codex": &lt;RateLimitSnapshot&gt;
+    }
+  }
+}</code></pre>
+
+<h4><code>RateLimitSnapshot</code></h4>
+
+<table>
+  <tr><th>Field</th><th>Type</th><th>Description</th></tr>
+  <tr><td class="mono">limitId</td><td>string | null</td><td>Metering key, e.g. <code>"codex"</code>.</td></tr>
+  <tr><td class="mono">limitName</td><td>string | null</td><td>Human label. Usually null for the default codex bucket.</td></tr>
+  <tr><td class="mono">primary</td><td>RateLimitWindow | null</td><td>The shorter rolling window (5h for ChatGPT Plus/Pro).</td></tr>
+  <tr><td class="mono">secondary</td><td>RateLimitWindow | null</td><td>The longer rolling window (7d for ChatGPT Plus/Pro).</td></tr>
+  <tr><td class="mono">credits</td><td>CreditsSnapshot | null</td><td>Pay-as-you-go credit balance. Out of scope for MVP.</td></tr>
+  <tr><td class="mono">planType</td><td>enum string | null</td><td><code>"free"</code>, <code>"plus"</code>, <code>"pro"</code>, <code>"business"</code>, …</td></tr>
+  <tr><td class="mono">rateLimitReachedType</td><td>enum string | null</td><td>Non-null when a limit is exhausted.</td></tr>
+</table>
+
+<h4><code>RateLimitWindow</code></h4>
+
+<table>
+  <tr><th>Field</th><th>Type</th><th>Description</th></tr>
+  <tr><td class="mono">usedPercent</td><td>integer (0–100)</td><td>Percentage of the window consumed. <strong>Required.</strong></td></tr>
+  <tr><td class="mono">windowDurationMins</td><td>int64 | null</td><td>Window length. ChatGPT Plus today: <code>300</code> (5h) for primary, <code>10080</code> (7d) for secondary.</td></tr>
+  <tr><td class="mono">resetsAt</td><td>int64 | null</td><td>Unix seconds (UTC) when the window rolls over.</td></tr>
+</table>
+
+<h3 id="updated-notification">4.4 <code>account/rateLimits/updated</code></h3>
+
+<p>
+  <span class="tag">stable</span> <span class="tag">server → client</span>
+  Server-initiated notification, emitted whenever the cached rate-limit state
+  changes. Sit on this and you get event-driven updates with no polling.
+</p>
+
+<pre><code>{
+  "method": "account/rateLimits/updated",
+  "params": {
+    "rateLimits": &lt;RateLimitSnapshot&gt;
+  }
+}</code></pre>
+
+<p>
+  Same <code>RateLimitSnapshot</code> shape as <a href="#read-method">section 4.3</a>.
+  No <code>id</code> field — this is a notification, not a response. Do not
+  reply.
+</p>
+
+<!-- =============================================================== -->
+<h2 id="sample">5. Sample response (annotated)</h2>
+
+<p>
+  Captured live against <code>codex-cli 0.130.0</code> with a ChatGPT Plus
+  account that had just sent a few prompts:
+</p>
+
+<pre><code>{
+  "rateLimits": {
+    "limitId": "codex",
+    "limitName": null,
+    "primary":   { "usedPercent":  1, "windowDurationMins":   300, "resetsAt": 1779261506 },
+    "secondary": { "usedPercent":  0, "windowDurationMins": 10080, "resetsAt": 1779848306 },
+    "credits":   { "hasCredits": false, "unlimited": false, "balance": "0" },
+    "planType":  "plus",
+    "rateLimitReachedType": null
+  },
+  "rateLimitsByLimitId": {
+    "codex": { ... same as above ... }
+  }
+}</code></pre>
+
+<p>Decoding:</p>
+
+<ul>
+  <li><code>primary</code>: 1% used of the <strong>5-hour</strong> window
+      (300 min), rolls over at <code>1779261506</code>.</li>
+  <li><code>secondary</code>: 0% used of the <strong>weekly</strong> window
+      (10080 min = 7 d), rolls over at <code>1779848306</code>.</li>
+  <li><code>planType</code>: <code>"plus"</code> — useful for UI labels, not
+      consumed by the MVP firmware.</li>
+</ul>
+
+<!-- =============================================================== -->
+<h2 id="mapping">6. Mapping to <code>AgentSnapshot</code></h2>
+
+<p>
+  The Codex agent collector converts each non-null <code>RateLimitWindow</code>
+  into one <code>SessionSnapshot</code> entry (<a href="./wire-format.md">wire-format.md</a>):
+</p>
+
+<table>
+  <tr><th>Source</th><th>→</th><th><code>SessionSnapshot</code></th></tr>
+  <tr>
+    <td class="mono">rateLimits.primary</td>
+    <td>→</td>
+    <td><code>{ type: "primary", used_pct: usedPercent / 100, resets_at: resetsAt }</code></td>
+  </tr>
+  <tr>
+    <td class="mono">rateLimits.secondary</td>
+    <td>→</td>
+    <td><code>{ type: "secondary", used_pct: usedPercent / 100, resets_at: resetsAt }</code></td>
+  </tr>
+</table>
+
+<p>
+  This is the <strong>same</strong> wire-format vocabulary the previous
+  header-based probe produced (see the header→session table at the bottom of
+  <code>wire-format.md</code>). No firmware change is required — the swap is
+  source-side only.
+</p>
+
+<p>
+  If <code>windowDurationMins</code> is null or <code>resetsAt</code> is null
+  for a window, skip that window (do not emit a partial
+  <code>SessionSnapshot</code>). If both <code>primary</code> and
+  <code>secondary</code> are null the snapshot has an empty
+  <code>sessions</code> array — the daemon treats it as "no data yet" and
+  withholds the push.
+</p>
+
+<!-- =============================================================== -->
+<h2 id="schemas">7. Generating schemas locally</h2>
+
+<p>
+  The exact wire shape on your installed CLI version can be dumped without
+  reading source:
+</p>
+
+<pre><code>codex app-server generate-json-schema --out /tmp/codex-schema
+ls /tmp/codex-schema/v2/ | grep -i ratelimit</code></pre>
+
+<p>The relevant files in <code>v2/</code>:</p>
+
+<table>
+  <tr><th>File</th><th>Purpose</th></tr>
+  <tr><td class="mono">GetAccountRateLimitsResponse.json</td><td>Response schema for <code>account/rateLimits/read</code>.</td></tr>
+  <tr><td class="mono">AccountRateLimitsUpdatedNotification.json</td><td>Payload schema for the <code>account/rateLimits/updated</code> notification.</td></tr>
+  <tr><td class="mono">codex_app_server_protocol.v2.schemas.json</td><td>Combined schema bundle — every type, every method name.</td></tr>
+</table>
+
+<p>
+  Method names are extractable from the combined bundle with:
+</p>
+
+<pre><code>grep -oE '"[A-Za-z]+(/[A-Za-z]+)+Method"' \
+  /tmp/codex-schema/codex_app_server_protocol.v2.schemas.json \
+  | sort -u</code></pre>
+
+<p>
+  Wire-side method strings are the lowercased prefix — e.g. the schema title
+  <code>Account/rateLimits/readRequestMethod</code> corresponds to the
+  on-wire <code>method: "account/rateLimits/read"</code>.
+</p>
+
+<!-- =============================================================== -->
+<h2 id="caveats">8. Caveats</h2>
+
+<ul>
+  <li>
+    <strong>Subprocess lifetime.</strong> The app-server is long-lived. The
+    collector should spawn it once at daemon start and keep it alive — not
+    spawn-per-probe. Restart on unexpected EOF.
+  </li>
+  <li>
+    <strong>Notification interleaving.</strong> Notifications can arrive
+    between your <code>initialize</code> request and its response, or between
+    any request and its response. The read loop must demux by
+    <code>id</code>, not assume "next line is my reply."
+  </li>
+  <li>
+    <strong>Overload back-pressure.</strong> Under load the server responds
+    with JSON-RPC error code <code>-32001</code> ("Server overloaded; retry
+    later."). Retry with exponential backoff and jitter; do not hammer.
+  </li>
+  <li>
+    <strong>No upstream authentication state means no data.</strong> If
+    <code>~/.codex/auth.json</code> is missing or expired, the server starts
+    fine but <code>account/rateLimits/read</code> returns an error result.
+    The collector treats this the same as the old probe's
+    <code>CredentialsError</code> — log and back off; do not crash.
+  </li>
+  <li>
+    <strong>Versioning.</strong> The <code>v2</code> namespace is the
+    current stable surface. The protocol is designed for backward
+    compatibility, so older clients keep working against newer servers — but
+    pin <code>codex-cli &gt;= 0.124</code> as a soft minimum and parse only
+    fields documented above.
+  </li>
+  <li>
+    <strong>Plan dependence.</strong> The 5h + 7d window pair is what
+    ChatGPT Plus/Pro plans expose. <code>free</code> and enterprise plans
+    can return different shapes (e.g. <code>primary</code> only, or
+    credit-only buckets). Always null-check both windows.
+  </li>
+</ul>
+
+<hr>
+
+<p class="small">
+  References:
+  <a href="https://developers.openai.com/codex/app-server">OpenAI — Codex app-server</a>
+  ·
+  <a href="https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md">openai/codex — app-server README</a>
+  ·
+  <a href="https://github.com/Dimillian/CodexMonitor">Dimillian/CodexMonitor</a> (Tauri reference client).
+</p>
+
+</body>
+</html>

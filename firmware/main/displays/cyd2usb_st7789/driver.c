@@ -7,7 +7,7 @@
  * BGR with inversion off (cyd2usb profile).
  */
 
-#include "panel.h"
+#include "driver.h"
 
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
@@ -34,6 +34,8 @@
 #define LCD_V_RES           240
 /* CYD display SPI is not on IOMUX pins; 40 MHz causes bit errors (C-2). */
 #define LCD_PIXEL_CLOCK_HZ  (20 * 1000 * 1000)
+
+static lv_display_t *s_display = NULL;
 
 static void enable_backlight(void)
 {
@@ -73,7 +75,9 @@ static esp_lcd_panel_handle_t init_st7789(esp_lcd_panel_io_handle_t *io_out)
     esp_lcd_panel_handle_t panel_handle = NULL;
     const esp_lcd_panel_dev_config_t panel_config = {
         .reset_gpio_num = PIN_NUM_LCD_RST,
-        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_BGR,
+        /* CYD ST7789 panels are physically RGB; setting BGR here would flip
+         * the R and B channels (orange→blue), as seen with the brand icons. */
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
         .bits_per_pixel = 16,
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(io_handle, &panel_config, &panel_handle));
@@ -87,8 +91,12 @@ static esp_lcd_panel_handle_t init_st7789(esp_lcd_panel_io_handle_t *io_out)
     return panel_handle;
 }
 
-lv_display_t *panel_init(void)
+lv_display_t *cyd2usb_st7789_driver_init(void)
 {
+    if (s_display != NULL) {
+        return s_display;
+    }
+
     enable_backlight();
 
     esp_lcd_panel_io_handle_t io_handle = NULL;
@@ -116,5 +124,6 @@ lv_display_t *panel_init(void)
             .swap_bytes = true,
         },
     };
-    return lvgl_port_add_disp(&disp_cfg);
+    s_display = lvgl_port_add_disp(&disp_cfg);
+    return s_display;
 }

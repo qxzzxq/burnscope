@@ -1,0 +1,664 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>BurnScope · agent-screen font preview</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700&display=block" rel="stylesheet">
+<style>
+  /* UNSCII bitmap font — best-effort load; falls back to ui-monospace. */
+  @font-face {
+    font-family: "Unscii-16";
+    src: url("https://cdn.jsdelivr.net/npm/unscii@1.0.0/dist/unscii-16.woff2") format("woff2");
+    font-display: block;
+  }
+
+  :root {
+    --bg: #0b0b0c;
+    --panel-bg: #000;
+    --card-bg: #1C1C1C;
+    --chip-bg: #2E2E2E;
+    --text: #e5e5e5;
+    --muted: #888;
+    --accent: #4FC3F7;
+  }
+
+
+  html, body {
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.4 -apple-system, "Helvetica Neue", Arial, sans-serif;
+    margin: 0;
+    padding: 0;
+  }
+
+  .app {
+    display: grid;
+    grid-template-columns: auto 320px;
+    gap: 40px;
+    padding: 32px;
+    align-items: start;
+  }
+
+  .stage {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    align-items: flex-start;
+  }
+
+  .stage-controls {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+
+  .stage-controls button {
+    background: #1b1b1d;
+    color: var(--text);
+    border: 1px solid #2a2a2d;
+    border-radius: 6px;
+    padding: 4px 10px;
+    font: inherit;
+    cursor: pointer;
+  }
+
+  .stage-controls button.on {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  /* The 320×240 panel, scaled via CSS transform without affecting layout. */
+  .panel-wrap {
+    background: #1a1a1c;
+    padding: 12px;
+    border-radius: 8px;
+    border: 1px solid #2a2a2d;
+    /* enough box for the 2x default scale */
+    width: calc(320px * 2 + 24px);
+    height: calc(240px * 2 + 24px);
+    box-sizing: border-box;
+    display: flex;
+    align-items: flex-start;
+    justify-content: flex-start;
+  }
+
+  .panel {
+    /* Panel-scoped colors — driven by the sidebar color pickers. */
+    --title-fg: #F9F2DF;
+    --chip-fg: #F9F2DF;
+    --pct-fg: #F9F2DF;
+    --countdown-fg: #B0ACA0;
+    --bar-track: #2F2F2F;
+    --row1: #DE7356;
+    --row2: #A4A049;
+    --bar-radius: 3px;
+    --bar-height: 15px;
+
+    width: 320px;
+    height: 240px;
+    background: var(--panel-bg);
+    color: #fff;
+    position: relative;
+    overflow: hidden;
+    transform-origin: 0 0;
+    /* default 2× */
+    transform: scale(2);
+  }
+
+  /* Header layer (40 px tall — matches ui.c:216 `top = 40`). */
+  .header {
+    position: absolute;
+    left: 0; right: 0; top: 0;
+    height: 40px;
+  }
+
+  .title {
+    position: absolute;
+    left: 0; right: 0;
+    top: 50%;
+    transform: translateY(-50%);
+    text-align: center;
+    font-family: "Montserrat", sans-serif;
+    /* LVGL ships Montserrat at regular (400) only; the preview matches what
+     * the firmware can actually render. Switch to 600 here only if a Bold
+     * variant gets baked into firmware/main/fonts/. */
+    font-weight: 400;
+    line-height: 1;
+    color: var(--title-fg);
+  }
+
+  /* Brand icon in the top-left slot the agent dot used to occupy. No disc,
+     no cropping — the SVG paints its native shape directly on the panel.
+     Vertically centred in the 40 px header band so it lines up with the
+     title text regardless of the title font size. */
+  .title-icon {
+    position: absolute;
+    left: 8px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 24px;
+    height: 24px;
+  }
+  .title-icon > svg { display: block; width: 100%; height: 100%; }
+
+  /* Rows. Two cards, 88 px tall, 304 wide, centred, with 8 px gap. */
+  .row {
+    position: absolute;
+    left: 8px; right: 8px;
+    width: 304px;
+    height: 88px;
+    background: var(--card-bg);
+    border-radius: 8px;
+    padding: 6px;
+    box-sizing: border-box;
+  }
+  .row.r1 { top: 48px; }   /* 40 + 8 */
+  .row.r2 { top: 144px; }  /* 40 + 8 + 88 + 8 */
+
+  .chip {
+    position: absolute;
+    left: 6px; top: 6px;
+    background: var(--chip-bg);
+    color: var(--chip-fg);
+    border-radius: 6px;
+    padding: 2px 8px;
+    line-height: 1.1;
+    font-family: "Montserrat", sans-serif;
+  }
+
+  .pct {
+    position: absolute;
+    right: 6px; top: 8px;
+    color: var(--pct-fg);
+    line-height: 1;
+    font-family: "Montserrat", sans-serif;
+  }
+
+  .bar {
+    position: absolute;
+    left: 6px; top: 40px;
+    width: 292px;
+    height: var(--bar-height);
+    background: var(--bar-track);
+    border-radius: var(--bar-radius);
+    overflow: hidden;
+  }
+  .bar > i {
+    display: block;
+    height: 100%;
+    border-radius: var(--bar-radius);
+  }
+  .row.r1 .bar > i { background: var(--row1); }
+  .row.r2 .bar > i { background: var(--row2); }
+
+  /* Sidebar color-picker grid */
+  .swatch-row {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+  .swatch-row:last-child { margin-bottom: 0; }
+  .swatch-row label {
+    margin-bottom: 0;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .swatch-row input[type="color"] {
+    width: 36px;
+    height: 24px;
+    padding: 0;
+    border: 1px solid #2a2a2d;
+    border-radius: 4px;
+    background: #1c1c1f;
+    cursor: pointer;
+  }
+  .reset-btn {
+    margin-top: 8px;
+    background: #1b1b1d;
+    color: var(--muted);
+    border: 1px solid #2a2a2d;
+    border-radius: 6px;
+    padding: 4px 10px;
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .reset-btn:hover { color: var(--text); }
+
+  .countdown {
+    position: absolute;
+    left: 6px; bottom: 6px;
+    color: var(--countdown-fg);
+    line-height: 1;
+    font-family: "Montserrat", sans-serif;
+  }
+
+  /* Sidebar */
+  .sidebar {
+    background: #131316;
+    border: 1px solid #2a2a2d;
+    border-radius: 10px;
+    padding: 20px;
+  }
+
+  .sidebar h2 {
+    margin: 0 0 12px 0;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+
+  .group { margin-bottom: 20px; }
+  .group:last-child { margin-bottom: 0; }
+
+  .row-2 {
+    display: grid;
+    grid-template-columns: 1fr 90px;
+    gap: 8px;
+  }
+
+  label {
+    display: block;
+    color: var(--muted);
+    font-size: 12px;
+    margin-bottom: 4px;
+  }
+
+  select {
+    width: 100%;
+    background: #1c1c1f;
+    color: var(--text);
+    border: 1px solid #2a2a2d;
+    border-radius: 6px;
+    padding: 6px 8px;
+    font: inherit;
+  }
+
+  .snippet {
+    margin-top: 20px;
+    padding: 12px;
+    background: #0e0e10;
+    border: 1px solid #2a2a2d;
+    border-radius: 8px;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 12px;
+    color: var(--accent);
+    user-select: all;
+  }
+
+  .note {
+    margin-top: 12px;
+    font-size: 12px;
+    color: var(--muted);
+    line-height: 1.5;
+  }
+  .note.warn {
+    color: #ffb24a;
+  }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <div class="stage">
+    <div class="stage-controls">
+      <span style="color:var(--muted)">Scale:</span>
+      <button data-scale="1">1×</button>
+      <button data-scale="2" class="on">2×</button>
+      <button data-scale="3">3×</button>
+    </div>
+
+    <div class="panel-wrap" id="panel-wrap">
+      <div class="panel" id="panel">
+        <div class="header">
+          <span class="title-icon" id="title-icon"></span>
+          <div class="title" id="title">Usage</div>
+        </div>
+
+        <div class="row r1">
+          <div class="chip body" id="chip1">current</div>
+          <div class="pct body" id="pct1">42%</div>
+          <div class="bar"><i style="width:42%"></i></div>
+          <div class="countdown body" id="cd1">resets in 3h 12m</div>
+        </div>
+
+        <div class="row r2">
+          <div class="chip body" id="chip2">weekly</div>
+          <div class="pct body" id="pct2">17%</div>
+          <div class="bar"><i style="width:17%"></i></div>
+          <div class="countdown body" id="cd2">resets in 4d 02h</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="snippet" id="snippet">Title: Montserrat 28 · Body: Montserrat 16 · Icon: claude_burst</div>
+  </div>
+
+  <aside class="sidebar">
+    <h2>Title (the "Usage" header)</h2>
+    <div class="group row-2">
+      <div>
+        <label for="title-family">Font</label>
+        <select id="title-family"></select>
+      </div>
+      <div>
+        <label for="title-size">Size</label>
+        <select id="title-size"></select>
+      </div>
+    </div>
+
+    <h2>Body (row labels: chip, %, countdown)</h2>
+    <div class="group row-2">
+      <div>
+        <label for="body-family">Font</label>
+        <select id="body-family"></select>
+      </div>
+      <div>
+        <label for="body-size">Size</label>
+        <select id="body-size"></select>
+      </div>
+    </div>
+
+    <h2>Agent icon (preview only — left of "Usage")</h2>
+    <div class="group row-2">
+      <div>
+        <label for="agent-name">Agent</label>
+        <select id="agent-name">
+          <option value="claude">Claude</option>
+          <option value="codex">Codex</option>
+        </select>
+      </div>
+      <div>
+        <label for="claude-mark">Claude mark</label>
+        <select id="claude-mark">
+          <option value="burst">Burst</option>
+          <option value="pixel">Pixel C</option>
+        </select>
+      </div>
+    </div>
+
+    <h2>Colors (text &amp; bars)</h2>
+    <div class="group" id="color-group">
+      <div class="swatch-row">
+        <label for="c-title">Title text</label>
+        <input type="color" id="c-title" data-var="--title-fg" value="#F9F2DF">
+      </div>
+      <div class="swatch-row">
+        <label for="c-chip">Row label (chip)</label>
+        <input type="color" id="c-chip" data-var="--chip-fg" value="#F9F2DF">
+      </div>
+      <div class="swatch-row">
+        <label for="c-pct">Percent text</label>
+        <input type="color" id="c-pct" data-var="--pct-fg" value="#F9F2DF">
+      </div>
+      <div class="swatch-row">
+        <label for="c-cd">Countdown text</label>
+        <input type="color" id="c-cd" data-var="--countdown-fg" value="#B0ACA0">
+      </div>
+      <div class="swatch-row">
+        <label for="c-row1">Row 1 bar fill</label>
+        <input type="color" id="c-row1" data-var="--row1" value="#DE7356">
+      </div>
+      <div class="swatch-row">
+        <label for="c-row2">Row 2 bar fill</label>
+        <input type="color" id="c-row2" data-var="--row2" value="#A4A049">
+      </div>
+      <div class="swatch-row">
+        <label for="c-track">Bar track</label>
+        <input type="color" id="c-track" data-var="--bar-track" value="#2F2F2F">
+      </div>
+      <button type="button" class="reset-btn" id="reset-colors">Reset to defaults</button>
+    </div>
+
+    <h2>Bar shape</h2>
+    <div class="group">
+      <div class="swatch-row">
+        <label for="bar-radius">Corner radius <span id="bar-radius-val">3 px</span></label>
+        <input type="range" id="bar-radius" min="0" max="20" step="1" value="3" style="width:90px">
+      </div>
+      <div class="swatch-row">
+        <label for="bar-height">Height <span id="bar-height-val">15 px</span></label>
+        <input type="range" id="bar-height" min="2" max="40" step="1" value="15" style="width:90px">
+      </div>
+    </div>
+
+    <div class="note" id="note"></div>
+  </aside>
+
+</div>
+
+<script>
+  // Source of truth: what's actually compilable into the firmware today.
+  // Sizes listed here are sizes LVGL ships; for New York, only 22 is baked.
+  const FAMILIES = {
+    "Montserrat": {
+      css: '"Montserrat", sans-serif',
+      sizes: [8,10,12,14,16,18,20,22,24,26,28,30,32,34,36,38,40,42,44,46,48],
+      note: "",
+    },
+    "Unscii-16 (bitmap)": {
+      css: '"Unscii-16", ui-monospace, "SF Mono", Menlo, monospace',
+      sizes: [8, 16],
+      note: "UNSCII is a pixel font designed for low-res displays. Web rendering is approximate; the firmware will render it crisply at the exact pixel size.",
+    },
+    "New York (serif)": {
+      css: 'ui-serif, "New York", "Times New Roman", serif',
+      sizes: [22],
+      note: "Only 22 px is currently baked into firmware/main/fonts/. Other sizes would require regenerating lv_font_newyork_<N>.c via LVGL's font converter.",
+    },
+  };
+
+  // Brand-icon SVG paths sourced from lobehub/lobe-icons (MIT) which mirror
+  // the official brand marks. Claude marks render in Anthropic clay (#D97757)
+  // directly on the panel; Codex ships its own white background square + blue-
+  // gradient glyph. Icons sit in their natural shape — no disc, no cropping.
+  const CLAUDE_BURST_D = "M4.709 15.955l4.72-2.647.08-.23-.08-.128H9.2l-.79-.048-2.698-.073-2.339-.097-2.266-.122-.571-.121L0 11.784l.055-.352.48-.321.686.06 1.52.103 2.278.158 1.652.097 2.449.255h.389l.055-.157-.134-.098-.103-.097-2.358-1.596-2.552-1.688-1.336-.972-.724-.491-.364-.462-.158-1.008.656-.722.881.06.225.061.893.686 1.908 1.476 2.491 1.833.365.304.145-.103.019-.073-.164-.274-1.355-2.446-1.446-2.49-.644-1.032-.17-.619a2.97 2.97 0 01-.104-.729L6.283.134 6.696 0l.996.134.42.364.62 1.414 1.002 2.229 1.555 3.03.456.898.243.832.091.255h.158V9.01l.128-1.706.237-2.095.23-2.695.08-.76.376-.91.747-.492.584.28.48.685-.067.444-.286 1.851-.559 2.903-.364 1.942h.212l.243-.242.985-1.306 1.652-2.064.73-.82.85-.904.547-.431h1.033l.76 1.129-.34 1.166-1.064 1.347-.881 1.142-1.264 1.7-.79 1.36.073.11.188-.02 2.856-.606 1.543-.28 1.841-.315.833.388.091.395-.328.807-1.969.486-2.309.462-3.439.813-.042.03.049.061 1.549.146.662.036h1.622l3.02.225.79.522.474.638-.079.485-1.215.62-1.64-.389-3.829-.91-1.312-.329h-.182v.11l1.093 1.068 2.006 1.81 2.509 2.33.127.578-.322.455-.34-.049-2.205-1.657-.851-.747-1.926-1.62h-.128v.17l.444.649 2.345 3.521.122 1.08-.17.353-.608.213-.668-.122-1.374-1.925-1.415-2.167-1.143-1.943-.14.08-.674 7.254-.316.37-.729.28-.607-.461-.322-.747.322-1.476.389-1.924.315-1.53.286-1.9.17-.632-.012-.042-.14.018-1.434 1.967-2.18 2.945-1.726 1.845-.414.164-.717-.37.067-.662.401-.589 2.388-3.036 1.44-1.882.93-1.086-.006-.158h-.055L4.132 18.56l-1.13.146-.487-.456.061-.746.231-.243 1.908-1.312-.006.006z";
+  const CLAUDE_PIXEL_D = "M20.998 10.949H24v3.102h-3v3.028h-1.487V20H18v-2.921h-1.487V20H15v-2.921H9V20H7.488v-2.921H6V20H4.487v-2.921H3V14.05H0V10.95h3V5h17.998v5.949zM6 10.949h1.488V8.102H6v2.847zm10.51 0H18V8.102h-1.49v2.847z";
+
+  const ICONS = {
+    claude_burst: {
+      svg: `<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="${CLAUDE_BURST_D}" fill="#D97757" fill-rule="nonzero"/></svg>`,
+    },
+    claude_pixel: {
+      svg: `<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="${CLAUDE_PIXEL_D}" fill="#D97757" fill-rule="evenodd"/></svg>`,
+    },
+    codex: {
+      svg: `<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M19.503 0H4.496A4.496 4.496 0 000 4.496v15.007A4.496 4.496 0 004.496 24h15.007A4.496 4.496 0 0024 19.503V4.496A4.496 4.496 0 0019.503 0z" fill="#fff"/><path d="M9.064 3.344a4.578 4.578 0 012.285-.312c1 .115 1.891.54 2.673 1.275.01.01.024.017.037.021a.09.09 0 00.043 0 4.55 4.55 0 013.046.275l.047.022.116.057a4.581 4.581 0 012.188 2.399c.209.51.313 1.041.315 1.595a4.24 4.24 0 01-.134 1.223.123.123 0 00.03.115c.594.607.988 1.33 1.183 2.17.289 1.425-.007 2.71-.887 3.854l-.136.166a4.548 4.548 0 01-2.201 1.388.123.123 0 00-.081.076c-.191.551-.383 1.023-.74 1.494-.9 1.187-2.222 1.846-3.711 1.838-1.187-.006-2.239-.44-3.157-1.302a.107.107 0 00-.105-.024c-.388.125-.78.143-1.204.138a4.441 4.441 0 01-1.945-.466 4.544 4.544 0 01-1.61-1.335c-.152-.202-.303-.392-.414-.617a5.81 5.81 0 01-.37-.961 4.582 4.582 0 01-.014-2.298.124.124 0 00.006-.056.085.085 0 00-.027-.048 4.467 4.467 0 01-1.034-1.651 3.896 3.896 0 01-.251-1.192 5.189 5.189 0 01.141-1.6c.337-1.112.982-1.985 1.933-2.618.212-.141.413-.251.601-.33.215-.089.43-.164.646-.227a.098.098 0 00.065-.066 4.51 4.51 0 01.829-1.615 4.535 4.535 0 011.837-1.388zm3.482 10.565a.637.637 0 000 1.272h3.636a.637.637 0 100-1.272h-3.636zM8.462 9.23a.637.637 0 00-1.106.631l1.272 2.224-1.266 2.136a.636.636 0 101.095.649l1.454-2.455a.636.636 0 00.005-.64L8.462 9.23z" fill="url(#fp-codex-grad)"/><defs><linearGradient id="fp-codex-grad" x1="12" x2="12" y1="3" y2="21" gradientUnits="userSpaceOnUse"><stop stop-color="#B1A7FF"/><stop offset=".5" stop-color="#7A9DFF"/><stop offset="1" stop-color="#3941FF"/></linearGradient></defs></svg>`,
+    },
+  };
+
+  const $ = (id) => document.getElementById(id);
+  const titleFamilyEl = $("title-family");
+  const titleSizeEl = $("title-size");
+  const bodyFamilyEl = $("body-family");
+  const bodySizeEl = $("body-size");
+  const noteEl = $("note");
+  const titleEl = $("title");
+  const titleIconEl = $("title-icon");
+  const agentEl = $("agent-name");
+  const claudeMarkEl = $("claude-mark");
+  const bodyEls = document.querySelectorAll(".body");
+  const snippetEl = $("snippet");
+  const panelEl = $("panel");
+  const panelWrap = $("panel-wrap");
+
+  function fillFamilies(sel) {
+    sel.innerHTML = "";
+    for (const name of Object.keys(FAMILIES)) {
+      const opt = document.createElement("option");
+      opt.value = name; opt.textContent = name;
+      sel.appendChild(opt);
+    }
+  }
+
+  function fillSizes(sel, familyName, preferredSize) {
+    sel.innerHTML = "";
+    const fam = FAMILIES[familyName];
+    for (const sz of fam.sizes) {
+      const opt = document.createElement("option");
+      opt.value = String(sz);
+      opt.textContent = sz + " px";
+      sel.appendChild(opt);
+    }
+    // Try to keep the previously-selected size if the new family supports it.
+    if (preferredSize && fam.sizes.includes(preferredSize)) {
+      sel.value = String(preferredSize);
+    } else {
+      // Sensible defaults: title 24 / body 18 if available, else closest.
+      const target = sel === titleSizeEl ? 24 : 18;
+      const closest = fam.sizes.reduce((a, b) =>
+        Math.abs(b - target) < Math.abs(a - target) ? b : a);
+      sel.value = String(closest);
+    }
+  }
+
+  function pickIconKey() {
+    if (agentEl.value === "codex") return "codex";
+    return claudeMarkEl.value === "pixel" ? "claude_pixel" : "claude_burst";
+  }
+
+  function redraw() {
+    const tFam = FAMILIES[titleFamilyEl.value];
+    const bFam = FAMILIES[bodyFamilyEl.value];
+    const tSz = parseInt(titleSizeEl.value, 10);
+    const bSz = parseInt(bodySizeEl.value, 10);
+
+    titleEl.style.fontFamily = tFam.css;
+    titleEl.style.fontSize = tSz + "px";
+
+    bodyEls.forEach(el => {
+      el.style.fontFamily = bFam.css;
+      el.style.fontSize = bSz + "px";
+    });
+
+    // Top-left brand icon at the agent-dot's original 24×24 footprint; the
+    // SVG paints its native shape — no disc, no cropping.
+    const iconKey = pickIconKey();
+    titleIconEl.innerHTML = ICONS[iconKey].svg;
+
+    // Only Claude has variant choices; disable the variant picker for Codex.
+    claudeMarkEl.disabled = (agentEl.value !== "claude");
+
+    // Snippet for copy-back
+    snippetEl.textContent =
+      `Title: ${titleFamilyEl.value} ${tSz} · Body: ${bodyFamilyEl.value} ${bSz} · Icon: ${iconKey}`;
+
+    // Notes: surface family-specific caveats.
+    const notes = [];
+    if (tFam.note) notes.push("Title — " + tFam.note);
+    if (bFam.note && bFam !== tFam) notes.push("Body — " + bFam.note);
+    noteEl.textContent = notes.join("  ");
+    noteEl.className = (titleFamilyEl.value.startsWith("New York") ||
+                       bodyFamilyEl.value.startsWith("New York")) ? "note warn" : "note";
+  }
+
+  function setScale(n) {
+    panelEl.style.transform = `scale(${n})`;
+    panelWrap.style.width = `calc(320px * ${n} + 24px)`;
+    panelWrap.style.height = `calc(240px * ${n} + 24px)`;
+    document.querySelectorAll(".stage-controls button").forEach(b => {
+      b.classList.toggle("on", b.dataset.scale === String(n));
+    });
+  }
+
+  // Wire up
+  fillFamilies(titleFamilyEl);
+  fillFamilies(bodyFamilyEl);
+  titleFamilyEl.value = "Montserrat";
+  bodyFamilyEl.value = "Montserrat";
+  fillSizes(titleSizeEl, titleFamilyEl.value, 28);
+  fillSizes(bodySizeEl, bodyFamilyEl.value, 16);
+
+  titleFamilyEl.addEventListener("change", () => {
+    const prev = parseInt(titleSizeEl.value, 10);
+    fillSizes(titleSizeEl, titleFamilyEl.value, prev);
+    redraw();
+  });
+  bodyFamilyEl.addEventListener("change", () => {
+    const prev = parseInt(bodySizeEl.value, 10);
+    fillSizes(bodySizeEl, bodyFamilyEl.value, prev);
+    redraw();
+  });
+  titleSizeEl.addEventListener("change", redraw);
+  bodySizeEl.addEventListener("change", redraw);
+  agentEl.addEventListener("change", () => {
+    applyAgentPalette(agentEl.value);
+    redraw();
+  });
+  claudeMarkEl.addEventListener("change", redraw);
+
+  document.querySelectorAll(".stage-controls button").forEach(b => {
+    b.addEventListener("click", () => setScale(parseInt(b.dataset.scale, 10)));
+  });
+
+  // Colors — each input owns one CSS variable scoped to the panel.
+  const colorInputs = document.querySelectorAll("#color-group input[type=color]");
+  const colorDefaults = new Map();
+  colorInputs.forEach(inp => {
+    colorDefaults.set(inp.id, inp.value);
+    panelEl.style.setProperty(inp.dataset.var, inp.value);
+    inp.addEventListener("input", () => {
+      panelEl.style.setProperty(inp.dataset.var, inp.value);
+    });
+  });
+  // Per-agent bar palettes — mirrors AGENT_PALETTES in ui.c. Row colours
+  // swap with the agent dropdown; the per-row pickers still override.
+  const AGENT_PALETTES = {
+    claude: { "--row1": "#DE7356", "--row2": "#A4A049" },
+    codex:  { "--row1": "#81C3DD", "--row2": "#A4A049" },
+  };
+  const rowInputsByVar = {
+    "--row1": document.getElementById("c-row1"),
+    "--row2": document.getElementById("c-row2"),
+  };
+  function applyAgentPalette(name) {
+    const pal = AGENT_PALETTES[name] || AGENT_PALETTES.claude;
+    for (const [v, hex] of Object.entries(pal)) {
+      rowInputsByVar[v].value = hex;
+      panelEl.style.setProperty(v, hex);
+    }
+  }
+  applyAgentPalette(agentEl.value);
+
+  document.getElementById("reset-colors").addEventListener("click", () => {
+    colorInputs.forEach(inp => {
+      // Skip row fills — they reset via the current agent's palette.
+      if (inp.dataset.var === "--row1" || inp.dataset.var === "--row2") return;
+      const def = colorDefaults.get(inp.id);
+      inp.value = def;
+      panelEl.style.setProperty(inp.dataset.var, def);
+    });
+    applyAgentPalette(agentEl.value);
+  });
+
+  // Bar corner radius slider — drives --bar-radius (used by both track and fill).
+  const barRadiusEl = $("bar-radius");
+  const barRadiusValEl = $("bar-radius-val");
+  function applyBarRadius() {
+    const px = parseInt(barRadiusEl.value, 10);
+    panelEl.style.setProperty("--bar-radius", px + "px");
+    barRadiusValEl.textContent = px + " px";
+  }
+  barRadiusEl.addEventListener("input", applyBarRadius);
+  applyBarRadius();
+
+  const barHeightEl = $("bar-height");
+  const barHeightValEl = $("bar-height-val");
+  function applyBarHeight() {
+    const px = parseInt(barHeightEl.value, 10);
+    panelEl.style.setProperty("--bar-height", px + "px");
+    barHeightValEl.textContent = px + " px";
+  }
+  barHeightEl.addEventListener("input", applyBarHeight);
+  applyBarHeight();
+
+  redraw();
+</script>
+</body>
+</html>

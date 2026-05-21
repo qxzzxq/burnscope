@@ -3,12 +3,12 @@
   "captured_at": 1779050146,
   "sessions": [
     {
-      "type": "5h",
+      "type": "current",
       "used_pct": 0.03,
       "resets_at": 1779066600
     },
     {
-      "type": "7d",
+      "type": "weekly",
       "used_pct": 0.09,
       "resets_at": 1779156000
     }

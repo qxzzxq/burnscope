@@ -81,6 +81,7 @@ class CodexAgent(Agent):
     """Probes ChatGPT Codex's rate-limit headers via a streaming POST."""
 
     name = "codex"
+    probe_interval: ClassVar[float] = 120.0
     CREDENTIALS_PATH: ClassVar[Path] = Path.home() / ".codex" / "auth.json"
 
     def __init__(self, credential: CodexCredential) -> None:

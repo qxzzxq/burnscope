@@ -1,0 +1,862 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BurnScope client v2 — detailed specification</title>
+<style>
+  :root {
+    --accent: #2c5aa0;
+    --accent-soft: #eef3fa;
+    --border: #e1e4e8;
+    --bg-soft: #fafbfc;
+    --bg-code: #f4f4f7;
+    --text: #24292f;
+    --muted: #57606a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    max-width: 1040px;
+    margin: 2em auto;
+    padding: 0 1.5em;
+    color: var(--text);
+    line-height: 1.55;
+  }
+  h1 { border-bottom: 2px solid var(--accent); padding-bottom: .35em; }
+  h2 { border-bottom: 1px solid var(--border); padding-bottom: .25em; margin-top: 2.2em; }
+  h3 { color: var(--accent); margin-top: 1.8em; }
+  h4 { margin-top: 1.4em; margin-bottom: .4em; color: var(--muted); text-transform: uppercase;
+       font-size: .82em; letter-spacing: .05em; }
+  p { margin: .6em 0; }
+  code, pre { font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace; }
+  code {
+    background: var(--bg-code);
+    padding: .1em .35em;
+    border-radius: 3px;
+    font-size: .92em;
+  }
+  pre {
+    background: var(--bg-code);
+    padding: 1em 1.2em;
+    border-radius: 6px;
+    overflow-x: auto;
+    border-left: 3px solid var(--accent);
+    font-size: .87em;
+    line-height: 1.5;
+  }
+  pre code { background: transparent; padding: 0; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 1em 0;
+    font-size: .92em;
+  }
+  th, td {
+    border: 1px solid var(--border);
+    padding: .55em .8em;
+    text-align: left;
+    vertical-align: top;
+  }
+  th { background: var(--bg-soft); font-weight: 600; }
+  td.mono, table.mono td:first-child {
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: .9em;
+    white-space: nowrap;
+  }
+  .toc {
+    background: var(--bg-soft);
+    border: 1px solid var(--border);
+    padding: 1em 1.5em;
+    border-radius: 6px;
+  }
+  .toc ul { margin: .3em 0; padding-left: 1.4em; }
+  .toc li { margin: .15em 0; }
+  .module-header {
+    background: var(--bg-soft);
+    padding: .8em 1.2em;
+    border-radius: 6px;
+    border-left: 4px solid var(--accent);
+    margin-top: 1.8em;
+  }
+  .module-header h3 { margin: 0; }
+  .module-header .path { color: var(--muted); font-family: monospace; font-size: .88em; }
+  .tag {
+    display: inline-block;
+    background: var(--accent-soft);
+    color: var(--accent);
+    padding: .12em .55em;
+    border-radius: 3px;
+    font-size: .78em;
+    font-weight: 600;
+    margin-right: .4em;
+    vertical-align: middle;
+  }
+  .tag-new { background: #d4f4dd; color: #1a7f37; }
+  .tag-gone { background: #ffe1e1; color: #b42318; }
+  blockquote {
+    border-left: 3px solid #ccc;
+    margin: 1em 0;
+    padding: .35em 1em;
+    color: var(--muted);
+    background: var(--bg-soft);
+    border-radius: 0 4px 4px 0;
+  }
+  .diagram {
+    background: white;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 1em;
+    margin: 1.2em 0;
+    overflow-x: auto;
+  }
+  .diagram pre {
+    background: transparent;
+    border-left: none;
+    padding: 0;
+    margin: 0;
+    font-size: .88em;
+  }
+  .small { font-size: .88em; color: var(--muted); }
+  hr { border: 0; border-top: 1px solid var(--border); margin: 2.5em 0; }
+</style>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral', securityLevel: 'loose' });
+</script>
+</head>
+<body>
+
+<h1>BurnScope Client v2 — Detailed Specification</h1>
+
+<p class="small">
+  Component-level reference for the credentialless rewrite of
+  <code>client/src/burnscope_client/</code>. Replaces
+  <a href="./client-spec.html">client-spec.html</a> (v1, header-probe era).
+  Pairs with <a href="./wire-format.md">wire-format.md</a>,
+  <a href="./claude-statusline.html">claude-statusline.html</a>, and
+  <a href="./codex-app-server.html">codex-app-server.html</a>.
+</p>
+
+<div class="toc">
+  <strong>Contents</strong>
+  <ul>
+    <li><a href="#overview">1. Overview &amp; deltas from v1</a></li>
+    <li><a href="#data-flow">2. Data flow</a></li>
+    <li><a href="#identity">3. Identity &amp; pairing</a></li>
+    <li><a href="#wire-additions">4. Wire-format additions</a></li>
+    <li><a href="#modules">5. Module reference</a>
+      <ul>
+        <li><a href="#schema"><code>schema.py</code></a></li>
+        <li><a href="#identity-py"><code>identity.py</code></a> <span class="tag tag-new">new</span></li>
+        <li><a href="#host-cache"><code>host_cache.py</code></a> <span class="tag tag-new">new</span></li>
+        <li><a href="#discovery"><code>discovery.py</code></a></li>
+        <li><a href="#pusher"><code>pusher.py</code></a></li>
+        <li><a href="#claude-collector"><code>claude_statusline.py</code></a> <span class="tag tag-new">new</span></li>
+        <li><a href="#codex-collector"><code>codex_daemon.py</code></a> <span class="tag tag-new">new</span></li>
+        <li><a href="#cli"><code>cli.py</code></a></li>
+      </ul>
+    </li>
+    <li><a href="#lifecycle-claude">6. Claude per-fire lifecycle</a></li>
+    <li><a href="#lifecycle-codex">7. Codex per-event lifecycle</a></li>
+    <li><a href="#installation">8. Installation</a></li>
+    <li><a href="#test-matrix">9. Test matrix</a></li>
+    <li><a href="#migration">10. Migration from v1</a></li>
+  </ul>
+</div>
+
+<!-- =============================================================== -->
+<h2 id="overview">1. Overview &amp; deltas from v1</h2>
+
+<p>
+  v2 replaces the per-agent OAuth-token HTTP probe (which made real,
+  token-costing API calls to extract rate-limit headers) with two
+  agent-native, no-cost data sources:
+</p>
+
+<ul>
+  <li><strong>Claude</strong> → Claude Code's
+      <a href="./claude-statusline.html">statusline hook</a>. The hook is a
+      script that Claude Code invokes after every assistant message,
+      passing the current session's <code>rate_limits</code> on stdin.</li>
+  <li><strong>Codex</strong> → the
+      <a href="./codex-app-server.html"><code>codex app-server</code></a>
+      JSON-RPC subprocess. Listens for
+      <code>account/rateLimits/updated</code> server notifications.</li>
+</ul>
+
+<p>
+  Both sources are documented, stable, and intended for third-party
+  integrations. Neither consumes upstream tokens. The collectors have
+  asymmetric lifecycles, so v2 abandons the v1
+  <code>Agent</code> ABC + unified <code>asyncio</code> daemon-loop pattern.
+</p>
+
+<h4>What's gone</h4>
+
+<table>
+  <tr><th>v1</th><th>Fate</th></tr>
+  <tr><td class="mono">credentials.py</td><td><span class="tag tag-gone">removed</span> — no client-side credential reading</td></tr>
+  <tr><td class="mono">agent.py</td><td><span class="tag tag-gone">removed</span> — collectors no longer share an ABC</td></tr>
+  <tr><td class="mono">agents/claude.py</td><td><span class="tag tag-gone">removed</span> — replaced by <code>claude_statusline.py</code></td></tr>
+  <tr><td class="mono">agents/codex.py</td><td><span class="tag tag-gone">removed</span> — replaced by <code>codex_daemon.py</code></td></tr>
+  <tr><td class="mono">agents/__init__.py</td><td><span class="tag tag-gone">removed</span></td></tr>
+  <tr><td class="mono">daemon.py (unified loop)</td><td><span class="tag tag-gone">removed</span> — Codex-only daemon is now <code>codex_daemon.py</code></td></tr>
+  <tr><td class="mono">docs/probe-claude.sh</td><td><span class="tag tag-gone">removed</span></td></tr>
+  <tr><td class="mono">docs/probe-codex.sh</td><td><span class="tag tag-gone">removed</span></td></tr>
+</table>
+
+<h4>What's new</h4>
+
+<table>
+  <tr><th>v2</th><th>Purpose</th></tr>
+  <tr><td class="mono">claude_statusline.py</td><td>Statusline-hook entry point. Short-lived, fires per event.</td></tr>
+  <tr><td class="mono">codex_daemon.py</td><td>Long-lived process owning the <code>codex app-server</code> subprocess.</td></tr>
+  <tr><td class="mono">identity.py</td><td>Derives the per-agent <code>client_id</code> hash for TOFU pairing.</td></tr>
+  <tr><td class="mono">host_cache.py</td><td>Atomic file-backed cache of the discovered ESP32 host.</td></tr>
+</table>
+
+<h4>What's preserved</h4>
+
+<table>
+  <tr><th>v1 / v2</th><th>Notes</th></tr>
+  <tr><td class="mono">schema.py</td><td><code>SessionSnapshot</code> / <code>AgentSnapshot</code> unchanged. Wire format is backward-compatible.</td></tr>
+  <tr><td class="mono">discovery.py</td><td>mDNS browsing. Now consumed by both collectors via <code>host_cache.py</code>.</td></tr>
+  <tr><td class="mono">pusher.py</td><td><code>POST /summary</code> and <code>GET /health</code> client. Extended with the <code>X-BurnScope-Client-Id</code> header.</td></tr>
+  <tr><td class="mono">cli.py</td><td>Rewritten as an installer / status tool, not a daemon entry point.</td></tr>
+</table>
+
+<!-- =============================================================== -->
+<h2 id="data-flow">2. Data flow</h2>
+
+<div class="diagram">
+<pre class="mermaid">
+flowchart LR
+  subgraph Local["laptop (macOS or Linux)"]
+    direction TB
+
+    subgraph ClaudePath["Claude collector"]
+      direction LR
+      creds[("Claude credentials<br/>OS keyring<br/>or ~/.claude/<br/>.credentials.json")]
+      cc["Claude Code<br/>(active session)"]
+      hook["claude_statusline.py<br/>(per-fire)"]
+      bgpush["detached push child"]
+    end
+
+    subgraph CodexPath["Codex collector"]
+      direction LR
+      cas["codex app-server<br/>(JSON-RPC subprocess)"]
+      codexd["codex_daemon.py<br/>(long-lived)"]
+    end
+
+    subgraph BState["~/.burnscope/ (state dir)"]
+      direction TB
+      host[("host<br/>mDNS cache")]
+      lpclaude[("last-push.claude<br/>indicator for next fire")]
+      lpcodex[("last-push.codex<br/>burnscope status only")]
+    end
+  end
+
+  esp32[("ESP32<br/>POST /summary · GET /health<br/>NVS: paired client_id per agent")]
+
+  %% Claude wiring
+  cc -- "stdin JSON" --> hook
+  hook -- "stdout statusline" --> cc
+  creds -. "organizationUuid" .-> hook
+  lpclaude -. "previous outcome" .-> hook
+  hook -- "spawn" --> bgpush
+  bgpush --> host
+  bgpush --> lpclaude
+  bgpush -. "POST<br/>X-BurnScope-Client-Id<br/>(hash organizationUuid)" .-> esp32
+
+  %% Codex wiring
+  cas -- "stdout notifications" --> codexd
+  codexd -- "stdin JSON-RPC" --> cas
+  codexd --> host
+  codexd --> lpcodex
+  codexd -. "POST<br/>X-BurnScope-Client-Id<br/>(hash email)" .-> esp32
+</pre>
+</div>
+
+<p>
+  Two collectors, one ESP32. They share <strong>only</strong> the
+  ESP32-host cache file and the wire-format target — no IPC, no shared
+  process state, no shared token.
+</p>
+
+<!-- =============================================================== -->
+<h2 id="identity">3. Identity &amp; pairing</h2>
+
+<p>
+  v2 adds per-agent TOFU (trust-on-first-use) pairing: each agent's
+  collector independently derives a stable identity hash from the local
+  credential material that agent already authenticates with, sends it on
+  every request, and the ESP32 binds the first one it sees per agent into
+  NVS-persistent state. The user does nothing.
+</p>
+
+<h4>Source identifiers</h4>
+
+<table>
+  <tr><th>Agent</th><th>Source</th><th>Field</th><th>Stable?</th></tr>
+  <tr>
+    <td>Claude</td>
+    <td class="mono">OS keyring (<code>Claude Code-credentials</code>), or fallback file <code>~/.claude/.credentials.json</code></td>
+    <td class="mono">organizationUuid</td>
+    <td>Yes — UUID per Claude org</td>
+  </tr>
+  <tr>
+    <td>Codex</td>
+    <td class="mono">codex app-server: <code>account/read</code></td>
+    <td class="mono">account.email</td>
+    <td>Yes — stable until user changes ChatGPT email</td>
+  </tr>
+</table>
+
+<p>
+  The Claude resolver is OS-agnostic. On macOS it pulls from Keychain, on
+  Linux it pulls from the Secret Service API (gnome-keyring, KWallet,
+  KeePassXC, etc.) via <code>libsecret</code>. If neither yields the
+  credential, the resolver falls back to the plaintext file
+  <code>~/.claude/.credentials.json</code>, which Claude Code writes when
+  no keyring is available. Codex credentials are file-based on every
+  platform, so no OS branching is needed.
+</p>
+
+<h4>Hashing</h4>
+
+<pre><code>def client_id(agent: str, raw: str) -&gt; str:
+    return sha256(f"burnscope:{agent}:{raw}".encode()).hexdigest()</code></pre>
+
+<p>
+  Namespace prefix (<code>"burnscope:"</code>) prevents accidental
+  collisions with hashes used elsewhere. Lower-cased agent name keeps
+  the hash deterministic.
+</p>
+
+<h4>Pairing semantics</h4>
+
+<ol>
+  <li>ESP32 reads <code>nvs::client_id[agent]</code> at boot.</li>
+  <li>Incoming request includes <code>X-BurnScope-Client-Id: &lt;hash&gt;</code>:
+    <ul>
+      <li>NVS empty for this <code>agent</code> → accept, persist the
+          incoming hash.</li>
+      <li>NVS matches → accept.</li>
+      <li>NVS mismatch → <code>401 Unauthorized</code>.</li>
+    </ul>
+  </li>
+  <li>To re-pair (user changed Claude org, sold the ESP32, etc.):
+      erase NVS via <code>idf.py erase-flash</code>, or via the hardware
+      boot-button-hold path (Phase-2 polish).</li>
+</ol>
+
+<h4>Why this works for every scenario</h4>
+
+<table>
+  <tr><th>Scenario</th><th>Behavior</th></tr>
+  <tr><td>Same user, two laptops, both Claude</td><td>Both derive <code>hash(organizationUuid)</code> → identical → both accepted. ✓</td></tr>
+  <tr><td>Same user, two laptops, both Codex</td><td>Both derive <code>hash(email)</code> → identical → both accepted. ✓</td></tr>
+  <tr><td>Same user, Claude on one laptop and Codex on another</td><td>Per-agent slots claimed independently. ESP32 shows both. ✓</td></tr>
+  <tr><td>Two users on same LAN, each own ESP32</td><td>Different identifiers → different hashes → each ESP32 only accepts its owner. ✓</td></tr>
+  <tr><td>First-run race attack</td><td>Same TOFU surface as bare TOFU. Mitigation: pair while ESP32 is on your bench before exposing to LAN.</td></tr>
+</table>
+
+<!-- =============================================================== -->
+<h2 id="wire-additions">4. Wire-format additions</h2>
+
+<p>
+  Two additions to <a href="./wire-format.md">wire-format.md</a>, both
+  backward-compatible:
+</p>
+
+<h4>4.1 <code>X-BurnScope-Client-Id</code> header</h4>
+
+<p>
+  Optional. SHA-256 hex of an agent-stable identifier (see
+  <a href="#identity">§3</a>). Sent on <code>POST /summary</code> and
+  <code>GET /health</code>. Server enforcement is per-agent TOFU:
+</p>
+
+<ul>
+  <li>If NVS has no stored hash for the incoming request's
+      <code>agent</code> → accept, persist.</li>
+  <li>If NVS hash matches → accept.</li>
+  <li>If mismatch → <code>401 Unauthorized</code> (no state change).</li>
+  <li>If header absent → accepted only if NVS is empty for that agent
+      (legacy-client compatibility window). Once any TOFU-paired client
+      has POSTed, header-less clients for that agent are rejected with
+      <code>401</code>.</li>
+</ul>
+
+<h4>4.2 Monotonic <code>captured_at</code> guard</h4>
+
+<p>
+  Per-agent. Firmware tracks the highest <code>captured_at</code> seen
+  per <code>agent</code>. On <code>POST /summary</code>:
+</p>
+
+<ul>
+  <li><code>captured_at &gt;= stored</code> → update stored snapshot,
+      update stored <code>captured_at</code>, return <code>204</code>.</li>
+  <li><code>captured_at &lt; stored</code> → return <code>204</code>
+      without updating state. The push is acknowledged so clients don't
+      retry, but the older snapshot is dropped.</li>
+</ul>
+
+<p>
+  Equal <code>captured_at</code> is treated as last-writer-wins. The
+  data is essentially identical at one-second resolution.
+</p>
+
+<p>
+  Together, the two guards mean a multi-laptop, multi-session deployment
+  always converges to the freshest snapshot from an authorized client per
+  agent.
+</p>
+
+<!-- =============================================================== -->
+<h2 id="modules">5. Module reference</h2>
+
+<div class="module-header">
+  <h3 id="schema"><code>schema.py</code></h3>
+  <span class="path">unchanged from v1</span>
+</div>
+
+<p>
+  <code>SessionSnapshot(type, used_pct, resets_at)</code> and
+  <code>AgentSnapshot(agent, captured_at, sessions, to_dict())</code>.
+  Wire format is unchanged.
+</p>
+
+<div class="module-header">
+  <h3 id="identity-py"><code>identity.py</code> <span class="tag tag-new">new</span></h3>
+  <span class="path">client/src/burnscope_client/identity.py</span>
+</div>
+
+<p>Pure module. No I/O state beyond reading the relevant credential source.</p>
+
+<table>
+  <tr><th>Symbol</th><th>Signature</th><th>Description</th></tr>
+  <tr>
+    <td class="mono">client_id_for_agent</td>
+    <td><code>(agent: str, raw_identifier: str) → str</code></td>
+    <td>SHA-256 hex of <code>burnscope:{agent}:{raw_identifier}</code>.</td>
+  </tr>
+  <tr>
+    <td class="mono">claude_org_uuid</td>
+    <td><code>() → str</code></td>
+    <td>Returns Claude's <code>organizationUuid</code> using an OS-agnostic resolver: first the system keyring via the <code>keyring</code> library (Keychain on macOS, Secret Service on Linux), then a fallback to the plaintext file <code>~/.claude/.credentials.json</code>. Raises <code>IdentityError</code> if every source fails or the JSON lacks the field.</td>
+  </tr>
+  <tr>
+    <td class="mono">IdentityError</td>
+    <td><em>(exception)</em></td>
+    <td>Raised when the required credential source is missing or malformed.</td>
+  </tr>
+</table>
+
+<p>
+  The Codex equivalent (extracting email from <code>account/read</code>) lives
+  in <code>codex_daemon.py</code> rather than here, because it requires an
+  open app-server connection — pulling it into <code>identity.py</code> would
+  introduce an awkward subprocess dependency in an otherwise pure module.
+</p>
+
+<div class="module-header">
+  <h3 id="host-cache"><code>host_cache.py</code> <span class="tag tag-new">new</span></h3>
+  <span class="path">client/src/burnscope_client/host_cache.py</span>
+</div>
+
+<p>
+  Manages the three files in the user's state directory. The state
+  directory is <code>~/.burnscope/</code> on both macOS and Linux
+  (no XDG branching — explicit and predictable across platforms; tools
+  like <code>ssh</code>, <code>aws</code>, and <code>gh</code> use the
+  same dot-directory pattern). Atomic writes via
+  <code>tempfile.NamedTemporaryFile</code> + <code>os.replace</code> so
+  concurrent statusline fires from multiple Claude sessions can't corrupt
+  any file. Directory is created lazily on first write with mode
+  <code>0700</code>.
+</p>
+
+<table>
+  <tr><th>File</th><th>Owner</th><th>Reader(s)</th><th>Purpose</th></tr>
+  <tr><td class="mono">host</td><td>both collectors</td><td>both collectors</td><td>Cached ESP32 host (string). Written after a successful mDNS resolve, deleted on transport failure.</td></tr>
+  <tr><td class="mono">last-push.claude</td><td><code>claude_statusline.py --push</code> child</td><td><code>claude_statusline.py</code> on the next fire, and <code>cli.py status</code></td><td>Outcome of the most recent Claude push (<code>ok</code> / <code>fail</code> with a timestamp). Drives the <code>✓</code> / <code>✗</code> indicator in the next-fire statusline output.</td></tr>
+  <tr><td class="mono">last-push.codex</td><td><code>codex_daemon.py</code> pusher coroutine</td><td><code>cli.py status</code></td><td>Same shape as Claude's, but consumed only by external observers — the daemon already remembers its own state in memory.</td></tr>
+</table>
+
+<table>
+  <tr><th>Symbol</th><th>Signature</th><th>Description</th></tr>
+  <tr><td class="mono">load_host</td><td><code>() → str | None</code></td><td>Returns cached host, or <code>None</code> if absent / malformed.</td></tr>
+  <tr><td class="mono">store_host</td><td><code>(host: str) → None</code></td><td>Atomic write.</td></tr>
+  <tr><td class="mono">invalidate_host</td><td><code>() → None</code></td><td>Removes the cache file. Called on push transport failure to force rediscovery next attempt.</td></tr>
+  <tr><td class="mono">write_push_state</td><td><code>(agent: str, ok: bool) → None</code></td><td>Writes <code>last-push.&lt;agent&gt;</code> atomically with <code>{"ok": bool, "at": unix_seconds}</code>.</td></tr>
+  <tr><td class="mono">read_push_state</td><td><code>(agent: str) → dict | None</code></td><td>Returns the parsed state, or <code>None</code> if absent / malformed.</td></tr>
+</table>
+
+<div class="module-header">
+  <h3 id="discovery"><code>discovery.py</code></h3>
+  <span class="path">preserved from v1; minor signature change</span>
+</div>
+
+<p>
+  mDNS browse for <code>_burnscope._tcp.local.</code>. v1's single async
+  call signature remains; both v2 collectors call it through
+  <code>host_cache.py</code>'s "load → discover → store" idiom.
+</p>
+
+<div class="module-header">
+  <h3 id="pusher"><code>pusher.py</code></h3>
+  <span class="path">preserved from v1; extended with client-id header</span>
+</div>
+
+<table>
+  <tr><th>Symbol</th><th>Signature</th></tr>
+  <tr>
+    <td class="mono">push</td>
+    <td><code>(snapshot: AgentSnapshot, host: str, client_id: str, client: httpx.AsyncClient) → None</code></td>
+  </tr>
+  <tr>
+    <td class="mono">fetch_health</td>
+    <td><code>(host: str, client_id: str, client: httpx.AsyncClient) → dict | None</code></td>
+  </tr>
+  <tr>
+    <td class="mono">PushError</td>
+    <td><em>(exception)</em> — raised on transport failure, non-2xx, or 401.</td>
+  </tr>
+</table>
+
+<p>
+  Both functions add <code>X-BurnScope-Client-Id: &lt;hash&gt;</code> to the
+  outgoing request. <code>401</code> responses raise <code>PushError</code>
+  with a recognizable subclass so callers can decide whether to invalidate
+  the host cache (transport failure) or surface a "not paired" error
+  (auth failure — host is right, identity is wrong).
+</p>
+
+<div class="module-header">
+  <h3 id="claude-collector"><code>claude_statusline.py</code> <span class="tag tag-new">new</span></h3>
+  <span class="path">client/src/burnscope_client/claude_statusline.py</span>
+</div>
+
+<p>
+  Module-level entry-point script invoked by Claude Code on every
+  statusline fire. Two roles via argparse:
+</p>
+
+<ul>
+  <li><strong>Default (no args)</strong> — read JSON from stdin, print
+      statusline to stdout (including the indicator from
+      <code>read_push_state("claude")</code>), fork a detached background
+      child to do the push.</li>
+  <li><strong><code>--push</code></strong> — read AgentSnapshot JSON from
+      stdin (piped by the detached parent), run mDNS-cached
+      <code>POST /summary</code>, call
+      <code>write_push_state("claude", ok=…)</code>.</li>
+</ul>
+
+<p>
+  See <a href="#lifecycle-claude">§6</a> for the full per-fire sequence.
+</p>
+
+<div class="module-header">
+  <h3 id="codex-collector"><code>codex_daemon.py</code> <span class="tag tag-new">new</span></h3>
+  <span class="path">client/src/burnscope_client/codex_daemon.py</span>
+</div>
+
+<p>
+  Long-running async process. Owns one <code>codex app-server</code>
+  subprocess for the lifetime of the daemon. Restarts the subprocess on
+  unexpected EOF. Three coroutines:
+</p>
+
+<ul>
+  <li><strong>Reader</strong> — reads JSONL from app-server stdout,
+      demuxes responses by <code>id</code> and notifications by
+      <code>method</code>. On
+      <code>account/rateLimits/updated</code>: build <code>AgentSnapshot</code>,
+      enqueue push.</li>
+  <li><strong>Pusher</strong> — consumes the push queue, runs
+      mDNS-cached <code>POST /summary</code>. After each attempt,
+      calls <code>write_push_state("codex", ok=…)</code> so
+      <code>burnscope status</code> can report health. On transport
+      failure, invalidates the host cache and retries on the next
+      event (no aggressive retry loop).</li>
+  <li><strong>Health</strong> — periodic <code>GET /health</code>; on
+      transport failure invalidates the host cache; on body mismatch
+      with the latest snapshot, re-enqueues a push. Preserves v1's
+      edge-triggered reconciliation guarantee for Codex.</li>
+</ul>
+
+<p>
+  Bootstrap sequence: <code>initialize</code> → <code>account/read</code>
+  (derives identity hash) → <code>account/rateLimits/read</code>
+  (initial snapshot) → enter reader loop.
+</p>
+
+<div class="module-header">
+  <h3 id="cli"><code>cli.py</code></h3>
+  <span class="path">rewritten: installer/status, not a daemon entry point</span>
+</div>
+
+<p>
+  v1's <code>cli.py</code> built an asyncio daemon. v2's is small and
+  imperative — subcommands for one-shot operations:
+</p>
+
+<table>
+  <tr><th>Command</th><th>Action</th></tr>
+  <tr>
+    <td class="mono">burnscope install claude</td>
+    <td>Patches <code>~/.claude/settings.json</code> to add the
+        <code>statusLine</code> entry pointing at
+        <code>claude_statusline.py</code>. Idempotent.</td>
+  </tr>
+  <tr>
+    <td class="mono">burnscope install codex</td>
+    <td>OS-detected service registration:
+        <ul style="margin: .3em 0 0 1em; padding: 0;">
+          <li>macOS → writes a launchd plist at
+              <code>~/Library/LaunchAgents/com.burnscope.codex.plist</code>
+              and loads it with <code>launchctl bootstrap</code>.</li>
+          <li>Linux → writes a systemd user unit at
+              <code>~/.config/systemd/user/burnscope-codex.service</code>
+              and enables it with
+              <code>systemctl --user enable --now</code>.</li>
+        </ul>
+        Both arrange the daemon to start on user login and restart on
+        crash. Fallback (no launchd / no systemd-user): print the
+        command and ask the user to wire it up themselves.</td>
+  </tr>
+  <tr>
+    <td class="mono">burnscope uninstall {claude,codex}</td>
+    <td>Reverses the above.</td>
+  </tr>
+  <tr>
+    <td class="mono">burnscope status</td>
+    <td>Prints: cached ESP32 host, last push state per agent (from the
+        state files), whether the Codex launchd job is loaded, whether
+        the Claude statusline hook is configured. Useful for debugging.</td>
+  </tr>
+  <tr>
+    <td class="mono">burnscope pair-reset</td>
+    <td>Removes the host cache so the next push rediscovers. Does not
+        touch the ESP32 NVS — that's a firmware-side reset.</td>
+  </tr>
+</table>
+
+<!-- =============================================================== -->
+<h2 id="lifecycle-claude">6. Claude per-fire lifecycle</h2>
+
+<p>Steps in order, executed every time Claude Code fires the statusline:</p>
+
+<ol>
+  <li><strong>Read stdin</strong> as JSON; locate
+      <code>rate_limits.five_hour</code> and <code>rate_limits.seven_day</code>.</li>
+  <li><strong>Read indicator state</strong>
+      via <code>read_push_state("claude")</code>
+      (reads <code>~/.burnscope/last-push.claude</code>):
+      <code>{"ok": true}</code> → <code>✓</code>,
+      <code>{"ok": false}</code> → <code>✗</code>,
+      absent → <code>…</code>.</li>
+  <li><strong>Render statusline</strong> to stdout:
+      <code>5h X% · 7d Y% ✓</code>. If <code>rate_limits</code> is absent
+      (first-message-of-session or non-subscriber), substitute dashes.
+      <strong>Flush stdout.</strong></li>
+  <li><strong>If rate_limits is absent → exit.</strong> Nothing to push.</li>
+  <li><strong>Build <code>AgentSnapshot</code></strong> with
+      <code>captured_at = int(time.time())</code>.</li>
+  <li><strong>Spawn detached child</strong>:
+      <code>Popen([sys.executable, __file__, "--push"], stdin=PIPE, start_new_session=True)</code>.
+      Write the snapshot JSON to its stdin, close stdin, exit.</li>
+  <li><strong>(Child) Resolve host</strong> via
+      <code>host_cache.load()</code>; on cache miss run mDNS,
+      <code>host_cache.store()</code> the result.</li>
+  <li><strong>(Child) Derive client_id</strong> via
+      <code>identity.client_id_for_agent("claude", identity.claude_org_uuid())</code>.</li>
+  <li><strong>(Child) POST /summary</strong> with the header. On
+      success: <code>write_push_state("claude", ok=True)</code>. On
+      transport failure: <code>invalidate_host()</code> then
+      <code>write_push_state("claude", ok=False)</code>. On
+      <code>401</code>: <code>write_push_state("claude", ok=False)</code>
+      but do <em>not</em> invalidate the host cache (the device is
+      reachable; identity is the issue).</li>
+</ol>
+
+<p>
+  Steps 1–6 happen synchronously on the foreground statusline-rendering
+  path and must complete in well under 300ms (Claude Code's debounce
+  window). The actual work — discovery, POST — happens in the detached
+  child, immune to Claude's cancellation-on-next-event behavior.
+</p>
+
+<!-- =============================================================== -->
+<h2 id="lifecycle-codex">7. Codex per-event lifecycle</h2>
+
+<h4>Bootstrap (once per daemon start)</h4>
+
+<ol>
+  <li>Spawn <code>codex app-server</code>, attach to its stdio.</li>
+  <li>Send <code>initialize</code>; await response.</li>
+  <li>Send <code>account/read</code>; cache
+      <code>client_id = hash(email)</code> for the daemon lifetime.</li>
+  <li>Send <code>account/rateLimits/read</code> for the initial snapshot;
+      enqueue a push.</li>
+  <li>Start the reader, pusher, and health coroutines.</li>
+</ol>
+
+<h4>Steady state (reader loop)</h4>
+
+<ol>
+  <li>Read a JSONL line.</li>
+  <li>If it has an <code>id</code> matching a pending request → resolve
+      that request's future.</li>
+  <li>If it has a <code>method</code>:
+    <ul>
+      <li><code>account/rateLimits/updated</code> → build
+          <code>AgentSnapshot</code>, set <code>captured_at = now</code>,
+          enqueue push.</li>
+      <li>Other methods → log at debug, ignore.</li>
+    </ul>
+  </li>
+</ol>
+
+<h4>Pusher coroutine</h4>
+
+<ol>
+  <li>Await a snapshot from the queue.</li>
+  <li><code>host = load_host()</code>; on miss, discover and
+      <code>store_host()</code>.</li>
+  <li><code>POST /summary</code> with the cached client_id header.</li>
+  <li>On success: <code>write_push_state("codex", ok=True)</code>.</li>
+  <li>On transport failure: <code>invalidate_host()</code>,
+      <code>write_push_state("codex", ok=False)</code>.</li>
+  <li>On <code>401</code>:
+      <code>write_push_state("codex", ok=False)</code>; do not
+      invalidate the host cache.</li>
+</ol>
+
+<h4>Health coroutine (every 30 s)</h4>
+
+<ol>
+  <li><code>GET /health</code> with the client_id header.</li>
+  <li>On transport failure: <code>invalidate_host()</code>.</li>
+  <li>On success: compare body's per-agent <code>sessions</code> against
+      the last pushed snapshot. On divergence (firmware lost state),
+      enqueue the latest snapshot for re-push.</li>
+</ol>
+
+<h4>Subprocess failure</h4>
+
+<p>
+  If the <code>codex app-server</code> stdout EOFs, the reader fails out.
+  The daemon backs off (exponential, max 60 s) and restarts the
+  subprocess, going through bootstrap again. Identity may change if the
+  user re-authenticated in between — that's fine, the ESP32 will accept
+  if it's the same email, reject if not.
+</p>
+
+<!-- =============================================================== -->
+<h2 id="installation">8. Installation</h2>
+
+<pre><code># one-time, per laptop (macOS or Linux)
+pip install -e ./client
+burnscope install claude   # patches ~/.claude/settings.json (OS-agnostic)
+burnscope install codex    # macOS → launchd plist; Linux → systemd user unit
+burnscope status           # confirm wiring</code></pre>
+
+<p>
+  No credential setup at install time. No token to copy. No flashing the
+  ESP32 with a secret. First push pairs the ESP32 to the laptop's
+  derived identity; subsequent pushes from the same account on other
+  laptops (or on the same laptop on a different OS) are accepted because
+  they derive the same hash from the same upstream account.
+</p>
+
+<table>
+  <tr><th>Concern</th><th>macOS</th><th>Linux</th></tr>
+  <tr><td>Claude credential location</td><td>Keychain service <code>Claude Code-credentials</code></td><td>Secret Service via <code>libsecret</code>; fallback to <code>~/.claude/.credentials.json</code></td></tr>
+  <tr><td>Codex credential location</td><td><code>~/.codex/auth.json</code> (file-based — uniform)</td><td><code>~/.codex/auth.json</code> (file-based — uniform)</td></tr>
+  <tr><td>State directory</td><td><code>~/.burnscope/</code></td><td><code>~/.burnscope/</code></td></tr>
+  <tr><td>Codex daemon supervisor</td><td>launchd user agent</td><td>systemd <code>--user</code> unit</td></tr>
+  <tr><td>mDNS resolver</td><td>Bonjour (built-in)</td><td>Avahi (typically installed; <code>zeroconf</code> Python library handles both)</td></tr>
+</table>
+
+<!-- =============================================================== -->
+<h2 id="test-matrix">9. Test matrix</h2>
+
+<table>
+  <tr><th>Module</th><th>What to test</th></tr>
+  <tr>
+    <td class="mono">identity.py</td>
+    <td>Deterministic hash output for fixed inputs. Resolver tries keyring first, falls back to file. <code>IdentityError</code> only when both fail. Tests must cover macOS and Linux keyring paths (via <code>keyring</code> library mocks).</td>
+  </tr>
+  <tr>
+    <td class="mono">host_cache.py</td>
+    <td>Atomic write under concurrent <code>store_host()</code> calls. <code>load_host()</code> returns <code>None</code> for missing/empty/garbage files. <code>invalidate_host()</code> is idempotent. <code>write_push_state</code> / <code>read_push_state</code> round-trip per agent without cross-contamination.</td>
+  </tr>
+  <tr>
+    <td class="mono">pusher.py</td>
+    <td>Header is on every request. <code>401</code> raises a distinct subclass. Transport errors raise the generic <code>PushError</code>.</td>
+  </tr>
+  <tr>
+    <td class="mono">claude_statusline.py</td>
+    <td>End-to-end with mocked stdin: statusline output format, push child spawned with correct args, indicator file read for previous state. <code>rate_limits</code>-absent path doesn't push.</td>
+  </tr>
+  <tr>
+    <td class="mono">codex_daemon.py</td>
+    <td>Integration with mocked app-server subprocess: bootstrap sequence; rateLimits/updated → push; subprocess EOF triggers restart with backoff; health divergence triggers re-push.</td>
+  </tr>
+  <tr>
+    <td>firmware: client_id auth</td>
+    <td>NVS-empty pairs; matching hash accepted; mismatched hash 401s; header-absent 401s after NVS populated.</td>
+  </tr>
+  <tr>
+    <td>firmware: monotonic guard</td>
+    <td>Older <code>captured_at</code> is acked-but-dropped. Equal accepted. Newer accepted.</td>
+  </tr>
+</table>
+
+<!-- =============================================================== -->
+<h2 id="migration">10. Migration from v1</h2>
+
+<p>
+  v1 → v2 is not an in-place upgrade — too many files are removed and the
+  daemon's role changes shape. Operator steps:
+</p>
+
+<ol>
+  <li>Stop the v1 daemon (whatever launchd / systemd / nohup arrangement
+      is in place). Remove its job file.</li>
+  <li>Update the client install (<code>pip install -e ./client</code>).</li>
+  <li>Run <code>burnscope install claude</code> and
+      <code>burnscope install codex</code>.</li>
+  <li>(Firmware) Flash the v2 firmware build, which includes the
+      client-id auth and the monotonic guard. NVS will be empty on first
+      boot, allowing TOFU pairing.</li>
+  <li>Start a Claude Code session; the statusline fires and pairs the
+      Claude slot. The Codex daemon (already loaded by launchd) pairs the
+      Codex slot at its first push.</li>
+</ol>
+
+<p>
+  No data is migrated. The wire format is backward-compatible at the
+  payload level, so an old v1 firmware would still accept v2 client
+  pushes (it just ignores the new header and the monotonic logic isn't
+  enforced). A new v2 firmware will, however, reject v1 client pushes
+  once paired — by design.
+</p>
+
+<hr>
+
+<p class="small">
+  See also:
+  <a href="./wire-format.md">wire-format.md</a> ·
+  <a href="./claude-statusline.html">claude-statusline.html</a> ·
+  <a href="./codex-app-server.html">codex-app-server.html</a> ·
+  <a href="./client-spec.html">client-spec.html (v1, historical)</a>.
+</p>
+
+</body>
+</html>

@@ -10,7 +10,7 @@ When you hit the cap and walk away, an always-on display tells you "how much hav
 
 | Agent | Storage | Windows |
 | --- | --- | --- |
-| **Claude Code** | macOS keychain (`Claude Code-credentials`) or `~/.claude/.credentials.json` | `5h`, `7d` |
+| **Claude Code** | macOS keychain (`Claude Code-credentials`) or `~/.claude/.credentials.json` | `current`, `weekly` |
 | **Codex CLI** | `~/.codex/auth.json` (access token + optional ChatGPT account id) | `primary`, `secondary` |
 
 The daemon auto-detects which agents are logged in and runs all of them concurrently — one `AgentSnapshot` per agent per cycle. Restrict to a subset with `--agent`.
@@ -21,8 +21,8 @@ The daemon auto-detects which agents are logged in and runs all of them concurre
 ┌──────────────────────────┐   HTTP POST /summary    ┌─────────────────────┐
 │ Python daemon (laptop)   │ ──────────────────────▶ │  ESP32 (CYD)        │
 │ - probes each agent      │   AgentSnapshot JSON    │  - advertises mDNS  │
-│ - tails activity         │                         │  - tiny HTTP server │
-│ - discovers ESP32 (mDNS) │                         │  - renders TFT      │
+│ - discovers ESP32 (mDNS) │                         │  - tiny HTTP server │
+│                          │                         │  - renders TFT      │
 └──────────────────────────┘                         └─────────────────────┘
 ```
 

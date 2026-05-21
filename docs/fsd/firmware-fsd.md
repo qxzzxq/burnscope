@@ -52,15 +52,20 @@ glance.
 - Accept `POST /summary` and render the result within a budget that feels
   immediate to the user.
 - Render whatever `sessions[].type` strings arrive, so the same firmware
-  works for Claude Code's `5h`/`7d` and Codex CLI's `primary`/`secondary`.
+  works for Claude Code's `current`/`weekly` and Codex CLI's `primary`/`secondary`.
 - Be stable enough to leave running for weeks (always-on watchdog).
 
 **Non-goals (deferred to Phase 2 or out of scope):**
 
 - OTA firmware updates.
 - Authentication on `POST /summary` (LAN-trust only).
-- Persisting snapshots across reboots (RAM-only — the daemon re-pushes
-  within ~30 s anyway, per `wire-format.md`).
+- Persisting snapshots across reboots (RAM-only). The daemon's pushes
+  are edge-triggered (see `docs/wire-format.md`), so after a firmware
+  reboot the device will sit on the "waiting for daemon..." splash
+  until each agent's snapshot *content* next changes. Today the daemon
+  does not yet detect a firmware reboot via `GET /health` and
+  re-prime, so the snapshot may take one full quota-change cycle to
+  reappear (logged as a known gap; see § 5.5).
 - Aggregating across multiple machines.
 - Rendering a third quota bucket (overage / credits) — schema allows it
   but the MVP layout only has room for two rows.
@@ -80,12 +85,16 @@ Power-on
    ▼
 STA connect → mDNS advertise (_burnscope._tcp) + NTP sync
    │
-   ├──◄ POST /summary  (one AgentSnapshot)            from daemon
+   ├──◄ POST /summary  (one AgentSnapshot, edge-triggered)   from daemon
    │       │
    │       ▼
-   │   parse → store per-agent snapshot → repaint UI
+   │   parse → store per-agent snapshot → (first push only) swap
+   │                                       off splash; 1 Hz UI tick
+   │                                       re-renders & cycles agents
    │
    └──◄ GET /health    (firmware version / uptime / last-snapshot-age)
+        — sent by the daemon between content changes as the heartbeat;
+          the firmware just replies and does not touch the UI.
 ```
 
 ---
@@ -105,13 +114,18 @@ Subsystems, runtime-only:
 | **NTP client**       | Syncs wall clock at boot and every 6 h. Used for "X s ago" and "resets in Y" math. |
 | **HTTP server**      | Two routes: `POST /summary`, `GET /health`. No middleware, no auth. |
 | **Snapshot store**   | RAM-only `map<agent, AgentSnapshot>` (max two agents in MVP — `claude`, `codex`). |
-| **Renderer**         | LVGL repaint on snapshot change *and* once a second for countdowns. Uses the **Display** abstraction. |
+| **Renderer**         | A 1 Hz LVGL timer re-reads the snapshot store, refreshes the visible agent's bars + countdowns, and cycles between agents (FR-4.10). A `POST /summary` only forces a screen change on the *first* push (splash → agent view). Uses the **Display** abstraction. |
 | **Display abstraction** | `display_t` virtual interface; concrete `cyd2usb_st7789_display` for the MVP panel. |
 | **Watchdog**         | Software task-heartbeat WDT plus IDF Task Watchdog (TWDT). |
 
 Data flow on the hot path is a straight line: HTTP → parser → snapshot
-store → UI dirty flag → next LVGL tick repaints. No queues, no tasks
-fighting for locks beyond the LVGL port mutex.
+store update. The store's listener swaps the display off the splash on
+the *first* push only; after that the screen change is driven by the
+1 Hz LVGL timer, which reads the (already-updated) store. No queues,
+no tasks fighting for locks beyond the LVGL port mutex. Pushes from a
+non-visible agent never preempt the active rotation — they just land
+in the store and get picked up the next time the rotation reaches
+that agent.
 
 ### 2.2 Hardware / Platform Architecture
 
@@ -320,16 +334,29 @@ unit-testable on the host).
   bar (filled proportionally to `used_pct`), the integer percentage
   (`round(used_pct × 100)` followed by `%`), and the session's `type`
   string rendered verbatim as a tag.
-- **FR-4.6** [Must]: When a `POST /summary` arrives, the firmware shall
-  re-render the affected agent's view within 100 ms.
+- **FR-4.6** [Must]: When the *first* `POST /summary` arrives after
+  boot (or the first one after the splash has reappeared due to a
+  WiFi state change), the firmware shall transition from the splash
+  to the agent view within 100 ms. Subsequent pushes update the
+  snapshot store immediately but the on-screen redraw happens at the
+  next 1 Hz tick — i.e. within ≤ 1 s of receipt. This is deliberate:
+  re-rendering on every push would override the agent rotation when a
+  different agent pushes (FR-4.10).
 - **FR-4.7** [Should]: The two progress bars shall use distinct accent
   colours so the rows are visually distinguishable; the exact palette is
   an implementation detail.
 - **FR-4.8** [Should]: A countdown derived from `resets_at − now()` shall
   be displayed inside each row and updated at least once per second.
-- **FR-4.9** [Should]: If no snapshot has been received within
-  `2 × keepalive` (default keepalive ≈ 30 s per `wire-format.md`), the
-  firmware shall visually mark the data as "stale" (e.g. dimmed bars).
+- **FR-4.9** [Deferred — see § 5.5]: Originally specified "if no
+  snapshot has been received within `2 × keepalive`, dim the bars as
+  stale". The keepalive anchor went away when the daemon moved to
+  edge-triggered `POST /summary` + `GET /health` heartbeat — a
+  snapshot-receipt timestamp no longer correlates with daemon
+  liveness (usage may legitimately not change for hours). The
+  firmware still tracks `received_at_us` per agent for the `GET
+  /health` response, but the UI dimming behaviour is not implemented
+  pending a re-anchor (e.g. a heartbeat-touched timestamp updated by
+  `/health` instead of `/summary`).
 - **FR-4.10** [May]: When multiple agents have pushed snapshots, the
   firmware shall cycle between agents on a slow timer (default 5 s).
   When only one agent has pushed, that view shall be permanent.
@@ -418,6 +445,7 @@ unit-testable on the host).
   in MVP.
 - **A-5** (assumed): The keepalive interval used to detect "stale"
   in FR-4.9 is the daemon's ~30 s figure from `docs/wire-format.md`.
+  **Stale as of the edge-triggered push refactor** — see § 5.5.
 
 ### 5.3 Documentation conflict to resolve
 
@@ -437,6 +465,18 @@ needed to remove the stale paragraph.
 - `lvgl/lvgl` 9.5.x (`dependencies.lock`).
 - Public NTP infrastructure (`pool.ntp.org` by default).
 
+### 5.5 Known gaps (post edge-triggered push refactor)
+
+- **No firmware-reboot detection on the daemon side.** After a
+  firmware reboot, the daemon's per-agent `last_pushed_snapshot` is
+  still populated, so an unchanged probe will not re-POST `/summary`
+  and the device sits on the splash. `GET /health` succeeds (so the
+  daemon doesn't drop the mDNS host) but its response — which carries
+  `uptime_s` and an empty `agents` object — is not yet inspected to
+  invalidate the cache. Fixing this is a daemon-side change (no
+  firmware change required) and is the natural next step.
+- **Staleness dimming (FR-4.9) is unanchored.** See FR-4.9.
+
 ---
 
 ## 6. Interface Specifications
@@ -452,6 +492,14 @@ needed to remove the stale paragraph.
   Payload Too Large` (> 16 KiB), `405 Method Not Allowed` (non-POST).
 - Idempotency: each request overwrites the previous snapshot for that
   `agent` key. The firmware keeps no history.
+- **Cadence (informational, daemon-side):** the daemon POSTs only
+  when `(agent, sessions)` differs from the last successful push;
+  unchanged probes are silent. See `docs/wire-format.md`.
+- **UI side-effect:** receipt of a snapshot updates the in-memory
+  store unconditionally. The display only swaps screens when the
+  splash was currently visible (the "first push" transition); a
+  push for an agent that isn't currently on screen lands silently
+  and is picked up by the next 1 Hz tick / rotation slot.
 
 #### 6.1.2 `GET /health` (daemon → firmware)
 
@@ -503,12 +551,12 @@ See FR-4. Sketch:
 │ [logo]       USAGE                  [batt]   │ ← header
 ├──────────────────────────────────────────────┤
 │ ╭──────────────────────────────────────────╮ │
-│ │ 5h                                   63% │ │ ← type · remaining
+│ │ current                              63% │ │ ← type · remaining
 │ │ █████████████████████████░░░░░░░░░░░░░░░ │ │ ← progress bar
 │ │ resets in 2h 12m                         │ │ ← countdown
 │ ╰──────────────────────────────────────────╯ │
 │ ╭──────────────────────────────────────────╮ │
-│ │ 7d                                   82% │ │
+│ │ weekly                               82% │ │
 │ │ █████████████████████████████████░░░░░░░ │ │
 │ │ resets in 4d 05h                         │ │
 │ ╰──────────────────────────────────────────╯ │
@@ -594,12 +642,19 @@ A successful flash + boot yields the "Setup mode — connect to
 
 ### 7.3 Normal Operation
 
-- The daemon discovers the device via mDNS and sends `POST /summary` on
-  every JSONL change plus a ~30 s keepalive.
+- The daemon discovers the device via mDNS. It probes each upstream
+  agent on its own cadence (`probe_interval`, default 120 s; the
+  `--probe-interval` CLI flag overrides every agent). After every probe
+  it compares the fresh `(agent, sessions)` to what the firmware last
+  successfully received and POSTs `/summary` only when they differ.
+- Between content changes the daemon GETs `/health` once per tick
+  (default 5 s) so a dead device is noticed and rediscovery is
+  triggered — without forcing a firmware repaint.
 - The device renders the latest per-agent snapshot continuously. The
-  countdown timer ticks locally — no traffic needed between pushes.
-- If no snapshot arrives within `2 × keepalive`, the UI dims to indicate
-  staleness (FR-4.9).
+  1 Hz LVGL tick refreshes bars + countdowns from the in-memory store
+  and rotates between agents (FR-4.10); no traffic is needed between
+  pushes.
+- Staleness dimming (FR-4.9) is currently unimplemented — see § 5.5.
 
 ### 7.4 Maintenance
 
@@ -686,7 +741,105 @@ A successful flash + boot yields the "Setup mode — connect to
 | AT-1       | 24 h soak                | Continuous pushes every 30 s with periodic WiFi flapping.                                              | No reboots; free heap drift < 5 %. |
 | AT-2       | Display swap              | Build with `mock_display` registered instead of the ST7789.                                            | Unit tests on host pass; rendering logic exercised without panel. (FR-5.3) |
 
-### 8.4 Traceability Matrix
+### 8.4 Live Verification Log
+
+Snapshot of what has been exercised on real hardware. Update on each
+bring-up. Use ✅ for verified, ⏳ for not yet run, ❌ for regressed.
+
+**Hardware:** CYD cyd2usb, STA MAC `d4:e9:f4:b2:f6:4c`, SoftAP MAC ends
+`f6:4d` → AP SSID `BURNSCOPE-F64D`, mDNS host `burnscope-f64c.local`.
+
+**Phase 2 first bring-up — 2026-05-18:**
+
+| Test          | Status | Notes |
+|---------------|:------:|-------|
+| AP-001        | ✅     | AP visible within ~1 s of cold boot. |
+| AP-003        | ✅     | SSID `BURNSCOPE-F64D` matches last 4 hex of SoftAP MAC. |
+| AP-005        | ✅     | Phone associated; portal flow completed (implies DHCP). |
+| CP-001        | ✅     | Portal HTML served on phone connect. |
+| CP-002        | ⏳     | Redirect handler registered; not directly exercised. |
+| CP-003        | ✅     | Form submission accepted creds. |
+| CP-006        | ✅     | After reboot the device joined STA without re-provisioning. |
+| TC-CP-100     | ✅     | Full first-boot path: blank NVS → portal → STA. |
+| TC-CP-102     | ⏳     | `/scan.json` endpoint present; UI listing not visually confirmed. |
+| NVS-001       | ✅     | Creds persisted in `burnscope_wifi` namespace. |
+| NVS-002       | ✅     | Survived a power-cycle (RTS reset). |
+| NVS-010       | ⏸     | NVS encryption deferred — see §10.4. |
+| NVS-012       | ✅     | Password absent from filtered serial log; only SSID logged. |
+| TC-NVS-100    | ✅     | Equivalent to NVS-001 + NVS-002. |
+| TC-NVS-102    | ⏳     | BOOT-button long-press path not yet exercised. |
+| TC-NVS-103    | ⏳     | `POST /factory-reset` path not yet exercised. |
+| TC-SUM-100    | ✅     | Smoke script — Claude push 204, panel repaints. |
+| TC-SUM-101    | ✅     | Codex push 204; `/health` returns both agents; UI cycles. |
+| TC-SUM-102    | ✅     | Codex labels (`primary`, `secondary`) render verbatim. |
+| TC-SUM-103    | ✅     | Bad JSON → 400. |
+| TC-SUM-104    | ✅     | `used_pct=1.5` → 400. |
+| TC-SUM-105    | ✅     | 20 KiB body → 413. |
+| TC-HEALTH-100 | ✅     | Shape OK, `agents.*.seconds_since_last_push` increments. |
+| TC-UI-100     | ✅     | Layout matches §6.1.6 sketch after a font/contrast polish pass. |
+| TC-UI-101     | ✅     | Countdown ticks once per second (after fixing the `s % 60` bug, see below). |
+| WIFI-001/003  | ✅     | STA join + auto-reconnect (re-validated during Phase 2). |
+| TC-MDNS-100   | ✅     | `burnscope-f64c.local` resolves; smoke script uses it. |
+| TC-NTP-100    | ⏳     | Implicit — countdowns now look sensible — but not explicitly timed. |
+| TC-WDT-100    | ⏳     | Hang-injection build not re-run for Phase 2. |
+
+**Bugs found and fixed during this bring-up:**
+
+1. **IDF auto-restored a stale `wifi_config_t`.** ESP-IDF's WiFi
+   subsystem persists its own copy of `wifi_config_t` in the
+   `nvs.net80211` namespace by default. On the first Phase-2 boot the
+   STA radio auto-associated with the SSID from the previous Phase-1
+   build even though our `burnscope_wifi` namespace was empty. This
+   also violated FR-6.1 (our NVS is the *only* persistent store of
+   credentials). Fix: call `esp_wifi_set_storage(WIFI_STORAGE_RAM)`
+   right after `esp_wifi_init`. Captured at `firmware/main/wifi.c`.
+
+2. **`WIFI_EVENT_STA_START` fired while in AP mode.** APSTA brings up
+   both interfaces; without a guard the STA handler emitted
+   `WIFI_STATE_CONNECTING` (overwriting the captive-portal splash) and
+   tried `esp_wifi_connect()` against an empty SSID. Guarded with
+   `s_ap_mode` in the same handler that already protected
+   `STA_DISCONNECTED`.
+
+3. **Countdown showed `…58m3515s`.** `format_countdown` printed the
+   minutes from `s / 60` but the seconds field used the raw
+   post-hour-modulo `s` instead of `s % 60`. One-character fix in
+   `firmware/main/displays/cyd2usb_st7789/ui.c`.
+
+4. **Splash text overflowed the panel.** The status label was using
+   `lv_obj_center` with no width cap; the literal
+   `"Setup mode — connect to BURNSCOPE-XXXX"` extended past the 320 px
+   panel. Fix: `LV_LABEL_LONG_WRAP` + explicit 300 px width +
+   `LV_TEXT_ALIGN_CENTER`. The placeholder string was also replaced
+   with the *real* SSID computed in `provisioning_start`, with an
+   added "Open 192.168.4.1" hint for users whose phone OS doesn't
+   auto-launch the captive portal.
+
+5. **No Latin serif in stock LVGL 9.5.** A-3 in this FSD assumed
+   Roboto Mono. We instead baked Apple **NewYork** at 22 px via
+   `lv_font_conv` from `/System/Library/Fonts/NewYork.ttf` (ASCII
+   printable range only, ~63 KB). Source lives at
+   `firmware/main/fonts/lv_font_newyork_22.c`. A-3 should be considered
+   superseded by this concrete choice on the cyd2usb profile.
+
+**Deviations from the FSD recorded during Phase 2 build-out:**
+
+- **cJSON is not in ESP-IDF v6.** The schema is small and regular, so
+  `POST /summary` parses inline (~150 lines, no allocations beyond the
+  request body) rather than pulling in a third-party managed
+  component. The wire-format contract is unchanged.
+
+- **Display abstraction is realised at build time, not runtime.** FSD
+  FR-5 specified a runtime `display_t` virtual interface. The
+  implementation instead bundles the panel driver and the UI layout
+  into a Kconfig-selected profile under
+  `firmware/main/displays/<name>/`. UI layout is geometry-bound, so
+  one driver-plus-layout unit per screen reads more honestly than a
+  runtime polymorphism. The `mock_display` profile envisioned by FR-5.3
+  is still possible — it would simply be another build-time profile —
+  but is deferred to Phase 3 along with the host-side tests.
+
+### 8.5 Traceability Matrix
 
 | Requirement | Priority | Test Case(s)                              | Status  |
 |-------------|----------|-------------------------------------------|---------|
@@ -793,8 +946,8 @@ Source: `firmware/main/main.c`.
   "agent": "claude",
   "captured_at": 1779050146,
   "sessions": [
-    { "type": "5h", "used_pct": 0.03, "resets_at": 1779066600 },
-    { "type": "7d", "used_pct": 0.09, "resets_at": 1779156000 }
+    { "type": "current", "used_pct": 0.03, "resets_at": 1779066600 },
+    { "type": "weekly", "used_pct": 0.09, "resets_at": 1779156000 }
   ]
 }
 ```

@@ -14,13 +14,13 @@ The wire format (`docs/wire-format.md`) is the daemon ↔ firmware contract — 
 The Python daemon supports multiple upstream agents (Claude Code, Codex CLI, ...) running concurrently. The key modules:
 
 - `client/src/burnscope_client/schema.py` — `SessionSnapshot` and `AgentSnapshot` (frozen dataclasses). Agent-agnostic; matches `docs/wire-format.md`.
-- `client/src/burnscope_client/agent.py` — `Agent` ABC. Every supported provider is a subclass. Defines `name`, `probe()`, `load_credential()`, and a default `try_create()` for the CLI's auto-detect path.
+- `client/src/burnscope_client/agent.py` — `Agent` ABC. Every supported provider is a subclass. Defines `name`, `probe_interval` (class attr, seconds), `probe()`, `load_credential()`, and a default `try_create()` for the CLI's auto-detect path.
 - `client/src/burnscope_client/credentials.py` — `CredentialsError` plus the `Credential` ABC. The base class provides the shared *reading capabilities* (`_read_keychain`, `_read_file`, `_parse_json`) that every `*Credential` subclass composes in its own `load()`.
 - `client/src/burnscope_client/agents/` — one module per provider. Each module owns:
   - a frozen `<Name>Credential(Credential)` dataclass with its `load()` classmethod,
   - a `<Name>Agent(Agent)` subclass whose class attributes name where the credential lives (`KEYCHAIN_SERVICE`, `CREDENTIALS_PATH`), and whose `probe()` normalises the upstream scale to `0.0`-`1.0`.
-- `client/src/burnscope_client/daemon.py` — `DaemonConfig` takes `agents: list[Agent]`; the loop probes each agent on an independent cadence, isolates per-agent failures, and pushes one `AgentSnapshot` per agent per cycle.
-- `client/src/burnscope_client/cli.py` — `--agent` flag (repeatable). When absent, every agent whose credentials load is included.
+- `client/src/burnscope_client/daemon.py` — `DaemonConfig` takes `agents: list[Agent]`; each loop iteration resolves the per-agent cadence (`DaemonConfig.probe_interval` is an optional global override, otherwise the agent's own `probe_interval` class attr wins), isolates per-agent failures, and pushes one `AgentSnapshot` per agent per cycle.
+- `client/src/burnscope_client/cli.py` — `--agent` flag (repeatable). When absent, every agent whose credentials load is included. `--probe-interval` is an optional global cadence override applied to every agent.
 
 To add an agent: subclass `Credential` for the auth blob, subclass `Agent` for the probe, register it in `cli.py`'s `_AGENT_CLASSES`. See `agents/claude.py` and `agents/codex.py` for templates and the README's "Adding a new agent" section for the checklist.
 

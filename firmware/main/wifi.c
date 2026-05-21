@@ -1,9 +1,10 @@
 /*
- * WiFi STA with exponential-backoff reconnect.
+ * WiFi: STA from runtime-supplied creds, or open AP for the captive-portal
+ * provisioning flow. Exponential-backoff STA reconnect preserved from
+ * Phase 1.
  *
- * Phase 1 only — credentials are compile-time. TODO(phase2): swap for
- * NVS-backed creds and add AP-fallback after N consecutive auth failures
- * (FR-1.6).
+ * AP-mode fallback after N consecutive STA auth failures (FR-1.6, FSD
+ * EC-CP-200) is Phase 3 — not implemented here.
  */
 
 #include "wifi.h"
@@ -16,17 +17,16 @@
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
-#include "nvs_flash.h"
-
-#include "wifi_creds.h"
 
 static const char *TAG = "wifi";
 
 static wifi_state_cb_t s_state_cb = NULL;
 static esp_netif_t    *s_sta_netif = NULL;
+static esp_netif_t    *s_ap_netif  = NULL;
 static TimerHandle_t   s_reconnect_timer = NULL;
 static int             s_backoff_s = 1;
 static bool            s_had_ip = false;
+static bool            s_ap_mode = false;
 
 static void notify(wifi_state_t state)
 {
@@ -72,17 +72,31 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
     if (base == WIFI_EVENT) {
         switch (id) {
         case WIFI_EVENT_STA_START:
-            ESP_LOGI(TAG, "STA start; connecting to SSID '%s'", BURNSCOPE_WIFI_SSID);
+            if (s_ap_mode) {
+                /* APSTA is active only so the captive portal can scan;
+                 * the STA radio must not auto-associate. */
+                break;
+            }
+            ESP_LOGI(TAG, "STA start");
             notify(WIFI_STATE_CONNECTING);
             ESP_ERROR_CHECK(esp_wifi_connect());
             break;
         case WIFI_EVENT_STA_CONNECTED:
+            if (s_ap_mode) break;
             ESP_LOGI(TAG, "STA connected (awaiting IP)");
             break;
         case WIFI_EVENT_STA_DISCONNECTED:
+            if (s_ap_mode) {
+                /* During the AP scan we briefly enter APSTA — ignore. */
+                break;
+            }
             ESP_LOGW(TAG, "STA disconnected; scheduling reconnect in %ds", s_backoff_s);
             notify(s_had_ip ? WIFI_STATE_RECONNECTING : WIFI_STATE_DISCONNECTED);
             schedule_reconnect();
+            break;
+        case WIFI_EVENT_AP_START:
+            ESP_LOGI(TAG, "AP started");
+            notify(WIFI_STATE_AP_MODE);
             break;
         default:
             break;
@@ -98,35 +112,37 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
     }
 }
 
-esp_netif_t *wifi_init(void)
+void wifi_init(void)
 {
+    static bool inited = false;
+    if (inited) {
+        return;
+    }
+
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    s_sta_netif = esp_netif_create_default_wifi_sta();
-    assert(s_sta_netif != NULL);
-
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    /* Keep esp_wifi's own config in RAM. Otherwise IDF silently caches
+     * the last `wifi_config_t` in its `nvs.net80211` namespace and the
+     * STA radio auto-reconnects to a stale SSID on the next boot — which
+     * both bypasses our captive-portal flow and violates FR-6.1
+     * ("WiFi creds shall be the only values persisted to NVS"). Our
+     * `burnscope_wifi` namespace is the only persistent store. */
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
 
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL, NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL, NULL));
 
-    wifi_config_t wcfg = { 0 };
-    strncpy((char *)wcfg.sta.ssid, BURNSCOPE_WIFI_SSID, sizeof(wcfg.sta.ssid) - 1);
-    strncpy((char *)wcfg.sta.password, BURNSCOPE_WIFI_PASSWORD, sizeof(wcfg.sta.password) - 1);
-    wcfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wcfg));
-
     s_reconnect_timer = xTimerCreate("wifi_rc", pdMS_TO_TICKS(1000),
                                      pdFALSE, NULL, reconnect_timer_cb);
-    assert(s_reconnect_timer != NULL);
+    configASSERT(s_reconnect_timer != NULL);
 
-    return s_sta_netif;
+    inited = true;
 }
 
 void wifi_register_state_cb(wifi_state_cb_t cb)
@@ -134,7 +150,50 @@ void wifi_register_state_cb(wifi_state_cb_t cb)
     s_state_cb = cb;
 }
 
-void wifi_start(void)
+void wifi_start_sta(const wifi_creds_t *creds)
 {
+    configASSERT(creds != NULL);
+
+    if (s_sta_netif == NULL) {
+        s_sta_netif = esp_netif_create_default_wifi_sta();
+        configASSERT(s_sta_netif != NULL);
+    }
+
+    wifi_config_t wcfg = { 0 };
+    strncpy((char *)wcfg.sta.ssid, creds->ssid, sizeof(wcfg.sta.ssid) - 1);
+    strncpy((char *)wcfg.sta.password, creds->password, sizeof(wcfg.sta.password) - 1);
+    wcfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wcfg));
+
+    /* FR-6.2: log SSID only, never the password. */
+    ESP_LOGI(TAG, "connecting STA to SSID '%s'", creds->ssid);
+    ESP_ERROR_CHECK(esp_wifi_start());
+}
+
+void wifi_start_ap(const char *ssid)
+{
+    configASSERT(ssid != NULL && ssid[0] != '\0');
+
+    if (s_ap_netif == NULL) {
+        s_ap_netif = esp_netif_create_default_wifi_ap();
+        configASSERT(s_ap_netif != NULL);
+    }
+
+    wifi_config_t wcfg = { 0 };
+    strncpy((char *)wcfg.ap.ssid, ssid, sizeof(wcfg.ap.ssid) - 1);
+    wcfg.ap.ssid_len = strlen((char *)wcfg.ap.ssid);
+    wcfg.ap.channel = 1;
+    wcfg.ap.authmode = WIFI_AUTH_OPEN;
+    wcfg.ap.max_connection = 4;
+    wcfg.ap.beacon_interval = 100;
+
+    /* APSTA so we can also run scans for the captive portal's network
+     * picker (TC-CP-102). */
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wcfg));
+    ESP_LOGI(TAG, "starting AP '%s' (open, ch %d)", ssid, wcfg.ap.channel);
+    s_ap_mode = true;
     ESP_ERROR_CHECK(esp_wifi_start());
 }

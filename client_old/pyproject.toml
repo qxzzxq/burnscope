@@ -1,16 +1,15 @@
 [project]
 name = "burnscope-client"
-version = "0.2.0"
-description = "BurnScope client: per-fire Claude statusline + long-lived Codex app-server daemon, pushing snapshots to an ESP32."
+version = "0.1.0"
+description = "BurnScope daemon: tails Claude Code sessions and pushes usage snapshots to an ESP32 display."
 requires-python = ">=3.11"
 dependencies = [
   "httpx>=0.27",
   "zeroconf>=0.130",
-  "keyring>=24",
 ]
 
 [project.scripts]
-burnscope = "burnscope_client.cli:main"
+burnscope-client = "burnscope_client.cli:main"
 
 [dependency-groups]
 dev = [

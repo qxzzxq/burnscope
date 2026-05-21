@@ -270,6 +270,80 @@ async def test_bootstrap_sends_initialize_then_account_then_ratelimits():
     assert {s.type for s in queued.sessions} == {"primary", "secondary"}
 
 
+async def test_run_once_drives_reader_concurrently_with_bootstrap(monkeypatch):
+    """Regression: _run_once must run the reader alongside bootstrap.
+
+    If the reader only starts after bootstrap completes, the initialize
+    request's response is never read and the future times out — which is
+    exactly what bit the live daemon ("initialize timed out").
+
+    This test fails on the buggy ordering because bootstrap blocks on the
+    initialize future, the reader never runs, and `_run_once` raises
+    `initialize timed out` instead of advancing to EOF.
+    """
+    # Tight timeout so the test fails fast on regression instead of waiting 30s.
+    monkeypatch.setattr(codex_daemon, "REQUEST_TIMEOUT_S", 1.0)
+
+    daemon = CodexDaemon()
+    stdout = _FakeStream()
+    stdin = _FakeStdin()
+    proc = _FakeProc(stdout, stdin)
+
+    async def fake_spawn() -> None:
+        daemon._proc = proc  # type: ignore[assignment]
+
+    async def noop_loop() -> None:
+        # Park forever — gather() will cancel us when the reader EOFs.
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(daemon, "_spawn", fake_spawn)
+    monkeypatch.setattr(daemon, "_pusher_loop", noop_loop)
+    monkeypatch.setattr(daemon, "_health_loop", noop_loop)
+
+    async def feed_responses() -> None:
+        await _wait_for_method(stdin, "initialize")
+        stdout.feed_line({"id": stdin.lines[-1]["id"], "result": {"userAgent": "t"}})
+        await _wait_for_method(stdin, "account/read")
+        stdout.feed_line(
+            {
+                "id": stdin.lines[-1]["id"],
+                "result": {"account": {"email": "u@example.com"}},
+            }
+        )
+        await _wait_for_method(stdin, "account/rateLimits/read")
+        stdout.feed_line(
+            {
+                "id": stdin.lines[-1]["id"],
+                "result": {
+                    "rateLimits": {
+                        "primary": {
+                            "usedPercent": 10,
+                            "windowDurationMins": 300,
+                            "resetsAt": 1779066600,
+                        }
+                    }
+                },
+            }
+        )
+        # Bootstrap is now done. End the connection so _run_once unwinds.
+        stdout.feed_eof()
+
+    feeder = asyncio.create_task(feed_responses())
+    try:
+        with pytest.raises(codex_daemon.CodexProtocolError) as ei:
+            await daemon._run_once()
+        # The expected failure is the reader hitting EOF, NOT a bootstrap
+        # timeout — that's the whole point of this regression test.
+        assert "EOF" in str(ei.value)
+    finally:
+        if not feeder.done():
+            feeder.cancel()
+            with pytest.raises(BaseException):
+                await feeder
+
+    assert daemon._client_id == "u@example.com"
+
+
 async def test_rate_limits_updated_notification_enqueues_push():
     daemon = CodexDaemon()
     daemon._client_id = "x" * 64

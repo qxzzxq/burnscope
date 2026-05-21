@@ -111,15 +111,23 @@ class CodexDaemon:
     async def _run_once(self) -> None:
         await self._spawn()
         try:
-            await self._bootstrap()
+            # Reader must run concurrently with bootstrap — initialize's
+            # response is read off stdout, so without the reader the future
+            # never resolves and we hit REQUEST_TIMEOUT_S.
             await asyncio.gather(
                 self._reader_loop(),
-                self._pusher_loop(),
-                self._health_loop(),
+                self._bootstrap_then_workers(),
             )
         finally:
             self._fail_pending(CodexProtocolError("app-server connection ended"))
             await self._terminate()
+
+    async def _bootstrap_then_workers(self) -> None:
+        await self._bootstrap()
+        await asyncio.gather(
+            self._pusher_loop(),
+            self._health_loop(),
+        )
 
     # ----------------------------------------------------------- subprocess
 

@@ -37,6 +37,52 @@ SYSTEMD_UNIT_PATH = (
     Path.home() / ".config" / "systemd" / "user" / SYSTEMD_UNIT_NAME
 )
 
+# launchd and systemd-user start processes with a minimal PATH that excludes
+# Homebrew, ~/.cargo/bin, ~/.local/bin, etc. — so the daemon can't exec
+# `codex` even if it's on the user's shell PATH. We bake a PATH into the
+# supervisor unit at install time: the dir of whatever `codex` resolves to
+# now, plus OS-appropriate fallbacks.
+_PATH_FALLBACKS_DARWIN = (
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+)
+_PATH_FALLBACKS_LINUX = (
+    str(Path.home() / ".local" / "bin"),
+    str(Path.home() / ".cargo" / "bin"),
+    str(Path.home() / ".npm-global" / "bin"),
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/local/sbin",
+    "/usr/sbin",
+    "/sbin",
+)
+
+
+def _supervisor_path() -> str:
+    """Return the PATH to bake into the launchd/systemd unit.
+
+    Prepends the directory of `codex` (if found on the current PATH) to the
+    OS-appropriate fallback list, with duplicates removed.
+    """
+    fallbacks = (
+        _PATH_FALLBACKS_LINUX
+        if sys.platform.startswith("linux")
+        else _PATH_FALLBACKS_DARWIN
+    )
+    codex_path = shutil.which("codex")
+    parts: list[str] = []
+    if codex_path:
+        parts.append(str(Path(codex_path).parent))
+    for p in fallbacks:
+        if p not in parts:
+            parts.append(p)
+    return ":".join(parts)
+
 
 # ============================================================ argparse setup
 
@@ -172,6 +218,11 @@ def _render_launchd_plist() -> str:
     <key>ProgramArguments</key>
     <array>{program_args}
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{_supervisor_path()}</string>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -224,6 +275,7 @@ Description=BurnScope Codex daemon
 After=default.target
 
 [Service]
+Environment=PATH={_supervisor_path()}
 ExecStart={sys.executable} -m burnscope_client.codex_daemon
 Restart=always
 RestartSec=5

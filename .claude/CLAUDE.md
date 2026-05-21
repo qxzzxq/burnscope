@@ -4,7 +4,7 @@ An always-on token & quota meter for your AI coding agents.
 
 This repo has two components:
 
-- `client/` — Python 3.11+ client. Two collectors with asymmetric lifecycles (see below). v1 is preserved at `client_old/` for reference.
+- `client/` — Python 3.11+ client. Two collectors with asymmetric lifecycles (see below).
 - `firmware/` — ESP32 firmware (ESP-IDF, Cheap Yellow Display).
 
 The wire format (`docs/wire-format.md`) is the daemon ↔ firmware contract — agent-agnostic, hand-mirrored in both languages.

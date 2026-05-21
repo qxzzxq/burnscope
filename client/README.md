@@ -9,8 +9,8 @@ agent-native, zero-cost sources:
 - **Codex** — `codex app-server` JSON-RPC subprocess (`codex_daemon.py`,
   long-lived).
 
-See `docs/client-spec-v2.html` for the full specification. The v1 client is
-preserved at `../client_old/` for reference.
+See `docs/client-spec-v2.html` for the full specification. The v1 client
+was removed; its history is preserved in git.
 
 ## Install
 

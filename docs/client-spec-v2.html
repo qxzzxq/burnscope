@@ -212,7 +212,7 @@
   <tr><th>v2</th><th>Purpose</th></tr>
   <tr><td class="mono">claude_statusline.py</td><td>Statusline-hook entry point. Short-lived, fires per event.</td></tr>
   <tr><td class="mono">codex_daemon.py</td><td>Long-lived process owning the <code>codex app-server</code> subprocess.</td></tr>
-  <tr><td class="mono">identity.py</td><td>Derives the per-agent <code>client_id</code> hash for TOFU pairing.</td></tr>
+  <tr><td class="mono">identity.py</td><td>Returns Claude's plaintext identifier (<code>oauthAccount.emailAddress</code> from <code>~/.claude.json</code>, or <code>userID</code> fallback) for the <code>X-BurnScope-Client-Id</code> header.</td></tr>
   <tr><td class="mono">host_cache.py</td><td>Atomic file-backed cache of the discovered ESP32 host.</td></tr>
 </table>
 
@@ -237,7 +237,7 @@ flowchart LR
 
     subgraph ClaudePath["Claude collector"]
       direction LR
-      creds[("Claude credentials<br/>OS keyring<br/>or ~/.claude/<br/>.credentials.json")]
+      creds[("~/.claude.json<br/>oauthAccount.emailAddress<br/>or userID fallback")]
       cc["Claude Code<br/>(active session)"]
       hook["claude_statusline.py<br/>(per-fire)"]
       bgpush["detached push child"]
@@ -257,24 +257,24 @@ flowchart LR
     end
   end
 
-  esp32[("ESP32<br/>POST /summary · GET /health<br/>NVS: paired client_id per agent")]
+  esp32[("ESP32<br/>POST /summary · GET /health<br/>NVS: paired identifier per agent<br/>(displayed on screen)")]
 
   %% Claude wiring
   cc -- "stdin JSON" --> hook
   hook -- "stdout statusline" --> cc
-  creds -. "organizationUuid" .-> hook
+  creds -. "emailAddress / userID" .-> hook
   lpclaude -. "previous outcome" .-> hook
   hook -- "spawn" --> bgpush
   bgpush --> host
   bgpush --> lpclaude
-  bgpush -. "POST<br/>X-BurnScope-Client-Id<br/>(hash organizationUuid)" .-> esp32
+  bgpush -. "POST<br/>X-BurnScope-Client-Id<br/>(plaintext email / userID)" .-> esp32
 
   %% Codex wiring
   cas -- "stdout notifications" --> codexd
   codexd -- "stdin JSON-RPC" --> cas
   codexd --> host
   codexd --> lpcodex
-  codexd -. "POST<br/>X-BurnScope-Client-Id<br/>(hash email)" .-> esp32
+  codexd -. "POST<br/>X-BurnScope-Client-Id<br/>(plaintext email)" .-> esp32
 </pre>
 </div>
 
@@ -288,60 +288,58 @@ flowchart LR
 <h2 id="identity">3. Identity &amp; pairing</h2>
 
 <p>
-  v2 adds per-agent TOFU (trust-on-first-use) pairing: each agent's
-  collector independently derives a stable identity hash from the local
-  credential material that agent already authenticates with, sends it on
-  every request, and the ESP32 binds the first one it sees per agent into
-  NVS-persistent state. The user does nothing.
+  v2 adds per-agent TOFU (trust-on-first-use) pairing: each collector
+  reads a stable, human-readable identifier from local state that the
+  agent already maintains, sends it <strong>plaintext</strong> on every
+  request, and the ESP32 binds the first one it sees per agent into NVS.
+  No hashing — the value is also the on-screen owner label rendered by
+  the device. The user does nothing.
 </p>
 
 <h4>Source identifiers</h4>
 
 <table>
-  <tr><th>Agent</th><th>Source</th><th>Field</th><th>Stable?</th></tr>
+  <tr><th>Agent</th><th>File</th><th>Field</th><th>Fallback</th></tr>
   <tr>
     <td>Claude</td>
-    <td class="mono">OS keyring (<code>Claude Code-credentials</code>), or fallback file <code>~/.claude/.credentials.json</code></td>
-    <td class="mono">organizationUuid</td>
-    <td>Yes — UUID per Claude org</td>
+    <td class="mono">~/.claude.json</td>
+    <td class="mono">oauthAccount.emailAddress</td>
+    <td class="mono">userID (top-level, 64-char string)</td>
   </tr>
   <tr>
     <td>Codex</td>
     <td class="mono">codex app-server: <code>account/read</code></td>
     <td class="mono">account.email</td>
-    <td>Yes — stable until user changes ChatGPT email</td>
+    <td>none — daemon raises and reconnects</td>
   </tr>
 </table>
 
 <p>
-  The Claude resolver is OS-agnostic. On macOS it pulls from Keychain, on
-  Linux it pulls from the Secret Service API (gnome-keyring, KWallet,
-  KeePassXC, etc.) via <code>libsecret</code>. If neither yields the
-  credential, the resolver falls back to the plaintext file
-  <code>~/.claude/.credentials.json</code>, which Claude Code writes when
-  no keyring is available. Codex credentials are file-based on every
-  platform, so no OS branching is needed.
+  No OS keyring access, so no Keychain prompts on macOS and no
+  <code>libsecret</code> / Secret Service dependency on Linux. Both
+  sources are written by the upstream agent during normal sign-in and
+  read by us with a plain file/IPC read.
 </p>
 
-<h4>Hashing</h4>
-
-<pre><code>def client_id(agent: str, raw: str) -&gt; str:
-    return sha256(f"burnscope:{agent}:{raw}".encode()).hexdigest()</code></pre>
+<h4>Value semantics</h4>
 
 <p>
-  Namespace prefix (<code>"burnscope:"</code>) prevents accidental
-  collisions with hashes used elsewhere. Lower-cased agent name keeps
-  the hash deterministic.
+  The identifier is a printable ASCII string ≤ 254 bytes
+  (RFC 5321 mailbox cap). The collector does no normalization beyond
+  stripping leading/trailing whitespace — what the upstream agent
+  wrote is what the ESP32 receives and stores. No hashing means the
+  ESP32 can render the value verbatim on the owner row of each agent's
+  display panel.
 </p>
 
 <h4>Pairing semantics</h4>
 
 <ol>
   <li>ESP32 reads <code>nvs::client_id[agent]</code> at boot.</li>
-  <li>Incoming request includes <code>X-BurnScope-Client-Id: &lt;hash&gt;</code>:
+  <li>Incoming request includes <code>X-BurnScope-Client-Id: &lt;identifier&gt;</code>:
     <ul>
       <li>NVS empty for this <code>agent</code> → accept, persist the
-          incoming hash.</li>
+          incoming identifier.</li>
       <li>NVS matches → accept.</li>
       <li>NVS mismatch → <code>401 Unauthorized</code>.</li>
     </ul>
@@ -355,11 +353,12 @@ flowchart LR
 
 <table>
   <tr><th>Scenario</th><th>Behavior</th></tr>
-  <tr><td>Same user, two laptops, both Claude</td><td>Both derive <code>hash(organizationUuid)</code> → identical → both accepted. ✓</td></tr>
-  <tr><td>Same user, two laptops, both Codex</td><td>Both derive <code>hash(email)</code> → identical → both accepted. ✓</td></tr>
+  <tr><td>Same user, two laptops, both Claude</td><td>Both read the same <code>oauthAccount.emailAddress</code> → identical → both accepted. ✓</td></tr>
+  <tr><td>Same user, two laptops, both Codex</td><td>Both read the same <code>account.email</code> → identical → both accepted. ✓</td></tr>
   <tr><td>Same user, Claude on one laptop and Codex on another</td><td>Per-agent slots claimed independently. ESP32 shows both. ✓</td></tr>
-  <tr><td>Two users on same LAN, each own ESP32</td><td>Different identifiers → different hashes → each ESP32 only accepts its owner. ✓</td></tr>
+  <tr><td>Two users on same LAN, each own ESP32</td><td>Different emails → each ESP32 only accepts its owner. ✓</td></tr>
   <tr><td>First-run race attack</td><td>Same TOFU surface as bare TOFU. Mitigation: pair while ESP32 is on your bench before exposing to LAN.</td></tr>
+  <tr><td>PII on the LAN</td><td>The identifier (your email) is transmitted plaintext over your local network. Accepted trade-off in exchange for a human-readable label on the display.</td></tr>
 </table>
 
 <!-- =============================================================== -->
@@ -373,15 +372,16 @@ flowchart LR
 <h4>4.1 <code>X-BurnScope-Client-Id</code> header</h4>
 
 <p>
-  Optional. SHA-256 hex of an agent-stable identifier (see
-  <a href="#identity">§3</a>). Sent on <code>POST /summary</code> and
-  <code>GET /health</code>. Server enforcement is per-agent TOFU:
+  Plaintext per-agent identifier (see <a href="#identity">§3</a>) — no
+  hashing. Sent on <code>POST /summary</code> and <code>GET /health</code>.
+  Value rules: printable ASCII, no control characters, ≤ 254 bytes.
+  Server enforcement (Phase-2 firmware) is per-agent TOFU:
 </p>
 
 <ul>
-  <li>If NVS has no stored hash for the incoming request's
+  <li>If NVS has no stored identifier for the incoming request's
       <code>agent</code> → accept, persist.</li>
-  <li>If NVS hash matches → accept.</li>
+  <li>If NVS matches → accept.</li>
   <li>If mismatch → <code>401 Unauthorized</code> (no state change).</li>
   <li>If header absent → accepted only if NVS is empty for that agent
       (legacy-client compatibility window). Once any TOFU-paired client
@@ -434,26 +434,31 @@ flowchart LR
   <span class="path">client/src/burnscope_client/identity.py</span>
 </div>
 
-<p>Pure module. No I/O state beyond reading the relevant credential source.</p>
+<p>Pure module. Reads <code>~/.claude.json</code> only.</p>
 
 <table>
   <tr><th>Symbol</th><th>Signature</th><th>Description</th></tr>
   <tr>
-    <td class="mono">client_id_for_agent</td>
-    <td><code>(agent: str, raw_identifier: str) → str</code></td>
-    <td>SHA-256 hex of <code>burnscope:{agent}:{raw_identifier}</code>.</td>
+    <td class="mono">claude_user_identifier</td>
+    <td><code>() → str</code></td>
+    <td>Returns Claude's plaintext identifier. Resolution: <code>oauthAccount.emailAddress</code> from <code>~/.claude.json</code>; falls back to top-level <code>userID</code> when emailAddress is missing or empty. Raises <code>IdentityError</code> when both are absent or the file is missing/malformed.</td>
   </tr>
   <tr>
-    <td class="mono">claude_org_uuid</td>
-    <td><code>() → str</code></td>
-    <td>Returns Claude's <code>organizationUuid</code> using an OS-agnostic resolver: first the system keyring via the <code>keyring</code> library (Keychain on macOS, Secret Service on Linux), then a fallback to the plaintext file <code>~/.claude/.credentials.json</code>. Raises <code>IdentityError</code> if every source fails or the JSON lacks the field.</td>
+    <td class="mono">CLAUDE_SETTINGS_FILE</td>
+    <td><code>Path</code></td>
+    <td>Module-level <code>Path.home() / ".claude.json"</code>. Tests monkeypatch this.</td>
   </tr>
   <tr>
     <td class="mono">IdentityError</td>
     <td><em>(exception)</em></td>
-    <td>Raised when the required credential source is missing or malformed.</td>
+    <td>Raised when the settings file is missing, isn't a JSON object, or has no usable identifier field.</td>
   </tr>
 </table>
+
+<p>
+  No hashing function. The identifier travels plaintext on the wire so
+  the ESP32 can render it (see <a href="#identity">§3</a>).
+</p>
 
 <p>
   The Codex equivalent (extracting email from <code>account/read</code>) lives
@@ -591,7 +596,7 @@ flowchart LR
 
 <p>
   Bootstrap sequence: <code>initialize</code> → <code>account/read</code>
-  (derives identity hash) → <code>account/rateLimits/read</code>
+  (caches <code>email</code> as the plaintext client_id) → <code>account/rateLimits/read</code>
   (initial snapshot) → enter reader loop.
 </p>
 
@@ -673,8 +678,12 @@ flowchart LR
   <li><strong>(Child) Resolve host</strong> via
       <code>host_cache.load()</code>; on cache miss run mDNS,
       <code>host_cache.store()</code> the result.</li>
-  <li><strong>(Child) Derive client_id</strong> via
-      <code>identity.client_id_for_agent("claude", identity.claude_org_uuid())</code>.</li>
+  <li><strong>(Child) Resolve client_id</strong> from
+      <code>host_cache.read_client_id("claude")</code>; on cache miss, call
+      <code>identity.claude_user_identifier()</code> (reads
+      <code>~/.claude.json</code>) and persist via
+      <code>host_cache.write_client_id("claude", id)</code>. The value
+      goes plaintext into the <code>X-BurnScope-Client-Id</code> header.</li>
   <li><strong>(Child) POST /summary</strong> with the header. On
       success: <code>write_push_state("claude", ok=True)</code>. On
       transport failure: <code>invalidate_host()</code> then
@@ -700,7 +709,9 @@ flowchart LR
   <li>Spawn <code>codex app-server</code>, attach to its stdio.</li>
   <li>Send <code>initialize</code>; await response.</li>
   <li>Send <code>account/read</code>; cache
-      <code>client_id = hash(email)</code> for the daemon lifetime.</li>
+      <code>client_id = account.email</code> (plaintext) for the daemon
+      lifetime and persist via
+      <code>host_cache.write_client_id("codex", email)</code>.</li>
   <li>Send <code>account/rateLimits/read</code> for the initial snapshot;
       enqueue a push.</li>
   <li>Start the reader, pusher, and health coroutines.</li>
@@ -769,15 +780,16 @@ burnscope status           # confirm wiring</code></pre>
 <p>
   No credential setup at install time. No token to copy. No flashing the
   ESP32 with a secret. First push pairs the ESP32 to the laptop's
-  derived identity; subsequent pushes from the same account on other
-  laptops (or on the same laptop on a different OS) are accepted because
-  they derive the same hash from the same upstream account.
+  identifier (Claude's account email or userID; Codex's account email);
+  subsequent pushes from the same account on any laptop are accepted
+  because each collector reads the same field from the same upstream
+  source.
 </p>
 
 <table>
   <tr><th>Concern</th><th>macOS</th><th>Linux</th></tr>
-  <tr><td>Claude credential location</td><td>Keychain service <code>Claude Code-credentials</code></td><td>Secret Service via <code>libsecret</code>; fallback to <code>~/.claude/.credentials.json</code></td></tr>
-  <tr><td>Codex credential location</td><td><code>~/.codex/auth.json</code> (file-based — uniform)</td><td><code>~/.codex/auth.json</code> (file-based — uniform)</td></tr>
+  <tr><td>Claude identifier source</td><td colspan="2"><code>~/.claude.json</code> (OS-agnostic; no keyring access)</td></tr>
+  <tr><td>Codex identifier source</td><td colspan="2"><code>codex app-server</code> JSON-RPC: <code>account/read</code> → <code>account.email</code></td></tr>
   <tr><td>State directory</td><td><code>~/.burnscope/</code></td><td><code>~/.burnscope/</code></td></tr>
   <tr><td>Codex daemon supervisor</td><td>launchd user agent</td><td>systemd <code>--user</code> unit</td></tr>
   <tr><td>mDNS resolver</td><td>Bonjour (built-in)</td><td>Avahi (typically installed; <code>zeroconf</code> Python library handles both)</td></tr>
@@ -790,27 +802,27 @@ burnscope status           # confirm wiring</code></pre>
   <tr><th>Module</th><th>What to test</th></tr>
   <tr>
     <td class="mono">identity.py</td>
-    <td>Deterministic hash output for fixed inputs. Resolver tries keyring first, falls back to file. <code>IdentityError</code> only when both fail. Tests must cover macOS and Linux keyring paths (via <code>keyring</code> library mocks).</td>
+    <td>Prefers <code>oauthAccount.emailAddress</code>; falls back to top-level <code>userID</code> when emailAddress is missing or empty. <code>IdentityError</code> when both are absent, the file is missing, the JSON is unparseable, or the root isn't an object. Tests monkeypatch <code>CLAUDE_SETTINGS_FILE</code> to a <code>tmp_path</code> fixture.</td>
   </tr>
   <tr>
     <td class="mono">host_cache.py</td>
-    <td>Atomic write under concurrent <code>store_host()</code> calls. <code>load_host()</code> returns <code>None</code> for missing/empty/garbage files. <code>invalidate_host()</code> is idempotent. <code>write_push_state</code> / <code>read_push_state</code> round-trip per agent without cross-contamination.</td>
+    <td>Atomic write under concurrent <code>store_host()</code> calls. <code>load_host()</code> returns <code>None</code> for missing/empty/garbage files. <code>invalidate_host()</code> is idempotent. <code>write_push_state</code> / <code>read_push_state</code> round-trip per agent without cross-contamination. <code>read_client_id</code> rejects empty, overlong (&gt; 254 chars), and control-character payloads but accepts arbitrary printable ASCII (email or userID).</td>
   </tr>
   <tr>
     <td class="mono">pusher.py</td>
-    <td>Header is on every request. <code>401</code> raises a distinct subclass. Transport errors raise the generic <code>PushError</code>.</td>
+    <td>Header is on every request and carries the plaintext identifier verbatim. <code>401</code> raises a distinct subclass. Transport errors raise the generic <code>PushError</code>.</td>
   </tr>
   <tr>
     <td class="mono">claude_statusline.py</td>
-    <td>End-to-end with mocked stdin: statusline output format, push child spawned with correct args, indicator file read for previous state. <code>rate_limits</code>-absent path doesn't push.</td>
+    <td>End-to-end with mocked stdin: statusline output format, push child spawned with correct args, indicator file read for previous state. <code>rate_limits</code>-absent path doesn't push. <code>--push</code> mode hits the client_id cache and only re-reads <code>~/.claude.json</code> on miss.</td>
   </tr>
   <tr>
     <td class="mono">codex_daemon.py</td>
-    <td>Integration with mocked app-server subprocess: bootstrap sequence; rateLimits/updated → push; subprocess EOF triggers restart with backoff; health divergence triggers re-push.</td>
+    <td>Integration with mocked app-server subprocess: bootstrap sequence; account.email becomes the wire-level client_id verbatim; rateLimits/updated → push; subprocess EOF triggers restart with backoff; health divergence triggers re-push.</td>
   </tr>
   <tr>
     <td>firmware: client_id auth</td>
-    <td>NVS-empty pairs; matching hash accepted; mismatched hash 401s; header-absent 401s after NVS populated.</td>
+    <td>NVS-empty pairs; matching identifier accepted; mismatched identifier 401s; header-absent 401s after NVS populated.</td>
   </tr>
   <tr>
     <td>firmware: monotonic guard</td>

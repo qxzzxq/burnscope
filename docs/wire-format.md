@@ -62,9 +62,16 @@ in-memory store — the firmware's 1 Hz LVGL tick re-renders the
 currently visible agent against the updated store and handles
 between-agent cycling. This means a Codex push does not yank rotation
 away from a currently-visible Claude row (and vice versa). No history
-is kept. No auth (LAN trust). The ESP32 syncs its wall-clock over NTP
-and computes "resets in X" locally against `resets_at` — there is no
-server timestamp on the wire.
+is kept. The ESP32 syncs its wall-clock over NTP and computes "resets
+in X" locally against `resets_at` — there is no server timestamp on
+the wire.
+
+### Headers
+
+| Header                   | Required | Description |
+|--------------------------|----------|-------------|
+| `Content-Type`           | yes      | `application/json` |
+| `X-BurnScope-Client-Id`  | optional today, will become required | Plaintext per-agent identifier. Claude collectors send `oauthAccount.emailAddress` (or top-level `userID` as fallback) from `~/.claude.json`; the Codex collector sends `account.email` from the app-server `account/read` response. Value is ASCII-printable, no control characters, length ≤ 254 bytes (RFC 5321 mailbox cap). The ESP32 stores it verbatim — no parsing — and the display can render it as the owner label per agent. **Currently the firmware accepts pushes regardless of header value; first-use pairing enforcement is a Phase-2 firmware change (see "Deferred").** |
 
 ## `GET /health`
 
@@ -94,20 +101,26 @@ receiving `/health` does not refresh the snapshot store or the display.
 
 ---
 
-## Header → session mapping
+## Upstream → session mapping
 
-For collector implementers. Source of these headers: `docs/probe-claude.sh`
-and `docs/probe-codex.sh`.
+For collector implementers. The v2 client no longer scrapes
+rate-limit headers from upstream HTTP responses (which cost tokens);
+it reads the same numbers from agent-native sources. The mapping each
+collector applies before constructing a `SessionSnapshot`:
 
-| Agent    | `sessions[].type` | `used_pct` header                              | `resets_at` header                |
-|----------|-------------------|------------------------------------------------|-----------------------------------|
-| `claude` | `current`         | `anthropic-ratelimit-unified-5h-utilization`   | `anthropic-ratelimit-unified-5h-reset` |
-| `claude` | `weekly`          | `anthropic-ratelimit-unified-7d-utilization`   | `anthropic-ratelimit-unified-7d-reset` |
-| `codex`  | `primary`         | `x-codex-primary-used-percent` ÷ 100           | `x-codex-primary-reset-at`        |
-| `codex`  | `secondary`       | `x-codex-secondary-used-percent` ÷ 100         | `x-codex-secondary-reset-at`      |
+| Agent    | `sessions[].type` | Source field                                                | Notes |
+|----------|-------------------|-------------------------------------------------------------|-------|
+| `claude` | `current`         | Claude Code statusline payload: `rate_limits.five_hour.used_percentage` ÷ 100, `rate_limits.five_hour.resets_at` | See `docs/claude-statusline.html`. |
+| `claude` | `weekly`          | Claude Code statusline payload: `rate_limits.seven_day.used_percentage` ÷ 100, `rate_limits.seven_day.resets_at` | Same source. |
+| `codex`  | `primary`         | `codex app-server`: `rateLimits.primary.usedPercent` ÷ 100, `rateLimits.primary.resetsAt` | See `docs/codex-app-server.html`. Method `account/rateLimits/read` for the initial snapshot, notification `account/rateLimits/updated` for live updates. |
+| `codex`  | `secondary`       | `codex app-server`: `rateLimits.secondary.usedPercent` ÷ 100, `rateLimits.secondary.resetsAt` | Same source. |
 
-Claude returns `used_pct` already as a `0.0`–`1.0` float; Codex returns
-`0`–`100` integers and the collector divides by 100.
+Both upstream sources return percentages on a 0–100 scale; the
+collector divides by 100 before constructing the `SessionSnapshot`.
+
+The historical header-probe scripts (`docs/probe-claude.sh`,
+`docs/probe-codex.sh`) made real token-costing API calls and are
+preserved only as references for the v1 wire mapping.
 
 ---
 
@@ -132,8 +145,19 @@ re-litigate without a reason.
 - **Historical aggregates.** No daily totals, no per-session breakdown. The
   firmware keeps only the latest snapshot per agent.
 - **Cost/dollar estimates.** Token-based metrics only.
-- **Auth.** `POST /summary` accepts pushes from any LAN client. A shared
-  secret is straightforward to add later.
+- **Per-agent client-ID enforcement.** Today `POST /summary` accepts any
+  pushes from the LAN regardless of `X-BurnScope-Client-Id`. Phase-2
+  firmware adds trust-on-first-use pairing: at boot the ESP32 reads
+  `nvs::client_id[agent]`; an incoming request either matches the stored
+  string (accept), matches an empty slot (accept and persist), or
+  mismatches (`401 Unauthorized` with no state change). Re-pair by
+  erasing NVS (`idf.py erase-flash`) or the documented boot-button-hold
+  path. The header itself is on the wire today so v2 clients are
+  forward-compatible.
+- **Monotonic `captured_at` guard.** Phase-2 firmware tracks the highest
+  `captured_at` seen per agent and silently drops older snapshots
+  (still returns `204` so clients don't retry). Ensures multi-laptop /
+  multi-session deployments converge to the freshest data.
 - **Intermediate aggregation server.** An earlier MVP draft had a Go server
   fronting the firmware. Cut because for one laptop + one display it added
   installs and an always-on process without buying anything. It earns its

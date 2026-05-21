@@ -26,6 +26,7 @@ async def discover_esp32(
     own_zc = zc is None
     zc = zc or AsyncZeroconf()
     found: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+    log.debug("mDNS browse start: %s (timeout=%.1fs)", SERVICE_TYPE, timeout)
 
     def _on_change(zeroconf, service_type, name, state_change):
         if state_change is not ServiceStateChange.Added:
@@ -36,8 +37,11 @@ async def discover_esp32(
 
     browser = AsyncServiceBrowser(zc.zeroconf, SERVICE_TYPE, handlers=[_on_change])
     try:
-        return await asyncio.wait_for(found, timeout=timeout)
+        host = await asyncio.wait_for(found, timeout=timeout)
+        log.debug("mDNS browse resolved: %s", host)
+        return host
     except asyncio.TimeoutError:
+        log.debug("mDNS browse timed out with no results")
         return None
     finally:
         await browser.async_cancel()

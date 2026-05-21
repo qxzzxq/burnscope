@@ -64,7 +64,9 @@ def main(argv: list[str] | None = None) -> int:
         return _status()
     if args.cmd == "pair-reset":
         host_cache.invalidate_host()
-        print("Forgot cached ESP32 host.")
+        for agent in ("claude", "codex"):
+            host_cache.invalidate_client_id(agent)
+        print("Forgot cached ESP32 host and per-agent client_ids.")
         return 0
     return 1
 
@@ -249,7 +251,10 @@ def _status() -> int:
 
     for agent in ("claude", "codex"):
         state = host_cache.read_push_state(agent)
+        cid = host_cache.read_client_id(agent)
+        cid_short = f"{cid[:12]}…" if cid else "<not cached>"
         print(f"Last push {agent}: {state or '<none>'}")
+        print(f"Client-id {agent}: {cid_short}")
 
     claude_settings = _read_json(CLAUDE_SETTINGS_PATH) or {}
     sl = claude_settings.get("statusLine")

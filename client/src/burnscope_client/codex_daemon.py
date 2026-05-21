@@ -46,6 +46,7 @@ from dataclasses import dataclass  # noqa: E402
 import httpx  # noqa: E402
 
 from . import host_cache, identity  # noqa: E402
+from ._log import configure_logging  # noqa: E402
 from .discovery import discover_esp32  # noqa: E402
 from .pusher import PushAuthError, PushError, fetch_health, push  # noqa: E402
 from .schema import AgentSnapshot, SessionSnapshot  # noqa: E402
@@ -164,7 +165,11 @@ class CodexDaemon:
         email = _extract_email(account)
         if not email:
             raise CodexProtocolError("account/read returned no email")
-        self._client_id = identity.client_id_for_agent(AGENT_NAME, email)
+        derived = identity.client_id_for_agent(AGENT_NAME, email)
+        cached = host_cache.read_client_id(AGENT_NAME)
+        if cached != derived:
+            host_cache.write_client_id(AGENT_NAME, derived)
+        self._client_id = derived
         log.info("codex client_id derived from email")
 
         rl = await self._request("account/rateLimits/read", {})
@@ -246,6 +251,10 @@ class CodexDaemon:
     def _enqueue_snapshot(self, snapshot: AgentSnapshot) -> None:
         self._last_snapshot = snapshot
         self._snapshot_queue.put_nowait(snapshot)
+        log.debug(
+            "enqueued codex snapshot (sessions=%d) for push",
+            len(snapshot.sessions),
+        )
 
     # --------------------------------------------------------------- pusher
 
@@ -305,10 +314,13 @@ class CodexDaemon:
     async def _resolve_host(self) -> str | None:
         cached = host_cache.load_host()
         if cached:
+            log.debug("host cache hit: %s", cached)
             return cached
+        log.debug("host cache miss; running mDNS discovery")
         found = await discover_esp32()
         if found:
             host_cache.store_host(found)
+            log.debug("host cached: %s", found)
         return found
 
 
@@ -392,10 +404,10 @@ def _firmware_diverged(health_body: dict, expected: AgentSnapshot) -> bool:
 
 
 def main(argv: list[str] | None = None) -> int:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    # Stderr fallback so a stock launchd/systemd install still captures logs
+    # via the supervisor's stdout/stderr redirect. BURNSCOPE_LOG_FILE wins
+    # when set.
+    configure_logging(fallback_stderr=True)
     daemon = CodexDaemon()
     try:
         asyncio.run(daemon.run())

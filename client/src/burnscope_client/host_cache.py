@@ -28,6 +28,7 @@ log = logging.getLogger(__name__)
 
 _HOST_FILENAME = "host"
 _LAST_PUSH_PREFIX = "last-push."
+_CLIENT_ID_PREFIX = "client-id."
 
 
 def state_dir() -> Path:
@@ -89,6 +90,38 @@ def write_push_state(agent: str, ok: bool) -> None:
     """Write the per-agent last-push outcome atomically."""
     payload = json.dumps({"ok": bool(ok), "at": int(time.time())})
     _atomic_write(state_dir() / f"{_LAST_PUSH_PREFIX}{agent}", payload)
+
+
+def read_client_id(agent: str) -> str | None:
+    """Return the cached per-agent SHA-256 client_id, or None.
+
+    Cached on first derive so we don't hit the OS keyring on every Claude
+    statusline fire (each fire spawns a fresh process and would otherwise
+    re-prompt for Keychain access on macOS).
+    """
+    path = state_dir() / f"{_CLIENT_ID_PREFIX}{agent}"
+    try:
+        raw = path.read_text().strip()
+    except OSError:
+        return None
+    if len(raw) != 64 or any(c not in "0123456789abcdef" for c in raw):
+        log.warning("client-id.%s contained malformed hash; ignoring", agent)
+        return None
+    return raw
+
+
+def write_client_id(agent: str, client_id: str) -> None:
+    """Persist the derived client_id atomically."""
+    _atomic_write(state_dir() / f"{_CLIENT_ID_PREFIX}{agent}", client_id)
+
+
+def invalidate_client_id(agent: str) -> None:
+    """Drop the cached client_id. Idempotent."""
+    path = state_dir() / f"{_CLIENT_ID_PREFIX}{agent}"
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
 
 
 def read_push_state(agent: str) -> dict | None:

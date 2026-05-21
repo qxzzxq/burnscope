@@ -38,6 +38,13 @@ async def push(
     """POST `snapshot` to `http://{host}/summary` with the client-id header."""
     url = f"http://{host}/summary"
     headers = {CLIENT_ID_HEADER: client_id}
+    log.debug(
+        "POST %s agent=%s sessions=%d client_id=%s…",
+        url,
+        snapshot.agent,
+        len(snapshot.sessions),
+        client_id[:8],
+    )
     try:
         response = await client.post(
             url, json=snapshot.to_dict(), headers=headers, timeout=5.0
@@ -53,6 +60,7 @@ async def push(
         raise PushError(
             f"{url} returned {response.status_code}: {response.text[:200]}"
         )
+    log.info("POST %s → %d", url, response.status_code)
 
 
 async def fetch_health(

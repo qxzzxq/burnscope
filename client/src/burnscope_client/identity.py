@@ -51,8 +51,10 @@ def claude_org_uuid() -> str:
 
     Raises `IdentityError` if both sources fail or the JSON lacks the field.
     """
+    source = "keyring"
     blob = _try_keyring()
     if blob is None:
+        source = "file"
         blob = _try_file()
     if blob is None:
         raise IdentityError(
@@ -66,6 +68,8 @@ def claude_org_uuid() -> str:
             "Claude credentials JSON did not contain a non-empty "
             "`organizationUuid` field"
         )
+    # Log a short prefix only — full UUID is the input to the client_id hash.
+    log.debug("resolved Claude organizationUuid via %s (%s…)", source, uuid[:8])
     return uuid
 
 

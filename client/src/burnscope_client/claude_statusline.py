@@ -16,6 +16,10 @@ Two modes, selected by `--push`:
   as the ✓/✗ indicator.
 
 See `docs/client-spec-v2.html` § 6 for the per-fire lifecycle.
+
+Debug logging: set `BURNSCOPE_LOG_FILE=/path/to/file.log` and both the
+foreground render and the detached `--push` child will append to it.
+When unset, logging is silent (Claude Code discards script stderr).
 """
 
 from __future__ import annotations
@@ -43,6 +47,7 @@ import time  # noqa: E402
 import httpx  # noqa: E402
 
 from . import host_cache, identity  # noqa: E402
+from ._log import configure_logging  # noqa: E402
 from .discovery import discover_esp32  # noqa: E402
 from .pusher import PushAuthError, PushError, push  # noqa: E402
 from .schema import AgentSnapshot, SessionSnapshot  # noqa: E402
@@ -62,6 +67,8 @@ def main(argv: list[str] | None = None) -> int:
         help="Detached-child mode: read AgentSnapshot from stdin and POST it.",
     )
     args = parser.parse_args(argv)
+    configure_logging()
+    log.debug("claude_statusline invoked (push=%s)", args.push)
 
     if args.push:
         return _push_mode()
@@ -75,10 +82,17 @@ def _foreground_mode() -> int:
     except (ValueError, OSError):
         payload = {}
 
-    indicator = _indicator_for(host_cache.read_push_state("claude"))
+    prev = host_cache.read_push_state("claude")
+    indicator = _indicator_for(prev)
     rate_limits = payload.get("rate_limits") or {}
     five = rate_limits.get("five_hour") or {}
     seven = rate_limits.get("seven_day") or {}
+    log.debug(
+        "foreground fire: prev=%s indicator=%s rate_limits=%s",
+        prev,
+        indicator,
+        "present" if rate_limits else "absent",
+    )
 
     # Always render first so Claude has something to display even if push fails.
     sys.stdout.write(_render_line(five, seven, indicator))
@@ -87,8 +101,12 @@ def _foreground_mode() -> int:
 
     snapshot = _build_snapshot(five, seven)
     if snapshot is None:
+        log.debug("no usable rate_limits; skipping push")
         return 0
 
+    log.debug(
+        "spawning detached push child (sessions=%d)", len(snapshot.sessions)
+    )
     _spawn_push_child(snapshot)
     return 0
 
@@ -168,14 +186,21 @@ def _push_mode() -> int:
         host_cache.write_push_state("claude", ok=False)
         return 1
 
-    try:
-        client_id = identity.client_id_for_agent(
-            "claude", identity.claude_org_uuid()
-        )
-    except identity.IdentityError as exc:
-        log.error("could not derive client_id: %s", exc)
-        host_cache.write_push_state("claude", ok=False)
-        return 1
+    client_id = host_cache.read_client_id("claude")
+    if client_id is None:
+        log.debug("client_id cache miss; deriving from credentials")
+        try:
+            client_id = identity.client_id_for_agent(
+                "claude", identity.claude_org_uuid()
+            )
+        except identity.IdentityError as exc:
+            log.error("could not derive client_id: %s", exc)
+            host_cache.write_push_state("claude", ok=False)
+            return 1
+        host_cache.write_client_id("claude", client_id)
+        log.debug("client_id derived and cached (%s…)", client_id[:8])
+    else:
+        log.debug("client_id cache hit (%s…)", client_id[:8])
 
     try:
         asyncio.run(_do_push(snapshot, client_id))
@@ -205,10 +230,13 @@ async def _resolve_host() -> str | None:
     """Use the cached host if present; otherwise rediscover and cache."""
     cached = host_cache.load_host()
     if cached:
+        log.debug("host cache hit: %s", cached)
         return cached
+    log.debug("host cache miss; running mDNS discovery")
     found = await discover_esp32()
     if found:
         host_cache.store_host(found)
+        log.debug("host cached: %s", found)
     return found
 
 

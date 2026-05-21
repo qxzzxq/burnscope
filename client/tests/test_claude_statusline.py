@@ -117,6 +117,42 @@ def test_push_mode_writes_ok_on_successful_push(monkeypatch):
     assert rc == 0
     state = host_cache.read_push_state("claude")
     assert state["ok"] is True
+    # First successful derive should populate the cache.
+    assert host_cache.read_client_id("claude") is not None
+
+
+def test_push_mode_uses_cached_client_id_without_touching_keyring(monkeypatch):
+    snapshot_dict = {
+        "agent": "claude",
+        "captured_at": 1779050146,
+        "sessions": [
+            {"type": "current", "used_pct": 0.23, "resets_at": 1779066600},
+        ],
+    }
+    cached = "f" * 64
+    host_cache.write_client_id("claude", cached)
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(snapshot_dict)))
+
+    def boom():
+        raise AssertionError(
+            "claude_org_uuid should NOT be called when client_id is cached"
+        )
+
+    monkeypatch.setattr(claude_statusline.identity, "claude_org_uuid", boom)
+    monkeypatch.setattr(
+        claude_statusline.host_cache, "load_host", lambda: "esp.local:80"
+    )
+
+    received: list[str] = []
+
+    async def fake_push(snap, host, client_id, client):
+        received.append(client_id)
+
+    monkeypatch.setattr(claude_statusline, "push", fake_push)
+
+    rc = claude_statusline.main(["--push"])
+    assert rc == 0
+    assert received == [cached]
 
 
 def test_push_mode_writes_fail_and_invalidates_host_on_push_error(monkeypatch):

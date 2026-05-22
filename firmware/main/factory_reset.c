@@ -40,6 +40,10 @@ static void task(void *arg)
                 ESP_LOGW(TAG, "BOOT held ≥ %d ms — erasing creds and rebooting",
                          HOLD_REQUIRED_MS);
                 nvs_store_erase_creds();
+                /* Also clear the TOFU pairing slots so a new owner can
+                 * claim the device after reprovisioning. The next
+                 * /summary POST from any laptop will rebind verbatim. */
+                nvs_store_erase_client_ids();
                 vTaskDelay(pdMS_TO_TICKS(100));
                 esp_restart();
             }

@@ -402,6 +402,14 @@ static void render_snapshot_locked(const agent_snapshot_t *snap)
         float pct = s->used_pct;
         if (pct < 0.0f) pct = 0.0f;
         if (pct > 1.0f) pct = 1.0f;
+        /* Post-reset auto-zero: once the wall clock crosses resets_at the
+         * old window is logically gone. Keep the bar at 0 until the next
+         * push delivers the new window's used_pct + resets_at. The store
+         * is intentionally not mutated — /health still reports what the
+         * daemon last sent, so its drift-detection stays meaningful. */
+        if (clock_synced && now >= s->resets_at) {
+            pct = 0.0f;
+        }
 
         lv_label_set_text(r->type_lbl, s->type);
         char pct_buf[8];

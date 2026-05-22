@@ -218,9 +218,10 @@ static void build_row(lv_obj_t *parent, int row_idx, int y_offset, int height)
     lv_obj_set_style_text_color(pct_lbl, LABEL_FG, 0);
     lv_obj_align(pct_lbl, LV_ALIGN_TOP_RIGHT, 0, 2);
 
+    /* Bar Y in the card's content area, dialled in via font-preview.html. */
     lv_obj_t *bar = lv_bar_create(card);
     lv_obj_set_size(bar, 292, 15);
-    lv_obj_align(bar, LV_ALIGN_TOP_LEFT, 0, 34);
+    lv_obj_align(bar, LV_ALIGN_TOP_LEFT, 0, 32);
     lv_bar_set_range(bar, 0, 1000);
     lv_bar_set_value(bar, 0, LV_ANIM_OFF);
     /* Explicit bg_opa + zero border on both parts: the default theme can
@@ -272,17 +273,28 @@ static void build_agent_screen(void)
     lv_obj_set_style_text_font(s_agent_label, &lv_font_montserrat_28, 0);
     lv_obj_align(s_agent_label, LV_ALIGN_TOP_MID, 0, 6);
 
-    /* Two body rows. Header takes ~40 px at the top; a 14 px footer
-     * band sits at the bottom for owner-id + updated timestamp. The
-     * rows fill what's between. */
-    const int rows = 2;
-    const int top  = 40;
-    const int gap  = 8;
-    const int footer_h = 14;
-    const int avail = 240 - top - footer_h;
-    const int row_h = (avail - gap * (rows + 1)) / rows;  /* ~85 px */
+    /* Two body rows. Header is 40 px at the top; a 14 px footer band
+     * sits near the bottom for owner-id + updated timestamp. Vertical
+     * layout (dialled in via firmware/scripts/font-preview.html):
+     *
+     *   [40 header][8][row][8][row][5][14 footer][≈3 bottom-margin] == 240
+     *
+     * → row_h = (240 - 40 - 2*inter_gap - footer_top_margin
+     *           - footer_h - footer_bottom_margin) / 2  = 81 px.
+     *
+     * The footer bottom margin works out to 3 px (not 2) because the
+     * exact-fit row height is 81.5; the half-pixel rolls to the edge.
+     */
+    const int rows                 = 2;
+    const int top                  = 40;
+    const int inter_gap            = 8;
+    const int footer_h             = 14;
+    const int footer_top_margin    = 5;
+    const int footer_bottom_margin = 3;
+    const int row_h = (240 - top - inter_gap * rows
+                       - footer_top_margin - footer_h - footer_bottom_margin) / rows;
     for (int i = 0; i < rows; ++i) {
-        int y = top + gap + i * (row_h + gap);
+        int y = top + inter_gap + i * (row_h + inter_gap);
         build_row(scr, i, y, row_h);
     }
     /* Stash any unused row pointers so callers never deref them. */
@@ -290,26 +302,28 @@ static void build_agent_screen(void)
         s_rows[i].card = NULL;
     }
 
-    /* Footer band. Subtle mid-gray on both labels; the right-hand
-     * timestamp formatter writes UTC (firmware has no TZ knowledge —
-     * NTP gives us seconds-since-epoch, that's all). Truncation on the
-     * left label is handled by LVGL: dots mode replaces the overflow
-     * with an ellipsis when the label exceeds its width. */
-    const lv_color_t FOOTER_FG = lv_color_hex(0x9CD3CD);
+    /* Footer band. Warm off-white that sits in the same family as the
+     * row labels — readable but smaller than the body type, so the eye
+     * lands on the percentages first. The right-hand timestamp formatter
+     * writes UTC (firmware has no TZ knowledge — NTP gives us
+     * seconds-since-epoch, that's all). Truncation on the left label is
+     * handled by LVGL: dots mode replaces the overflow with an ellipsis
+     * when the label exceeds its width. */
+    const lv_color_t FOOTER_FG = lv_color_hex(0x5C5C5C);
 
     s_footer_left = lv_label_create(scr);
     lv_obj_set_width(s_footer_left, 184);
     lv_label_set_long_mode(s_footer_left, LV_LABEL_LONG_DOT);
     lv_label_set_text(s_footer_left, "unpaired");
-    lv_obj_set_style_text_font(s_footer_left, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(s_footer_left, &lv_font_montserrat_10, 0);
     lv_obj_set_style_text_color(s_footer_left, FOOTER_FG, 0);
-    lv_obj_align(s_footer_left, LV_ALIGN_BOTTOM_LEFT, 8, -1);
+    lv_obj_align(s_footer_left, LV_ALIGN_BOTTOM_LEFT, 8, -footer_bottom_margin);
 
     s_footer_right = lv_label_create(scr);
     lv_label_set_text(s_footer_right, "");
-    lv_obj_set_style_text_font(s_footer_right, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(s_footer_right, &lv_font_montserrat_10, 0);
     lv_obj_set_style_text_color(s_footer_right, FOOTER_FG, 0);
-    lv_obj_align(s_footer_right, LV_ALIGN_BOTTOM_RIGHT, -8, -1);
+    lv_obj_align(s_footer_right, LV_ALIGN_BOTTOM_RIGHT, -8, -footer_bottom_margin);
 
     s_agent_screen = scr;
 }

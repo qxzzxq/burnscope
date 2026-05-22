@@ -690,7 +690,31 @@ static void delayed_restart_cb(void *arg)
 
 static esp_err_t factory_reset_handler(httpd_req_t *req)
 {
-    nvs_store_erase_creds();
+    /* Mirror the BOOT long-press path in factory_reset.c: wipe both
+     * WiFi credentials and the per-agent pairing slots so a new owner
+     * can claim the device after reprovisioning. */
+    esp_err_t cred_err = nvs_store_erase_creds();
+    esp_err_t pair_err = nvs_store_erase_client_ids();
+
+    if (cred_err != ESP_OK) {
+        /* Without creds erase the device would boot STA-connected to
+         * the old WiFi and the captive portal wouldn't come back —
+         * surface that to the caller instead of silently rebooting. */
+        ESP_LOGE(TAG, "factory-reset: erase_creds failed: %s",
+                 esp_err_to_name(cred_err));
+        if (pair_err != ESP_OK) {
+            ESP_LOGE(TAG, "factory-reset: erase_client_ids also failed: %s",
+                     esp_err_to_name(pair_err));
+        }
+        return httpd_resp_send_500(req);
+    }
+    if (pair_err != ESP_OK) {
+        /* Non-fatal: WiFi creds are gone so the AP still comes up; a
+         * stale binding will 401 the next owner's first push, who can
+         * recover via BOOT long-press. */
+        ESP_LOGE(TAG, "factory-reset: erase_client_ids failed: %s",
+                 esp_err_to_name(pair_err));
+    }
 
     httpd_resp_set_status(req, "202 Accepted");
     httpd_resp_send(req, NULL, 0);

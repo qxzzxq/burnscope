@@ -50,13 +50,15 @@ Booting…  ──►  Connecting…  ──►  Waiting for daemon…
 
 Two equivalent paths:
 
-- **Long-press the BOOT button** (GPIO0) for ≥ 5 s. The device wipes
-  both the WiFi credentials and the per-agent pairing slots, then
-  reboots back into the captive portal. The next `POST /summary` from
-  any laptop will rebind verbatim (TOFU).
+Both paths wipe **WiFi credentials** *and* **per-agent pairing slots**,
+then reboot into the captive portal. The next `POST /summary` from any
+laptop will rebind verbatim (TOFU).
+
+- **Long-press the BOOT button** (GPIO0) for ≥ 5 s.
 - **Remote:** `curl -X POST http://burnscope-XXXX.local/factory-reset` —
-  responds 202 then reboots. (Currently wipes only WiFi creds; the
-  long-press path is what to use for a full re-pair.)
+  responds `202 Accepted` then reboots. Returns `500` (no reboot) if
+  the WiFi-cred erase fails, so you can retry instead of being stranded
+  with a device that won't bring its AP back up.
 
 ## Display profiles (build parameter)
 

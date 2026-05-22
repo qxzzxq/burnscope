@@ -60,6 +60,13 @@ HEALTH_INTERVAL_S = 30.0
 BACKOFF_INITIAL_S = 1.0
 BACKOFF_MAX_S = 60.0
 REQUEST_TIMEOUT_S = 30.0
+# Cap the pusher's pending-snapshot queue. If the firmware is in AP-mode
+# fallback (or the LAN is down) and the app-server keeps producing
+# `rateLimits/updated` notifications, the queue would otherwise grow
+# without bound. We only care about the most recent state per agent, so
+# bounded + drop-oldest is the right shape: a stale snapshot has zero
+# value once a newer one arrives.
+SNAPSHOT_QUEUE_MAX = 8
 
 
 class CodexProtocolError(RuntimeError):
@@ -84,7 +91,9 @@ class CodexDaemon:
         self._client_version = client_version
         self._next_id = 0
         self._pending: dict[int, _PendingRequest] = {}
-        self._snapshot_queue: asyncio.Queue[AgentSnapshot] = asyncio.Queue()
+        self._snapshot_queue: asyncio.Queue[AgentSnapshot] = asyncio.Queue(
+            maxsize=SNAPSHOT_QUEUE_MAX
+        )
         self._client_id: str | None = None
         self._last_snapshot: AgentSnapshot | None = None
         self._proc: asyncio.subprocess.Process | None = None
@@ -258,11 +267,32 @@ class CodexDaemon:
 
     def _enqueue_snapshot(self, snapshot: AgentSnapshot) -> None:
         self._last_snapshot = snapshot
-        self._snapshot_queue.put_nowait(snapshot)
+        self._enqueue_bounded(snapshot)
         log.debug(
             "enqueued codex snapshot (sessions=%d) for push",
             len(snapshot.sessions),
         )
+
+    def _enqueue_bounded(self, snapshot: AgentSnapshot) -> None:
+        """Put `snapshot` on the queue, evicting the oldest if it's full.
+
+        The pusher only needs the latest state of the world; dropping an
+        older queued snapshot to make room for a newer one is preferable
+        to letting the queue grow without bound when pushes are stalled
+        (e.g. firmware in AP-mode fallback).
+        """
+        try:
+            self._snapshot_queue.put_nowait(snapshot)
+        except asyncio.QueueFull:
+            try:
+                dropped = self._snapshot_queue.get_nowait()
+                log.warning(
+                    "snapshot queue full; dropping oldest (sessions=%d)",
+                    len(dropped.sessions),
+                )
+            except asyncio.QueueEmpty:
+                pass
+            self._snapshot_queue.put_nowait(snapshot)
 
     # --------------------------------------------------------------- pusher
 
@@ -315,7 +345,7 @@ class CodexDaemon:
                     continue
                 if _firmware_diverged(body, self._last_snapshot):
                     log.info("firmware diverged; re-enqueuing last snapshot")
-                    self._snapshot_queue.put_nowait(self._last_snapshot)
+                    self._enqueue_bounded(self._last_snapshot)
 
     # ----------------------------------------------------------- host cache
 

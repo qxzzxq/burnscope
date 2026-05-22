@@ -481,3 +481,31 @@ async def test_pusher_loop_preserves_host_cache_on_auth_error(monkeypatch):
 
     assert host_cache.load_host() == "esp.local:80"  # not invalidated
     assert host_cache.read_push_state("codex")["ok"] is False
+
+
+def test_enqueue_bounded_caps_queue_and_keeps_newest():
+    """Under sustained push failure the snapshot queue must stay bounded.
+
+    Older snapshots are stale by definition once a newer one arrives, so
+    when the queue is full we drop the oldest. After flooding the queue
+    with N > cap snapshots, qsize() must equal the cap, and the items
+    left must be the *newest* cap-many (FIFO with drop-oldest).
+    """
+
+    daemon = CodexDaemon()
+    cap = codex_daemon.SNAPSHOT_QUEUE_MAX
+    total = cap * 3
+    for i in range(total):
+        daemon._enqueue_bounded(
+            AgentSnapshot(
+                agent="codex",
+                captured_at=i,  # use captured_at to identify each snap
+                sessions=[SessionSnapshot("primary", 0.5, 1779066600)],
+            )
+        )
+
+    assert daemon._snapshot_queue.qsize() == cap
+    seen = []
+    while not daemon._snapshot_queue.empty():
+        seen.append(daemon._snapshot_queue.get_nowait().captured_at)
+    assert seen == list(range(total - cap, total))

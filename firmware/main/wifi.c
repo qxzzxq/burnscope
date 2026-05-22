@@ -3,8 +3,13 @@
  * provisioning flow. Exponential-backoff STA reconnect preserved from
  * Phase 1.
  *
- * AP-mode fallback after N consecutive STA auth failures (FR-1.6, FSD
- * EC-CP-200) is Phase 3 — not implemented here.
+ * Phase 3 / FR-1.6: after AUTH_FAIL_FALLBACK_THRESHOLD consecutive
+ * auth-flavoured disconnects without an intervening successful association,
+ * we wipe the stored creds and restart so the empty-NVS boot path lands in
+ * captive-portal provisioning. EC-CP-200 covers the password-changed-
+ * upstream case. Non-auth disconnects (NO_AP_FOUND, association drops, etc.)
+ * stay on the exponential-backoff reconnect path so a brief AP outage or
+ * range-walk doesn't blow away credentials.
  */
 
 #include "wifi.h"
@@ -14,17 +19,23 @@
 #include "esp_err.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
 
+#include "nvs_store.h"
+
 static const char *TAG = "wifi";
+
+#define AUTH_FAIL_FALLBACK_THRESHOLD 5
 
 static wifi_state_cb_t s_state_cb = NULL;
 static esp_netif_t    *s_sta_netif = NULL;
 static esp_netif_t    *s_ap_netif  = NULL;
 static TimerHandle_t   s_reconnect_timer = NULL;
 static int             s_backoff_s = 1;
+static int             s_auth_fail_streak = 0;
 static bool            s_had_ip = false;
 static bool            s_ap_mode = false;
 
@@ -65,10 +76,28 @@ static void schedule_reconnect(void)
     s_backoff_s = next_backoff(s_backoff_s);
 }
 
+static bool is_auth_failure_reason(uint8_t reason)
+{
+    /* Reasons that imply the stored credentials are no longer valid for
+     * this AP (password changed, key handshake failed). NO_AP_FOUND and
+     * association-drop reasons are deliberately excluded so a transient
+     * AP outage or range-walk doesn't wipe creds (FR-1.6 talks about
+     * *persistent auth* failure, not any disconnect). */
+    switch (reason) {
+    case WIFI_REASON_AUTH_EXPIRE:
+    case WIFI_REASON_AUTH_FAIL:
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t base,
                                int32_t id, void *data)
 {
-    (void)arg; (void)data;
+    (void)arg;
     if (base == WIFI_EVENT) {
         switch (id) {
         case WIFI_EVENT_STA_START:
@@ -85,15 +114,37 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
             if (s_ap_mode) break;
             ESP_LOGI(TAG, "STA connected (awaiting IP)");
             break;
-        case WIFI_EVENT_STA_DISCONNECTED:
+        case WIFI_EVENT_STA_DISCONNECTED: {
             if (s_ap_mode) {
                 /* During the AP scan we briefly enter APSTA — ignore. */
                 break;
             }
-            ESP_LOGW(TAG, "STA disconnected; scheduling reconnect in %ds", s_backoff_s);
+            const wifi_event_sta_disconnected_t *evt =
+                (const wifi_event_sta_disconnected_t *)data;
+            const uint8_t reason = evt ? evt->reason : 0;
+            if (is_auth_failure_reason(reason)) {
+                s_auth_fail_streak++;
+                ESP_LOGW(TAG, "STA auth failure (reason=%u, streak=%d/%d)",
+                         reason, s_auth_fail_streak,
+                         AUTH_FAIL_FALLBACK_THRESHOLD);
+                if (s_auth_fail_streak >= AUTH_FAIL_FALLBACK_THRESHOLD) {
+                    ESP_LOGW(TAG,
+                             "%d consecutive auth failures — wiping creds "
+                             "and restarting into AP mode",
+                             s_auth_fail_streak);
+                    (void)nvs_store_erase_creds();
+                    esp_restart();
+                    /* esp_restart() does not return; the break below is
+                     * just to keep the compiler happy. */
+                    break;
+                }
+            }
+            ESP_LOGW(TAG, "STA disconnected (reason=%u); scheduling reconnect in %ds",
+                     reason, s_backoff_s);
             notify(s_had_ip ? WIFI_STATE_RECONNECTING : WIFI_STATE_DISCONNECTED);
             schedule_reconnect();
             break;
+        }
         case WIFI_EVENT_AP_START:
             ESP_LOGI(TAG, "AP started");
             notify(WIFI_STATE_AP_MODE);
@@ -106,6 +157,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
             ip_event_got_ip_t *evt = (ip_event_got_ip_t *)data;
             ESP_LOGI(TAG, "got IP " IPSTR, IP2STR(&evt->ip_info.ip));
             s_backoff_s = 1;
+            s_auth_fail_streak = 0;
             s_had_ip = true;
             notify(WIFI_STATE_GOT_IP);
         }

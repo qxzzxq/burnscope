@@ -25,13 +25,13 @@ binds it on first push (TOFU) and rejects mismatches with `401`.
 ## Architecture
 
 ```
-┌───────────────────────────────┐   POST /summary    ┌────────────────────┐
-│  Per-agent collectors         │ ─────────────────▶ │  ESP32 (CYD)       │
-│   - Claude statusline hook    │   AgentSnapshot    │   - mDNS advert    │
-│   - Codex app-server daemon   │   + X-Client-Id    │   - HTTP server    │
-│  Shared: schema, discovery,   │                    │   - NVS pairing    │
-│  identity, pusher, host_cache │                    │   - TFT renderer   │
-└───────────────────────────────┘                    └────────────────────┘
+┌───────────────────────────────┐       POST /summary           ┌────────────────────┐
+│  Per-agent collectors         │ ────────────────────────────▶ │  ESP32 (CYD)       │
+│   - Claude statusline hook    │   AgentSnapshot JSON          │   - mDNS advert    │
+│   - Codex app-server daemon   │   + X-BurnScope-Client-Id     │   - HTTP server    │
+│  Shared: schema, discovery,   │                               │   - NVS pairing    │
+│  identity, pusher, host_cache │                               │   - TFT renderer   │
+└───────────────────────────────┘                               └────────────────────┘
 ```
 
 See:

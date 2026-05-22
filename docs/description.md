@@ -23,13 +23,13 @@ Claude Code (and most subscription-based agents) work in fixed usage windows —
 ## Architecture
 
 ```
-┌───────────────────────────────┐   POST /summary    ┌────────────────────┐
-│  Per-agent collectors          │ ─────────────────▶ │  ESP32 (CYD)       │
-│   - Claude statusline hook     │   AgentSnapshot    │   - mDNS advert    │
-│   - Codex app-server daemon    │   + X-Client-Id    │   - HTTP server    │
-│  Shared: schema, discovery,    │                    │   - NVS pairing    │
-│  identity, pusher, host_cache  │                    │   - TFT renderer   │
-└───────────────────────────────┘                    └────────────────────┘
+┌───────────────────────────────┐       POST /summary           ┌────────────────────┐
+│  Per-agent collectors          │ ────────────────────────────▶ │  ESP32 (CYD)       │
+│   - Claude statusline hook     │   AgentSnapshot JSON          │   - mDNS advert    │
+│   - Codex app-server daemon    │   + X-BurnScope-Client-Id     │   - HTTP server    │
+│  Shared: schema, discovery,    │                               │   - NVS pairing    │
+│  identity, pusher, host_cache  │                               │   - TFT renderer   │
+└───────────────────────────────┘                               └────────────────────┘
 ```
 
 - **Per-agent collectors** — each agent reads from its own zero-cost native source and builds an `AgentSnapshot` matching [wire-format.md](./wire-format.md). Claude is a Claude Code statusline hook that fires after each assistant message and forks a detached `--push` child; Codex is a long-lived daemon owning a `codex app-server` JSON-RPC subprocess that emits snapshots on `account/rateLimits/updated` notifications. There is no unified daemon and no header-scrape probing. Each collector reads a plaintext identifier (`oauthAccount.emailAddress` for Claude, `account.email` for Codex) and ships it in `X-BurnScope-Client-Id`.

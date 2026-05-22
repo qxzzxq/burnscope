@@ -97,17 +97,17 @@
     --bar-radius: 3px;
     --bar-height: 15px;
 
-    /* Vertical layout knobs — driven by the sliders in the sidebar.
-     * The numbers in --row-top1 / --row-top2 / --row-h / .footer's
-     * bottom are derived from these by recomputeLayout() in JS, so
-     * changing the default px values here has no effect unless the
-     * sliders are also rebased. */
+    /* Vertical layout knobs — kept in sync with the slider defaults in
+     * the sidebar so a fresh load matches the on-device firmware
+     * constants (40/8/5/3/14/32). `recomputeLayout()` overwrites these
+     * on load with the slider values, but a static viewer (no JS) and
+     * anyone diffing the CSS should see the same numbers. */
     --header-h: 40px;
     --inter-gap: 8px;
     --footer-top-margin: 5px;
-    --footer-bottom-margin: 5px;
+    --footer-bottom-margin: 3px;
     --footer-h: 14px;
-    --bar-y: 30px;
+    --bar-y: 32px;
 
     width: 320px;
     height: 240px;

@@ -130,6 +130,86 @@ static bool is_known_agent(const char *s)
     return s != NULL && (strcmp(s, "claude") == 0 || strcmp(s, "codex") == 0);
 }
 
+static const char *const KNOWN_AGENTS[] = { "claude", "codex" };
+#define KNOWN_AGENT_COUNT (sizeof(KNOWN_AGENTS) / sizeof(KNOWN_AGENTS[0]))
+
+/*
+ * Read `X-BurnScope-Client-Id` into `out`. Returns:
+ *   - 0 on success (NUL-terminated, possibly empty).
+ *   - -1 if the header is too long for our cap (caller should 401).
+ * `out` is always NUL-terminated on return.
+ */
+static int read_client_id_header(httpd_req_t *req, char *out, size_t cap)
+{
+    out[0] = '\0';
+    size_t len = httpd_req_get_hdr_value_len(req, "X-BurnScope-Client-Id");
+    if (len == 0) {
+        return 0;
+    }
+    if (len >= cap) {
+        return -1;
+    }
+    /* httpd_req_get_hdr_value_str needs cap >= len + 1; we already
+     * verified that above. */
+    if (httpd_req_get_hdr_value_str(req, "X-BurnScope-Client-Id", out, cap) != ESP_OK) {
+        out[0] = '\0';
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * TOFU pairing check for `agent`. Returns:
+ *   - true  → accept and continue (slot was empty and we just saved the
+ *             header, or the header matched the stored value).
+ *   - false → 401 already sent on `req`; caller returns ESP_OK.
+ *
+ * Empty header is treated as a hard reject — v2 collectors always send
+ * one, so a missing header on /summary means a misconfigured client. */
+static bool authorize_summary(httpd_req_t *req, const char *agent)
+{
+    char header[BURNSCOPE_CLIENT_ID_MAX];
+    if (read_client_id_header(req, header, sizeof(header)) != 0 || header[0] == '\0') {
+        ESP_LOGW(TAG, "/summary missing or oversized X-BurnScope-Client-Id");
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_set_type(req, "application/json");
+        const char *body = "{\"error\":\"client id required\"}";
+        httpd_resp_send(req, body, strlen(body));
+        return false;
+    }
+
+    char stored[BURNSCOPE_CLIENT_ID_MAX];
+    esp_err_t err = nvs_store_load_client_id(agent, stored, sizeof(stored));
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        /* TOFU: first push for this agent claims the slot. */
+        esp_err_t s = nvs_store_save_client_id(agent, header);
+        if (s != ESP_OK) {
+            ESP_LOGE(TAG, "failed to bind %s on first push: %s",
+                     agent, esp_err_to_name(s));
+            httpd_resp_send_500(req);
+            return false;
+        }
+        ESP_LOGI(TAG, "TOFU bound %s -> %s", agent, header);
+        return true;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "nvs_store_load_client_id(%s) failed: %s",
+                 agent, esp_err_to_name(err));
+        httpd_resp_send_500(req);
+        return false;
+    }
+
+    if (strcmp(stored, header) != 0) {
+        ESP_LOGW(TAG, "/summary client-id mismatch for %s", agent);
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_set_type(req, "application/json");
+        const char *body = "{\"error\":\"client id mismatch\"}";
+        httpd_resp_send(req, body, strlen(body));
+        return false;
+    }
+    return true;
+}
+
 /* Parse one {"type":..,"used_pct":..,"resets_at":..} object. Accepts the
  * three keys in any order. */
 static bool parse_session(cursor_t *c, session_snapshot_t *out)
@@ -288,6 +368,12 @@ static esp_err_t summary_post_handler(httpd_req_t *req)
         return reject_400(req, "invalid AgentSnapshot");
     }
 
+    /* Pairing check runs after parse so we know the agent name; runs
+     * before snapshot_store_put so a 401 leaves no state behind. */
+    if (!authorize_summary(req, snap.agent)) {
+        return ESP_OK;
+    }
+
     switch (snapshot_store_put(&snap)) {
     case SNAPSHOT_PUT_OK:
         ESP_LOGI(TAG, "snapshot accepted: agent=%s sessions=%d",
@@ -321,17 +407,17 @@ typedef struct {
     bool   first;
 } agents_writer_t;
 
-/* Append one agent entry to the /health JSON. Each entry carries both
- * `seconds_since_last_push` (for diagnostics) and `sessions` (the same
- * shape the daemon POSTs). The daemon uses `sessions` to detect when
- * firmware-side state diverges from its latest probe — for instance after
- * an ESP32 reboot — and re-POSTs without waiting for an upstream change.
+/* Append one agent entry to the /health JSON. Each entry carries the
+ * bound `client_id` (so daemons can detect drift after a factory
+ * reset), `seconds_since_last_push` (diagnostics), and `sessions` (the
+ * same shape the daemon POSTs — used to spot when firmware-side state
+ * diverges from the latest upstream probe after an ESP32 reboot).
  *
  * Worst case under SNAPSHOT_MAX_SESSIONS=3:
- *   "claude":{"seconds_since_last_push":<int64>,"sessions":[
- *      {"type":"<16ch>","used_pct":<%g>,"resets_at":<int64>}, ... x3]}
- * comfortably fits in ~240 bytes. The 1024-byte body buffer holds two of
- * those plus the outer envelope.
+ *   "claude":{"client_id":"<254ch>","seconds_since_last_push":<int64>,
+ *             "sessions":[{"type":"<16ch>","used_pct":<%g>,"resets_at":<int64>}, ... x3]}
+ * fits in ~520 bytes. Two of those plus the outer envelope fit in the
+ * 2048-byte body buffer with headroom.
  */
 static void append_agent(const agent_snapshot_t *snap, void *user)
 {
@@ -342,10 +428,17 @@ static void append_agent(const agent_snapshot_t *snap, void *user)
     size_t saved_off = w->off;
     bool saved_first = w->first;
 
+    /* Look up the bound client id once per entry. Empty if the slot was
+     * cleared (e.g. after a factory reset that wiped pairing but left
+     * the in-RAM snapshot — currently can't happen, but defensive). */
+    char cid[BURNSCOPE_CLIENT_ID_MAX] = "";
+    (void)nvs_store_load_client_id(snap->agent, cid, sizeof(cid));
+
     int n = snprintf(w->body + w->off, w->cap - w->off,
-                     "%s\"%s\":{\"seconds_since_last_push\":%lld,\"sessions\":[",
+                     "%s\"%s\":{\"client_id\":\"%s\",\"seconds_since_last_push\":%lld,\"sessions\":[",
                      w->first ? "" : ",",
                      snap->agent,
+                     cid,
                      (long long)age);
     if (n <= 0 || (size_t)n >= w->cap - w->off) goto overflow;
     w->off += n;
@@ -378,13 +471,71 @@ overflow:
     }
 }
 
+/*
+ * /health authorization: the daemon's probe must match *any* populated
+ * pairing slot. With no slots populated yet (fresh device), allow the
+ * header-less or any-value probe so the daemon's first cycle can
+ * discover the device before its first POST claims a slot. Returns
+ * true → continue; false → 401 already sent.
+ */
+static bool authorize_health(httpd_req_t *req)
+{
+    /* Survey populated slots first. */
+    char slots[KNOWN_AGENT_COUNT][BURNSCOPE_CLIENT_ID_MAX];
+    bool slot_filled[KNOWN_AGENT_COUNT] = { false };
+    bool any_filled = false;
+    for (size_t i = 0; i < KNOWN_AGENT_COUNT; ++i) {
+        slots[i][0] = '\0';
+        if (nvs_store_load_client_id(KNOWN_AGENTS[i], slots[i], sizeof(slots[i])) == ESP_OK) {
+            slot_filled[i] = true;
+            any_filled = true;
+        }
+    }
+    if (!any_filled) {
+        /* No bindings yet — accept anything so first contact works. */
+        return true;
+    }
+
+    char header[BURNSCOPE_CLIENT_ID_MAX];
+    if (read_client_id_header(req, header, sizeof(header)) != 0 || header[0] == '\0') {
+        ESP_LOGW(TAG, "/health missing X-BurnScope-Client-Id (have %d binding(s))",
+                 (int)KNOWN_AGENT_COUNT);
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_set_type(req, "application/json");
+        const char *body = "{\"error\":\"client id required\"}";
+        httpd_resp_send(req, body, strlen(body));
+        return false;
+    }
+
+    for (size_t i = 0; i < KNOWN_AGENT_COUNT; ++i) {
+        if (slot_filled[i] && strcmp(slots[i], header) == 0) {
+            return true;
+        }
+    }
+
+    ESP_LOGW(TAG, "/health client-id matches no populated slot");
+    httpd_resp_set_status(req, "401 Unauthorized");
+    httpd_resp_set_type(req, "application/json");
+    const char *body = "{\"error\":\"client id mismatch\"}";
+    httpd_resp_send(req, body, strlen(body));
+    return false;
+}
+
 static esp_err_t health_get_handler(httpd_req_t *req)
 {
+    if (!authorize_health(req)) {
+        return ESP_OK;
+    }
+
     int64_t uptime_us = esp_timer_get_time();
     uint32_t uptime_s = (uint32_t)(uptime_us / 1000000);
     uint32_t free_heap = esp_get_free_heap_size();
 
-    char body[1024];
+    /* 2 KiB holds the envelope plus two enriched agent entries (each
+     * including the bound client_id, capped at 255 bytes) with headroom.
+     * Stays on-stack — the handler runs on the httpd task whose stack
+     * is sized for this. */
+    char body[2048];
     int off = snprintf(body, sizeof(body),
                        "{\"firmware_version\":\"%s\","
                        "\"uptime_s\":%lu,"

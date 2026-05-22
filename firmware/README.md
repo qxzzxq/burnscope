@@ -50,15 +50,14 @@ Booting…  ──►  Connecting…  ──►  Waiting for daemon…
 
 Two equivalent paths:
 
-Both paths wipe **WiFi credentials** *and* **per-agent pairing slots**,
-then reboot into the captive portal. The next `POST /summary` from any
-laptop will rebind verbatim (TOFU).
+**Long-press the BOOT button** (GPIO0) for ≥ 5 s. The device wipes both
+the WiFi credentials and the per-agent pairing slots, then reboots
+into the captive portal. The next `POST /summary` from any laptop will
+rebind verbatim (TOFU).
 
-- **Long-press the BOOT button** (GPIO0) for ≥ 5 s.
-- **Remote:** `curl -X POST http://burnscope-XXXX.local/factory-reset` —
-  responds `202 Accepted` then reboots. Returns `500` (no reboot) if
-  the WiFi-cred erase fails, so you can retry instead of being stranded
-  with a device that won't bring its AP back up.
+A network-triggered factory-reset endpoint isn't exposed in MVP — the
+route had no auth and was pulled until an auth scheme lands. Use the
+BOOT button in the meantime.
 
 ## Display profiles (build parameter)
 
@@ -97,7 +96,6 @@ second).
 |------------|---------------------------------------------------------------------------|
 | TC-CP-100  | Erase NVS, boot, walk through portal → STA-connected without re-flash.   |
 | TC-NVS-102 | BOOT button held ≥ 5 s ⇒ portal returns on the next boot.                |
-| TC-NVS-103 | `POST /factory-reset` ⇒ 202 + portal returns.                            |
 | TC-SUM-100 | `POST /summary` with `docs/examples/summary-push.json` → 204, UI repaints.|
 | TC-SUM-101 | Push claude, then codex — UI cycles between them every ~5 s.             |
 | TC-SUM-104 | `used_pct = 1.5` ⇒ 400.                                                  |

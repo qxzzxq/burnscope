@@ -40,15 +40,14 @@ Claude Code (and most subscription-based agents) work in fixed usage windows —
 
 ## HTTP API
 
-Three endpoints, on the ESP32:
+Two endpoints, on the ESP32:
 
 | Endpoint              | Direction          | Body / Headers                                                                   | Response                                                            |
 | --------------------- | ------------------ | -------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
 | `POST /summary`       | collector → ESP32  | a single `AgentSnapshot` + `X-BurnScope-Client-Id`                               | `204 No Content`, `401` (missing/mismatched id), `409` (stale `captured_at`) |
 | `GET /health`         | collector → ESP32  | `X-BurnScope-Client-Id` (must match any bound slot once one exists)              | firmware version, uptime, free heap, per-agent `client_id` + `seconds_since_last_push` + `sessions` |
-| `POST /factory-reset` | manual             | —                                                                                | `202 Accepted` then reboot into captive portal                      |
 
-Schemas are hand-written in each language (Python, C). See [wire-format.md](./wire-format.md) for the full contract, including TOFU pairing semantics and the monotonic `captured_at` guard. Schema-as-codegen is deferred until there's a third consumer.
+A network-triggered factory reset isn't exposed in MVP — the route was pulled because it would let anything on the LAN wipe the device. Reset is via the BOOT-button long-press (≥ 5 s); a network endpoint will return once an auth scheme lands. Schemas are hand-written in each language (Python, C). See [wire-format.md](./wire-format.md) for the full contract, including TOFU pairing semantics and the monotonic `captured_at` guard. Schema-as-codegen is deferred until there's a third consumer.
 
 ---
 
@@ -152,11 +151,12 @@ The "display half" of BurnScope. Holds no rolling-window state of its own — th
 
 **Boot and provisioning.** On first power-up the firmware finds an empty NVS, brings up a WiFi Access Point named `BURNSCOPE-<last 4 hex of MAC>`, and serves a captive portal that scans for networks and accepts SSID + password. Credentials are persisted to NVS and the device reboots into normal STA mode. Every subsequent boot reads NVS, connects WiFi, advertises `_burnscope._tcp.local` on port 80 over mDNS, and syncs its wall clock over NTP so the countdowns are accurate. If the upstream WiFi password changes, the firmware falls back to AP mode after a handful of failed reconnect attempts so the user can re-provision without re-flashing.
 
-**HTTP surface.** Three routes, LAN-only with TOFU pairing:
+**HTTP surface.** Two routes, LAN-only with TOFU pairing:
 
 - `POST /summary` — the hot path. Validates `X-BurnScope-Client-Id` (TOFU bind on first push for that agent; `401` on mismatch). Rejects out-of-order pushes against a monotonic `captured_at` guard with `409`. Otherwise overwrites the in-RAM slot for that agent and returns `204`.
 - `GET /health` — firmware version, uptime, free heap, and per known agent: bound `client_id`, `seconds_since_last_push`, and the latest `sessions` array (lets the collector detect drift after an ESP32 reboot). Requires the header to match any populated slot once any slot is bound.
-- `POST /factory-reset` — erases WiFi creds *and* per-agent pairing slots, then reboots into the captive portal. Same effect as long-pressing the BOOT button for ≥ 5 s.
+
+Network-triggered factory reset is intentionally absent for MVP — the route had no auth and was pulled until an auth scheme exists. The BOOT-button long-press in `factory_reset.c` wipes WiFi creds *and* per-agent pairing slots and reboots into the captive portal.
 
 **UI.** Black background, Montserrat-based proportional text in warm off-white. The header has three slots: the agent's brand mark top-left, the literal text `Usage` top-centre, and a battery slot top-right hidden on hardware variants without a battery (every variant in MVP). The body is split into two equal-height rows with rounded dark-grey backgrounds; each row carries the session's `type` rendered as a tag chip, an integer percentage, a progress bar tinted per agent, and a "resets in HH:MM:SS" countdown ticking once a second against the NTP-synced clock. When the wall clock crosses `resets_at` and no fresh push has landed yet, the bar drops to 0 automatically (the old window is logically gone). A footer band shows the bound owner identifier (truncated with an ellipsis) bottom-left and the snapshot's `updated YYYY-MM-DD HH:MM` UTC stamp bottom-right, both in a dim neutral gray so they recede below the percentage rows. When two agents are paired the device cycles between them every ~5 s. WiFi disconnect paints "Reconnecting…" on the splash and restores the agent view from the last stored snapshot as soon as IP comes back.
 

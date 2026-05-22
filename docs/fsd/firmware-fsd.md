@@ -286,8 +286,10 @@ unit-testable on the host).
   `N = 5`), the firmware shall fall back to AP + captive-portal mode so
   the user can re-provision without re-flashing.
 - **FR-1.7** [Should]: A factory-reset trigger (long-press of the boot
-  button for ≥ 5 s, or `POST /factory-reset`) shall erase NVS and reboot
-  into AP mode.
+  button for ≥ 5 s) shall erase WiFi credentials and per-agent pairing
+  slots from NVS and reboot into AP mode. (A `POST /factory-reset`
+  endpoint was previously listed as an alternative but is deferred until
+  the network surface gets an authentication scheme — see FR-3.5.)
 
 **FR-2 Network Services**
 
@@ -314,8 +316,12 @@ unit-testable on the host).
 - **FR-3.4** [Should]: `GET /health` shall return JSON containing
   `firmware_version`, `uptime_s`, `free_heap_b`, and `seconds_since_last_push`
   (per known agent).
-- **FR-3.5** [May]: `POST /factory-reset` shall erase NVS and reboot
-  (provides a remote alternative to the button hold).
+- **FR-3.5** [Deferred]: A remote `POST /factory-reset` endpoint as an
+  alternative to the button hold is deferred pending an authentication
+  scheme. The route has no auth surface today, so anything on the LAN
+  could wipe the device — unacceptable on shared / guest networks. Will
+  return once `/summary`-style identity or a stronger token mechanism
+  is in place.
 
 **FR-4 Rendering**
 
@@ -518,9 +524,13 @@ needed to remove the stale paragraph.
   }
   ```
 
-#### 6.1.3 `POST /factory-reset` (daemon or admin → firmware)
+#### 6.1.3 `POST /factory-reset` (deferred — pending authentication)
 
-- Erases NVS and reboots. Response: `202 Accepted` (then reboot).
+- Not exposed in MVP. See FR-3.5. Reset is via the BOOT-button long-
+  press today; a network endpoint will return once an auth scheme
+  exists. The handler shape, when re-introduced, will erase WiFi
+  credentials + per-agent pairing slots and respond `202 Accepted`
+  before rebooting.
 
 #### 6.1.4 mDNS service advertisement
 

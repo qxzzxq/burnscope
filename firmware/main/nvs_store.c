@@ -143,7 +143,17 @@ esp_err_t nvs_store_load_client_id(const char *agent, char *out, size_t cap)
     err = nvs_get_str(h, agent, out, &len);
     nvs_close(h);
 
-    if (err != ESP_OK || out[0] == '\0') {
+    /* Only key-absent and explicitly-empty values count as "no binding".
+     * Other failures (size mismatch, corruption, type mismatch, …) must
+     * propagate so the caller refuses to TOFU-rebind over a slot that
+     * may still be populated. */
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_ERR_NVS_NOT_FOUND;
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (out[0] == '\0') {
         return ESP_ERR_NVS_NOT_FOUND;
     }
     return ESP_OK;

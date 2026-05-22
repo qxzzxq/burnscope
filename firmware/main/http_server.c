@@ -136,12 +136,14 @@ static const char *const KNOWN_AGENTS[] = { "claude", "codex" };
 
 /*
  * Read `X-BurnScope-Client-Id` into `out`. Returns:
- *   - 0 on success (NUL-terminated, possibly empty).
- *   - -1 if the header is too long, missing, or contains characters
- *     that would need JSON-string escaping. `/health` writes the
- *     stored value naked into its JSON body, so we forbid `"`, `\`,
- *     and control bytes at intake rather than escape on output.
- *     Caller should 401.
+ *   - 0 on success. `out` is NUL-terminated; an empty string means the
+ *     header was absent. Callers treat absent and present-with-value
+ *     differently (e.g. /health allows absent when no slot is bound).
+ *   - -1 if the header was present but unusable: too long for `cap`,
+ *     unreadable from the request, or containing characters that would
+ *     need JSON-string escaping. `/health` writes the stored value
+ *     naked into its JSON body, so we forbid `"`, `\`, and control
+ *     bytes at intake rather than escape on output. Caller should 401.
  * `out` is always NUL-terminated on return.
  */
 static bool client_id_byte_ok(unsigned char c)

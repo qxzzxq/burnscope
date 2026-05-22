@@ -277,13 +277,14 @@ static void build_agent_screen(void)
      * sits near the bottom for owner-id + updated timestamp. Vertical
      * layout (dialled in via firmware/scripts/font-preview.html):
      *
-     *   [40 header][8][row][8][row][5][14 footer][≈3 bottom-margin] == 240
+     *   [40 header][8][row][8][row][5][14 footer][3 bottom-margin] == 240
      *
      * → row_h = (240 - 40 - 2*inter_gap - footer_top_margin
      *           - footer_h - footer_bottom_margin) / 2  = 81 px.
      *
-     * The footer bottom margin works out to 3 px (not 2) because the
-     * exact-fit row height is 81.5; the half-pixel rolls to the edge.
+     * The preview tool's "ideal" footer-bottom-margin was 2 px (which
+     * would give row_h = 81.5); we widen it to 3 px so row_h lands on
+     * an exact integer. The 1 px shift below the footer is invisible.
      */
     const int rows                 = 2;
     const int top                  = 40;

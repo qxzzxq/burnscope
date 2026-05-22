@@ -133,9 +133,15 @@ esp_err_t nvs_store_load_client_id(const char *agent, char *out, size_t cap)
 
     nvs_handle_t h;
     esp_err_t err = open_ro(NS_PAIR, &h);
-    if (err != ESP_OK) {
-        /* Namespace absent before the first save — treat as empty slot. */
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        /* Namespace absent before the first save — empty slot. */
         return ESP_ERR_NVS_NOT_FOUND;
+    }
+    if (err != ESP_OK) {
+        /* Real NVS failure (uninitialised, corrupt, invalid args, …).
+         * Surface it so authorize_summary refuses to TOFU-rebind over a
+         * slot we can't actually read. */
+        return err;
     }
 
     size_t len = cap;

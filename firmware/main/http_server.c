@@ -148,10 +148,11 @@ static const char *const KNOWN_AGENTS[] = { "claude", "codex" };
  */
 static bool client_id_byte_ok(unsigned char c)
 {
-    /* Printable ASCII excluding the two JSON-string metacharacters.
-     * Emails and Claude userIDs comfortably fit this set; rejecting
-     * anything else early keeps the /health writer simple. */
-    return c >= 0x20 && c != '"' && c != '\\' && c < 0x7F;
+    /* Printable ASCII, matching `docs/wire-format.md`. `"` and `\\` are
+     * allowed — `/health` JSON-escapes them on output. Control bytes and
+     * non-ASCII (≥ 0x7F) stay rejected to keep stored identifiers
+     * single-line, byte-counted, and renderable by the device. */
+    return c >= 0x20 && c < 0x7F;
 }
 
 static int read_client_id_header(httpd_req_t *req, char *out, size_t cap)
@@ -428,17 +429,59 @@ typedef struct {
     bool   first;
 } agents_writer_t;
 
+/* Stream-write `in` into `w->body[off..cap]` with the JSON escapes
+ * required between surrounding `"..."` quotes. Bytes the wire-format
+ * input filter doesn't catch (`"` and `\\` survive intake; future agent
+ * `type` values are entirely agent-defined) get rewritten as `\"` /
+ * `\\`; newline/tab/CR map to their short forms. Returns false on
+ * buffer overflow — caller's outer rollback restores w->off. */
+static bool json_escape_append(agents_writer_t *w, const char *in)
+{
+    static const char HEX[] = "0123456789abcdef";
+    for (const unsigned char *p = (const unsigned char *)in; *p != '\0'; ++p) {
+        char tiny[7];
+        const char *seq;
+        size_t len;
+        switch (*p) {
+        case '"':  seq = "\\\""; len = 2; break;
+        case '\\': seq = "\\\\"; len = 2; break;
+        case '\n': seq = "\\n";  len = 2; break;
+        case '\r': seq = "\\r";  len = 2; break;
+        case '\t': seq = "\\t";  len = 2; break;
+        default:
+            if (*p < 0x20) {
+                tiny[0]='\\'; tiny[1]='u'; tiny[2]='0'; tiny[3]='0';
+                tiny[4]=HEX[*p >> 4]; tiny[5]=HEX[*p & 0xF]; tiny[6]='\0';
+                seq = tiny; len = 6;
+            } else {
+                tiny[0] = (char)*p; tiny[1] = '\0';
+                seq = tiny; len = 1;
+            }
+            break;
+        }
+        if (w->off + len > w->cap) return false;
+        memcpy(w->body + w->off, seq, len);
+        w->off += len;
+    }
+    return true;
+}
+
 /* Append one agent entry to the /health JSON. Each entry carries the
  * bound `client_id` (so daemons can detect drift after a factory
  * reset), `seconds_since_last_push` (diagnostics), and `sessions` (the
  * same shape the daemon POSTs — used to spot when firmware-side state
  * diverges from the latest upstream probe after an ESP32 reboot).
  *
+ * The variable-content strings (`agent`, `client_id`, `type`) are JSON-
+ * escaped on output so values containing `"` / `\\` / control bytes
+ * can't break the response.
+ *
  * Worst case under SNAPSHOT_MAX_SESSIONS=3:
  *   "claude":{"client_id":"<254ch>","seconds_since_last_push":<int64>,
  *             "sessions":[{"type":"<16ch>","used_pct":<%g>,"resets_at":<int64>}, ... x3]}
- * fits in ~520 bytes. Two of those plus the outer envelope fit in the
- * 2048-byte body buffer with headroom.
+ * fits in ~520 bytes (escaping doubles each metacharacter; we don't
+ * size for full 6x worst case because intake already rejects control
+ * bytes in client_id and agent values are constants).
  */
 static void append_agent(const agent_snapshot_t *snap, void *user)
 {
@@ -455,21 +498,33 @@ static void append_agent(const agent_snapshot_t *snap, void *user)
     char cid[BURNSCOPE_CLIENT_ID_MAX] = "";
     (void)nvs_store_load_client_id(snap->agent, cid, sizeof(cid));
 
-    int n = snprintf(w->body + w->off, w->cap - w->off,
-                     "%s\"%s\":{\"client_id\":\"%s\",\"seconds_since_last_push\":%lld,\"sessions\":[",
-                     w->first ? "" : ",",
-                     snap->agent,
-                     cid,
-                     (long long)age);
+    int n;
+    if (!w->first) {
+        if (w->off + 1 > w->cap) goto overflow;
+        w->body[w->off++] = ',';
+    }
+    if (w->off + 1 > w->cap) goto overflow;
+    w->body[w->off++] = '"';
+    if (!json_escape_append(w, snap->agent)) goto overflow;
+    n = snprintf(w->body + w->off, w->cap - w->off, "\":{\"client_id\":\"");
+    if (n <= 0 || (size_t)n >= w->cap - w->off) goto overflow;
+    w->off += n;
+    if (!json_escape_append(w, cid)) goto overflow;
+    n = snprintf(w->body + w->off, w->cap - w->off,
+                 "\",\"seconds_since_last_push\":%lld,\"sessions\":[",
+                 (long long)age);
     if (n <= 0 || (size_t)n >= w->cap - w->off) goto overflow;
     w->off += n;
 
     for (uint8_t i = 0; i < snap->session_count; ++i) {
         const session_snapshot_t *s = &snap->sessions[i];
         n = snprintf(w->body + w->off, w->cap - w->off,
-                     "%s{\"type\":\"%s\",\"used_pct\":%.6g,\"resets_at\":%lld}",
-                     i == 0 ? "" : ",",
-                     s->type,
+                     "%s{\"type\":\"", i == 0 ? "" : ",");
+        if (n <= 0 || (size_t)n >= w->cap - w->off) goto overflow;
+        w->off += n;
+        if (!json_escape_append(w, s->type)) goto overflow;
+        n = snprintf(w->body + w->off, w->cap - w->off,
+                     "\",\"used_pct\":%.6g,\"resets_at\":%lld}",
                      (double)s->used_pct,
                      (long long)s->resets_at);
         if (n <= 0 || (size_t)n >= w->cap - w->off) goto overflow;
@@ -584,10 +639,17 @@ static esp_err_t health_get_handler(httpd_req_t *req)
 
     agents_writer_t w = { .body = body, .cap = cap, .off = (size_t)off, .first = true };
     snapshot_store_foreach(append_agent, &w);
-    if (w.off + 3 < w.cap) {
-        w.body[w.off++] = '}';
-        w.body[w.off++] = '}';
-        w.body[w.off]   = '\0';
+    /* Need at least 2 bytes for the closing `}}`. If the agents writer
+     * filled the buffer right up to the edge, sending what we have
+     * would produce truncated JSON; surface that as a 500 instead. */
+    if (w.off + 2 > w.cap) {
+        free(body);
+        return httpd_resp_send_500(req);
+    }
+    w.body[w.off++] = '}';
+    w.body[w.off++] = '}';
+    if (w.off < w.cap) {
+        w.body[w.off] = '\0';
     }
 
     httpd_resp_set_type(req, "application/json");

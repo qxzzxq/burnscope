@@ -346,7 +346,10 @@ static void format_updated_utc(int64_t captured_at, char *out, size_t n)
         if (n > 0) out[0] = '\0';
         return;
     }
-    /* "updated " + "YYYY-MM-DD HH:MM" = 24 chars + NUL. */
+    /* `ts` holds the bare strftime output "YYYY-MM-DD HH:MM" (16 chars
+     * + NUL = 17 bytes; 24 leaves ample slack). The "updated " prefix
+     * is added by the snprintf into `out` below, where the caller-
+     * supplied `n` is sized for the full 24-char banner + NUL. */
     char ts[24];
     strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M", &gm);
     snprintf(out, n, "updated %s", ts);

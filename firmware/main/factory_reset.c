@@ -7,6 +7,7 @@
 #include "factory_reset.h"
 
 #include "driver/gpio.h"
+#include "esp_err.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
@@ -39,11 +40,31 @@ static void task(void *arg)
             if (held == HOLD_TICKS) {
                 ESP_LOGW(TAG, "BOOT held ≥ %d ms — erasing creds and rebooting",
                          HOLD_REQUIRED_MS);
-                nvs_store_erase_creds();
+                esp_err_t cred_err = nvs_store_erase_creds();
                 /* Also clear the TOFU pairing slots so a new owner can
                  * claim the device after reprovisioning. The next
                  * /summary POST from any laptop will rebind verbatim. */
-                nvs_store_erase_client_ids();
+                esp_err_t pair_err = nvs_store_erase_client_ids();
+
+                if (cred_err != ESP_OK) {
+                    /* If creds can't be cleared the AP wouldn't come up
+                     * after reboot — the user would just see the same
+                     * screen and try again. Reset the hold counter and
+                     * leave the device running so they can re-attempt
+                     * (or read the serial log for the underlying error). */
+                    ESP_LOGE(TAG, "factory reset aborted: erase_creds failed: %s",
+                             esp_err_to_name(cred_err));
+                    held = 0;
+                    continue;
+                }
+                if (pair_err != ESP_OK) {
+                    /* Pairing slots couldn't be cleared. WiFi creds are
+                     * gone, so the AP will still come back up — log and
+                     * proceed; the new owner sees a 401 mismatch on
+                     * their first push if the stale binding survives. */
+                    ESP_LOGE(TAG, "factory reset: erase_client_ids failed: %s",
+                             esp_err_to_name(pair_err));
+                }
                 vTaskDelay(pdMS_TO_TICKS(100));
                 esp_restart();
             }

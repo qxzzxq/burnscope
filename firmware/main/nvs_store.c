@@ -197,7 +197,9 @@ esp_err_t nvs_store_save_client_id(const char *agent, const char *id)
     nvs_close(h);
 
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "bound %s -> %s", agent, id);
+        /* Identifier (likely an email) stays out of the log — log only
+         * length, so a recurring pair-storm is still observable. */
+        ESP_LOGI(TAG, "bound %s (id %u bytes)", agent, (unsigned)strlen(id));
     } else {
         ESP_LOGE(TAG, "failed to bind %s: %s", agent, esp_err_to_name(err));
     }

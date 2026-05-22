@@ -126,13 +126,17 @@ static esp_err_t reject_400(httpd_req_t *req, const char *reason)
     return ESP_OK;
 }
 
-static bool is_known_agent(const char *s)
-{
-    return s != NULL && (strcmp(s, "claude") == 0 || strcmp(s, "codex") == 0);
-}
-
 static const char *const KNOWN_AGENTS[] = { "claude", "codex" };
 #define KNOWN_AGENT_COUNT (sizeof(KNOWN_AGENTS) / sizeof(KNOWN_AGENTS[0]))
+
+static bool is_known_agent(const char *s)
+{
+    if (s == NULL) return false;
+    for (size_t i = 0; i < KNOWN_AGENT_COUNT; ++i) {
+        if (strcmp(s, KNOWN_AGENTS[i]) == 0) return true;
+    }
+    return false;
+}
 
 /*
  * Read `X-BurnScope-Client-Id` into `out`. Returns:
@@ -140,10 +144,10 @@ static const char *const KNOWN_AGENTS[] = { "claude", "codex" };
  *     header was absent. Callers treat absent and present-with-value
  *     differently (e.g. /health allows absent when no slot is bound).
  *   - -1 if the header was present but unusable: too long for `cap`,
- *     unreadable from the request, or containing characters that would
- *     need JSON-string escaping. `/health` writes the stored value
- *     naked into its JSON body, so we forbid `"`, `\`, and control
- *     bytes at intake rather than escape on output. Caller should 401.
+ *     unreadable from the request, or containing bytes outside the
+ *     printable-ASCII set documented in `docs/wire-format.md` (control
+ *     bytes < 0x20, or non-ASCII ≥ 0x7F). `"` and `\\` are accepted —
+ *     /health JSON-escapes them on output. Caller should 401.
  * `out` is always NUL-terminated on return.
  */
 static bool client_id_byte_ok(unsigned char c)
@@ -211,7 +215,10 @@ static bool authorize_summary(httpd_req_t *req, const char *agent)
             httpd_resp_send_500(req);
             return false;
         }
-        ESP_LOGI(TAG, "TOFU bound %s -> %s", agent, header);
+        /* Don't log the bound identifier (typically an email) at info
+         * level — keep PII out of the serial log. Length is enough to
+         * confirm a non-empty bind for diagnostics. */
+        ESP_LOGI(TAG, "TOFU bound %s (id %u bytes)", agent, (unsigned)strlen(header));
         return true;
     }
     if (err != ESP_OK) {
@@ -562,9 +569,21 @@ static bool authorize_health(httpd_req_t *req)
     int  filled_count = 0;
     for (size_t i = 0; i < KNOWN_AGENT_COUNT; ++i) {
         slots[i][0] = '\0';
-        if (nvs_store_load_client_id(KNOWN_AGENTS[i], slots[i], sizeof(slots[i])) == ESP_OK) {
+        esp_err_t err = nvs_store_load_client_id(KNOWN_AGENTS[i], slots[i], sizeof(slots[i]));
+        if (err == ESP_OK) {
             slot_filled[i] = true;
             filled_count++;
+        } else if (err == ESP_ERR_NVS_NOT_FOUND) {
+            /* Empty slot — leave slot_filled[i] = false. */
+        } else {
+            /* Real NVS failure: fail closed. Treating it as "empty" would
+             * let an unauthenticated probe through (filled_count stays 0
+             * → return true on the next branch) even though a binding
+             * may actually exist but be unreadable. */
+            ESP_LOGE(TAG, "/health: NVS read failed for %s: %s — failing closed",
+                     KNOWN_AGENTS[i], esp_err_to_name(err));
+            httpd_resp_send_500(req);
+            return false;
         }
     }
     if (filled_count == 0) {

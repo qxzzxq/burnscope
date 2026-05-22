@@ -534,10 +534,19 @@ static esp_err_t health_get_handler(httpd_req_t *req)
 
     /* 2 KiB holds the envelope plus two enriched agent entries (each
      * including the bound client_id, capped at 255 bytes) with headroom.
-     * Stays on-stack — the handler runs on the httpd task whose stack
-     * is sized for this. */
-    char body[2048];
-    int off = snprintf(body, sizeof(body),
+     *
+     * Heap-allocated — keeping this on the httpd task stack overflowed
+     * the 4 KiB default once `append_agent` nested a 255-byte `cid` plus
+     * snprintf scratch on top: any /health probe under load would panic
+     * the httpd task. The heap path costs one malloc/free per /health
+     * (called ~every 30 s by the daemon), trivially cheap. */
+    const size_t cap = 2048;
+    char *body = malloc(cap);
+    if (body == NULL) {
+        return httpd_resp_send_500(req);
+    }
+
+    int off = snprintf(body, cap,
                        "{\"firmware_version\":\"%s\","
                        "\"uptime_s\":%lu,"
                        "\"free_heap_b\":%lu,"
@@ -546,7 +555,7 @@ static esp_err_t health_get_handler(httpd_req_t *req)
                        (unsigned long)uptime_s,
                        (unsigned long)free_heap);
 
-    agents_writer_t w = { .body = body, .cap = sizeof(body), .off = (size_t)off, .first = true };
+    agents_writer_t w = { .body = body, .cap = cap, .off = (size_t)off, .first = true };
     snapshot_store_foreach(append_agent, &w);
     if (w.off + 3 < w.cap) {
         w.body[w.off++] = '}';
@@ -555,8 +564,9 @@ static esp_err_t health_get_handler(httpd_req_t *req)
     }
 
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, body, w.off);
-    return ESP_OK;
+    esp_err_t send_err = httpd_resp_send(req, body, w.off);
+    free(body);
+    return send_err;
 }
 
 /* --------------------------------------------------------------------- */

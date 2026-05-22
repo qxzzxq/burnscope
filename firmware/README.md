@@ -51,9 +51,12 @@ Booting…  ──►  Connecting…  ──►  Waiting for daemon…
 Two equivalent paths:
 
 - **Long-press the BOOT button** (GPIO0) for ≥ 5 s. The device wipes
-  NVS and reboots back into the captive portal.
+  both the WiFi credentials and the per-agent pairing slots, then
+  reboots back into the captive portal. The next `POST /summary` from
+  any laptop will rebind verbatim (TOFU).
 - **Remote:** `curl -X POST http://burnscope-XXXX.local/factory-reset` —
-  responds 202 then reboots.
+  responds 202 then reboots. (Currently wipes only WiFi creds; the
+  long-press path is what to use for a full re-pair.)
 
 ## Display profiles (build parameter)
 

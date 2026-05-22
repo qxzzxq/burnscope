@@ -2,70 +2,121 @@
 
 > An always-on token & quota meter for your AI coding agents.
 
-BurnScope tracks rate-limit usage for your AI coding agents and surfaces it on a dedicated ESP32 desk display. A small daemon on your laptop probes each agent's rate-limit headers, computes the current window summary, discovers the ESP32 over mDNS, and pushes the rendered numbers straight to it over HTTP. No intermediate server.
+BurnScope surfaces rate-limit usage for your AI coding agents on a dedicated
+ESP32 desk display. Per-agent collectors on your laptop read the session data
+the agent **already produces** (no upstream API calls, no header scraping),
+discover the ESP32 over mDNS, and push the latest numbers straight to it over
+HTTP. No intermediate server.
 
-When you hit the cap and walk away, an always-on display tells you "how much have I used / when does it reset" without unlocking a laptop.
+When you hit the cap and walk away, an always-on display tells you "how much
+have I used / when does it reset" without unlocking a laptop.
 
 ## Supported agents
 
-| Agent | Storage | Windows |
-| --- | --- | --- |
-| **Claude Code** | macOS keychain (`Claude Code-credentials`) or `~/.claude/.credentials.json` | `current`, `weekly` |
-| **Codex CLI** | `~/.codex/auth.json` (access token + optional ChatGPT account id) | `primary`, `secondary` |
+| Agent | Source on your laptop | Push lifecycle | Windows |
+| --- | --- | --- | --- |
+| **Claude Code** | Statusline hook reading `rate_limits.*` from the runtime payload | Per-fire (after each assistant message) | `current` (5 h), `weekly` (7 d) |
+| **Codex CLI** | Long-lived daemon over `codex app-server` JSON-RPC | Per-event (`account/rateLimits/updated`) + 30 s drift reconciliation | `primary`, `secondary` |
 
-The daemon auto-detects which agents are logged in and runs all of them concurrently — one `AgentSnapshot` per agent per cycle. Restrict to a subset with `--agent`.
+Each collector ships its own plaintext identifier (`oauthAccount.emailAddress`
+for Claude, `account.email` for Codex) in `X-BurnScope-Client-Id`. The ESP32
+binds it on first push (TOFU) and rejects mismatches with `401`.
 
 ## Architecture
 
 ```
-┌──────────────────────────┐   HTTP POST /summary    ┌─────────────────────┐
-│ Python daemon (laptop)   │ ──────────────────────▶ │  ESP32 (CYD)        │
-│ - probes each agent      │   AgentSnapshot JSON    │  - advertises mDNS  │
-│ - discovers ESP32 (mDNS) │                         │  - tiny HTTP server │
-│                          │                         │  - renders TFT      │
-└──────────────────────────┘                         └─────────────────────┘
+┌───────────────────────────────┐       POST /summary           ┌────────────────────┐
+│  Per-agent collectors         │ ────────────────────────────▶ │  ESP32 (CYD)       │
+│   - Claude statusline hook    │   AgentSnapshot JSON          │   - mDNS advert    │
+│   - Codex app-server daemon   │   + X-BurnScope-Client-Id     │   - HTTP server    │
+│  Shared: schema, discovery,   │                               │   - NVS pairing    │
+│  identity, pusher, host_cache │                               │   - TFT renderer   │
+└───────────────────────────────┘                               └────────────────────┘
 ```
 
-See [`docs/description.md`](./docs/description.md) for the design rationale, [`docs/wire-format.md`](./docs/wire-format.md) for the daemon ↔ firmware contract, and [`docs/client-spec.html`](./docs/client-spec.html) for a component-level specification of the Python daemon.
+See:
 
-## Running the daemon
+- [`docs/description.md`](./docs/description.md) — design rationale & scope.
+- [`docs/wire-format.md`](./docs/wire-format.md) — daemon ↔ firmware contract (TOFU pairing, monotonic `captured_at`, `/health` shape, error codes).
+- [`docs/client-spec-v2.html`](./docs/client-spec-v2.html) — canonical v2 client spec.
+- [`docs/fsd/firmware-fsd.md`](./docs/fsd/firmware-fsd.md) — firmware functional spec.
 
-The CLI entry point is `burnscope-client`. With both Claude and Codex logged in:
+(The historical v1 client spec lives at `docs/client-spec.html` for reference.)
+
+## Installing the client
+
+The CLI entry point is `burnscope-client` (installer/status only, not a
+daemon entry).
 
 ```bash
-burnscope-client                       # probe every detected agent
-burnscope-client --agent claude        # restrict to one agent
-burnscope-client --agent claude --agent codex   # explicit list
-burnscope-client --esp32-host burnscope.local   # bypass mDNS
+pip install -e ./client
+burnscope-client install claude   # writes Claude Code statusline hook
+burnscope-client install codex    # launchd (macOS) or systemd --user (Linux)
+burnscope-client status           # confirm wiring + last push outcomes
+burnscope-client pair-reset       # forget cached host + per-agent client_ids
 ```
 
-The daemon exits with a friendly message if no agent credentials are found.
+`install` is per-agent — install only the ones you use. The status command
+prints the cached ESP32 host, identifier source per agent, and the last-push
+indicator under `~/.burnscope/`.
+
+Debugging tips and log-level controls live in [`client/README.md`](./client/README.md).
+
+## Building & flashing the firmware
+
+```bash
+. ~/.espressif/v6.0.1/esp-idf/export.sh
+cd firmware
+idf.py set-target esp32
+idf.py -p <PORT> flash monitor
+```
+
+First boot brings up a captive portal (`BURNSCOPE-XXXX` open AP) for WiFi.
+Full details, re-provisioning, and on-device smoke tests in
+[`firmware/README.md`](./firmware/README.md).
 
 ## Repository layout
 
 ```
 burnscope/
 ├── README.md
-├── CLAUDE.md            ← in-repo agent instructions
+├── .claude/CLAUDE.md             ← in-repo agent instructions
 ├── docs/
-│   ├── description.md   ← project goals, scope, design notes
-│   └── wire-format.md   ← daemon ↔ firmware contract
-├── client/              ← Python daemon
+│   ├── description.md            ← design rationale
+│   ├── wire-format.md            ← daemon ↔ firmware contract
+│   ├── client-spec-v2.html       ← v2 client spec (current)
+│   ├── client-spec.html          ← v1 client spec (historical)
+│   ├── claude-statusline.html    ← Claude Code statusline reference
+│   ├── codex-app-server.html     ← codex app-server reference
+│   └── fsd/firmware-fsd.md       ← firmware functional spec
+├── client/                       ← Python collectors (v2)
 │   └── src/burnscope_client/
-│       ├── schema.py        ← wire-format dataclasses
-│       ├── agent.py         ← Agent ABC
-│       ├── credentials.py   ← Credential ABC + readers
-│       ├── agents/          ← one module per supported provider
-│       ├── daemon.py
-│       └── cli.py
-└── firmware/            ← ESP32 firmware (ESP-IDF, CYD)
+│       ├── schema.py             ← SessionSnapshot / AgentSnapshot
+│       ├── discovery.py          ← mDNS browse for _burnscope._tcp.local
+│       ├── identity.py           ← plaintext client_id resolver
+│       ├── host_cache.py         ← atomic ~/.burnscope/ state
+│       ├── pusher.py             ← POST /summary, GET /health
+│       ├── claude_statusline.py  ← Claude Code statusline hook (per-fire)
+│       ├── codex_daemon.py       ← long-lived Codex daemon
+│       └── cli.py                ← install/uninstall/status/pair-reset
+└── firmware/                     ← ESP32 firmware (ESP-IDF, CYD)
 ```
 
 ## Adding a new agent
 
-1. Create `client/src/burnscope_client/agents/<name>.py`.
-2. Define a frozen `<Name>Credential(Credential)` dataclass with a `load(**kwargs)` classmethod — reuse `cls._read_file`, `cls._read_keychain`, and `cls._parse_json` from the base.
-3. Define `<Name>Agent(Agent)` with `name`, the credential storage location as class attributes, an `__init__(credential)`, a `probe()` that returns an `AgentSnapshot` (normalising any upstream scale to `0.0`-`1.0`), and a `load_credential()` classmethod.
-4. Register the class in `_AGENT_CLASSES` in `cli.py`.
+There's no single Agent ABC to subclass. Each agent has its own lifecycle:
 
-See `agents/claude.py` and `agents/codex.py` for working examples.
+- **Statusline-style (per-fire)** — write a script like
+  `claude_statusline.py` that builds an `AgentSnapshot` and forks a detached
+  `--push` child. Register a `burnscope-client install <agent>` path that
+  wires the supervisor (e.g. `settings.json` for Claude Code).
+- **Daemon-style (long-lived)** — write a module like `codex_daemon.py`
+  that owns its upstream subprocess, queues snapshots, and pushes them.
+  Register a `burnscope-client install <agent>` path that drops a launchd
+  plist / systemd unit.
+
+In both cases reuse the shared modules: `schema` (frozen dataclasses,
+matches the wire format), `discovery` (mDNS), `host_cache` (atomic state),
+`identity` (resolves the plaintext identifier sent in the header), and
+`pusher` (the actual HTTP call). The firmware contract is agent-agnostic;
+all the per-agent work is upstream of `schema.AgentSnapshot`.

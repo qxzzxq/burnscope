@@ -50,10 +50,14 @@ Booting…  ──►  Connecting…  ──►  Waiting for daemon…
 
 Two equivalent paths:
 
-- **Long-press the BOOT button** (GPIO0) for ≥ 5 s. The device wipes
-  NVS and reboots back into the captive portal.
-- **Remote:** `curl -X POST http://burnscope-XXXX.local/factory-reset` —
-  responds 202 then reboots.
+**Long-press the BOOT button** (GPIO0) for ≥ 5 s. The device wipes both
+the WiFi credentials and the per-agent pairing slots, then reboots
+into the captive portal. The next `POST /summary` from any laptop will
+rebind verbatim (TOFU).
+
+A network-triggered factory-reset endpoint isn't exposed in MVP — the
+route had no auth and was pulled until an auth scheme lands. Use the
+BOOT button in the meantime.
 
 ## Display profiles (build parameter)
 
@@ -92,7 +96,6 @@ second).
 |------------|---------------------------------------------------------------------------|
 | TC-CP-100  | Erase NVS, boot, walk through portal → STA-connected without re-flash.   |
 | TC-NVS-102 | BOOT button held ≥ 5 s ⇒ portal returns on the next boot.                |
-| TC-NVS-103 | `POST /factory-reset` ⇒ 202 + portal returns.                            |
 | TC-SUM-100 | `POST /summary` with `docs/examples/summary-push.json` → 204, UI repaints.|
 | TC-SUM-101 | Push claude, then codex — UI cycles between them every ~5 s.             |
 | TC-SUM-104 | `used_pct = 1.5` ⇒ 400.                                                  |

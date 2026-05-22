@@ -71,7 +71,17 @@ the wire.
 | Header                   | Required | Description |
 |--------------------------|----------|-------------|
 | `Content-Type`           | yes      | `application/json` |
-| `X-BurnScope-Client-Id`  | optional today, will become required | Plaintext per-agent identifier. Claude collectors send `oauthAccount.emailAddress` (or top-level `userID` as fallback) from `~/.claude.json`; the Codex collector sends `account.email` from the app-server `account/read` response. Value is ASCII-printable, no control characters, length ≤ 254 bytes (RFC 5321 mailbox cap). The ESP32 stores it verbatim — no parsing — and the display can render it as the owner label per agent. **Currently the firmware accepts pushes regardless of header value; first-use pairing enforcement is a Phase-2 firmware change (see "Deferred").** |
+| `X-BurnScope-Client-Id`  | yes      | Plaintext per-agent identifier. Claude collectors send `oauthAccount.emailAddress` (or top-level `userID` as fallback) from `~/.claude.json`; the Codex collector sends `account.email` from the app-server `account/read` response. Value is ASCII-printable, no control characters, length ≤ 254 bytes (RFC 5321 mailbox cap). The ESP32 stores it verbatim and renders it as the owner label per agent. Authorisation is trust-on-first-use: an empty pairing slot accepts and persists the header; subsequent pushes must match (mismatch → `401 Unauthorized`). Re-pair via the BOOT-button long-press / AP-mode reprovision flow. |
+
+### Error responses
+
+| Status | Body | When |
+|--------|------|------|
+| `204 No Content`        | empty | Snapshot accepted. |
+| `400 Bad Request`       | text/plain reason | Empty body, malformed JSON, unknown agent, or schema violation. |
+| `401 Unauthorized`      | `{"error":"client id required"}` or `{"error":"client id mismatch"}` | Missing/empty header, or header doesn't match the bound id for this agent. |
+| `409 Conflict`          | `{"error":"stale captured_at"}` | Incoming `captured_at` is strictly older than the stored snapshot's. Idempotent equal values are accepted. Multi-laptop / multi-session deployments converge to the freshest data. |
+| `413 Content Too Large` | text/plain | Body exceeds the 16 KiB cap. |
 
 ## `GET /health`
 
@@ -93,11 +103,17 @@ Each entry under `agents`:
 
 | Field                     | Type    | Description |
 |---------------------------|---------|-------------|
+| `client_id`               | string  | The bound `X-BurnScope-Client-Id` for this agent. Lets the daemon detect drift after a factory reset (slot was cleared → daemon resends to TOFU-rebind). Empty string when no slot was filled at probe time. |
 | `seconds_since_last_push` | integer | Age of the stored snapshot in seconds. |
 | `sessions`                | array of `SessionSnapshot` | Same shape as `POST /summary`'s `sessions`. Lets the daemon detect when the firmware's stored content has diverged from the latest upstream probe without waiting for a content change to push. |
 
 The firmware does not act on the request beyond responding —
 receiving `/health` does not refresh the snapshot store or the display.
+
+Authorisation matches the `/summary` rule: `X-BurnScope-Client-Id`
+must equal *any* populated pairing slot. A fresh device with no
+bindings accepts header-less probes so the daemon's first contact
+succeeds. Mismatches return `401 Unauthorized`.
 
 ---
 
@@ -145,19 +161,6 @@ re-litigate without a reason.
 - **Historical aggregates.** No daily totals, no per-session breakdown. The
   firmware keeps only the latest snapshot per agent.
 - **Cost/dollar estimates.** Token-based metrics only.
-- **Per-agent client-ID enforcement.** Today `POST /summary` accepts any
-  pushes from the LAN regardless of `X-BurnScope-Client-Id`. Phase-2
-  firmware adds trust-on-first-use pairing: at boot the ESP32 reads
-  `nvs::client_id[agent]`; an incoming request either matches the stored
-  string (accept), matches an empty slot (accept and persist), or
-  mismatches (`401 Unauthorized` with no state change). Re-pair by
-  erasing NVS (`idf.py erase-flash`) or the documented boot-button-hold
-  path. The header itself is on the wire today so v2 clients are
-  forward-compatible.
-- **Monotonic `captured_at` guard.** Phase-2 firmware tracks the highest
-  `captured_at` seen per agent and silently drops older snapshots
-  (still returns `204` so clients don't retry). Ensures multi-laptop /
-  multi-session deployments converge to the freshest data.
 - **Intermediate aggregation server.** An earlier MVP draft had a Go server
   fronting the firmware. Cut because for one laptop + one display it added
   installs and an always-on process without buying anything. It earns its

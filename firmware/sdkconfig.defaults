@@ -15,8 +15,10 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 #  - montserrat_28 is the agent-screen header ("Usage").
 #  - montserrat_24 is the splash title and status line.
 #  - montserrat_16 is the agent-screen body labels (type chip, %, countdown).
+#  - montserrat_10 is the agent-screen footer (owner client-id + "updated …").
 #  - unscii_16 is the body's monospaced bitmap font (FR-4.2).
 CONFIG_LV_COLOR_DEPTH_16=y
+CONFIG_LV_FONT_MONTSERRAT_10=y
 CONFIG_LV_FONT_MONTSERRAT_16=y
 CONFIG_LV_FONT_MONTSERRAT_24=y
 CONFIG_LV_FONT_MONTSERRAT_28=y

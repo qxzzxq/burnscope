@@ -30,6 +30,23 @@ static void on_snapshot(const agent_snapshot_t *snap, void *user)
     display_profile_show_agent(snap);
 }
 
+/* Helper for restoring the agent view after a reconnect: grab the first
+ * occupied slot from the snapshot store. The 1 Hz UI tick takes care of
+ * cycling between agents from there. */
+typedef struct {
+    agent_snapshot_t snap;
+    bool             found;
+} first_snap_t;
+
+static void grab_first_snapshot(const agent_snapshot_t *snap, void *user)
+{
+    first_snap_t *out = (first_snap_t *)user;
+    if (!out->found) {
+        out->snap  = *snap;
+        out->found = true;
+    }
+}
+
 static void on_wifi_state(wifi_state_t state)
 {
     switch (state) {
@@ -46,8 +63,19 @@ static void on_wifi_state(wifi_state_t state)
         mdns_svc_start();
         ntp_start();
         http_server_start();
+        /* Restore whichever view makes sense for the moment:
+         *   - Fresh boot, no data yet: "Waiting for daemon..."
+         *   - Reconnect after a blip with snapshots still in RAM: jump
+         *     straight back to the agent view instead of leaving the
+         *     "Reconnecting..." splash up until the next push lands. */
         if (snapshot_store_count() == 0) {
             display_profile_show_status("Waiting for daemon...");
+        } else {
+            first_snap_t fs = { .found = false };
+            snapshot_store_foreach(grab_first_snapshot, &fs);
+            if (fs.found) {
+                display_profile_show_agent(&fs.snap);
+            }
         }
         break;
     case WIFI_STATE_AP_MODE:

@@ -45,10 +45,10 @@ void snapshot_store_init(void)
     memset(s_slots, 0, sizeof(s_slots));
 }
 
-bool snapshot_store_put(const agent_snapshot_t *snap)
+snapshot_put_result_t snapshot_store_put(const agent_snapshot_t *snap)
 {
     if (snap == NULL || snap->agent[0] == '\0') {
-        return false;
+        return SNAPSHOT_PUT_NO_SLOT;
     }
     lock();
 
@@ -67,7 +67,19 @@ bool snapshot_store_put(const agent_snapshot_t *snap)
     if (slot < 0) {
         unlock();
         ESP_LOGW(TAG, "no free slot for agent '%s'", snap->agent);
-        return false;
+        return SNAPSHOT_PUT_NO_SLOT;
+    }
+
+    /* Monotonic guard: in a multi-laptop deployment two daemons may race;
+     * we keep the snapshot with the highest `captured_at` and drop older
+     * ones so the display converges to the freshest data. Equal values
+     * are accepted (idempotent re-push after /health reconciliation). */
+    if (existing >= 0 && snap->captured_at < s_slots[slot].captured_at) {
+        int64_t stored = s_slots[slot].captured_at;
+        unlock();
+        ESP_LOGW(TAG, "stale snapshot for '%s': incoming=%lld stored=%lld",
+                 snap->agent, (long long)snap->captured_at, (long long)stored);
+        return SNAPSHOT_PUT_STALE;
     }
 
     s_slots[slot] = *snap;
@@ -84,7 +96,7 @@ bool snapshot_store_put(const agent_snapshot_t *snap)
     if (cb != NULL) {
         cb(&copy, cb_user);
     }
-    return true;
+    return SNAPSHOT_PUT_OK;
 }
 
 bool snapshot_store_get(const char *agent, agent_snapshot_t *out)

@@ -8,18 +8,24 @@
 
 static const char *TAG = "nvs";
 
-#define NS              "burnscope_wifi"
+#define NS_WIFI         "burnscope_wifi"
 #define KEY_SSID        "ssid"
 #define KEY_PASSWORD    "password"
 
-static esp_err_t open_ro(nvs_handle_t *out)
+/* Pairing slots live in a separate namespace so an `nvs_erase_all` of the
+ * WiFi namespace during reprovision wouldn't touch them — we want to
+ * decide explicitly when to wipe the client-ids (and we do, from
+ * `factory_reset.c`). */
+#define NS_PAIR         "burnscope_pair"
+
+static esp_err_t open_ro(const char *ns, nvs_handle_t *out)
 {
-    return nvs_open(NS, NVS_READONLY, out);
+    return nvs_open(ns, NVS_READONLY, out);
 }
 
-static esp_err_t open_rw(nvs_handle_t *out)
+static esp_err_t open_rw(const char *ns, nvs_handle_t *out)
 {
-    return nvs_open(NS, NVS_READWRITE, out);
+    return nvs_open(ns, NVS_READWRITE, out);
 }
 
 esp_err_t nvs_store_load_creds(wifi_creds_t *out)
@@ -29,7 +35,7 @@ esp_err_t nvs_store_load_creds(wifi_creds_t *out)
     }
 
     nvs_handle_t h;
-    esp_err_t err = open_ro(&h);
+    esp_err_t err = open_ro(NS_WIFI, &h);
     if (err != ESP_OK) {
         return ESP_ERR_NVS_NOT_FOUND;
     }
@@ -65,7 +71,7 @@ esp_err_t nvs_store_save_creds(const wifi_creds_t *in)
     }
 
     nvs_handle_t h;
-    esp_err_t err = open_rw(&h);
+    esp_err_t err = open_rw(NS_WIFI, &h);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "nvs_open RW failed: %s", esp_err_to_name(err));
         return err;
@@ -92,7 +98,7 @@ esp_err_t nvs_store_save_creds(const wifi_creds_t *in)
 esp_err_t nvs_store_erase_creds(void)
 {
     nvs_handle_t h;
-    esp_err_t err = open_rw(&h);
+    esp_err_t err = open_rw(NS_WIFI, &h);
     if (err != ESP_OK) {
         return err;
     }
@@ -112,4 +118,114 @@ bool nvs_store_has_creds(void)
 {
     wifi_creds_t tmp;
     return nvs_store_load_creds(&tmp) == ESP_OK;
+}
+
+/* --------------------------------------------------------------------- */
+/* Per-agent pairing slots                                                */
+/* --------------------------------------------------------------------- */
+
+esp_err_t nvs_store_load_client_id(const char *agent, char *out, size_t cap)
+{
+    if (agent == NULL || agent[0] == '\0' || out == NULL ||
+        cap < BURNSCOPE_CLIENT_ID_MAX) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    nvs_handle_t h;
+    esp_err_t err = open_ro(NS_PAIR, &h);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        /* Namespace absent before the first save — empty slot. */
+        return ESP_ERR_NVS_NOT_FOUND;
+    }
+    if (err != ESP_OK) {
+        /* Real NVS failure (uninitialised, corrupt, invalid args, …).
+         * Surface it so authorize_summary refuses to TOFU-rebind over a
+         * slot we can't actually read. */
+        return err;
+    }
+
+    size_t len = cap;
+    out[0] = '\0';
+    err = nvs_get_str(h, agent, out, &len);
+    nvs_close(h);
+
+    /* Only key-absent and explicitly-empty values count as "no binding".
+     * Other failures (size mismatch, corruption, type mismatch, …) must
+     * propagate so the caller refuses to TOFU-rebind over a slot that
+     * may still be populated. */
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_ERR_NVS_NOT_FOUND;
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (out[0] == '\0') {
+        return ESP_ERR_NVS_NOT_FOUND;
+    }
+    return ESP_OK;
+}
+
+esp_err_t nvs_store_save_client_id(const char *agent, const char *id)
+{
+    if (agent == NULL || agent[0] == '\0' || id == NULL || id[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* Defensive bounds: callers should never get this wrong, but
+     * `nvs_set_str` would happily write a huge blob if we let it. */
+    if (strnlen(id, BURNSCOPE_CLIENT_ID_MAX) >= BURNSCOPE_CLIENT_ID_MAX) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* Skip-write-when-equal — same anti-wear defence as save_creds. */
+    char cur[BURNSCOPE_CLIENT_ID_MAX];
+    if (nvs_store_load_client_id(agent, cur, sizeof(cur)) == ESP_OK &&
+        strcmp(cur, id) == 0) {
+        return ESP_OK;
+    }
+
+    nvs_handle_t h;
+    esp_err_t err = open_rw(NS_PAIR, &h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "nvs_open RW (pair) failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    err = nvs_set_str(h, agent, id);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+
+    if (err == ESP_OK) {
+        /* Identifier (likely an email) stays out of the log — log only
+         * length, so a recurring pair-storm is still observable. */
+        ESP_LOGI(TAG, "bound %s (id %u bytes)", agent, (unsigned)strlen(id));
+    } else {
+        ESP_LOGE(TAG, "failed to bind %s: %s", agent, esp_err_to_name(err));
+    }
+    return err;
+}
+
+esp_err_t nvs_store_erase_client_ids(void)
+{
+    nvs_handle_t h;
+    esp_err_t err = open_rw(NS_PAIR, &h);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        /* Namespace never existed — nothing to erase. */
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+    /* Wipe everything in the pairing namespace. Safe because this
+     * namespace is dedicated to pairing slots — no foreign keys. */
+    err = nvs_erase_all(h);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "erased all pairing slots");
+    }
+    return err;
 }

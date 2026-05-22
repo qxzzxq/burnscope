@@ -90,11 +90,24 @@
     --chip-fg: #F9F2DF;
     --pct-fg: #F9F2DF;
     --countdown-fg: #B0ACA0;
+    --footer-fg: #5C5C5C;
     --bar-track: #2F2F2F;
     --row1: #DE7356;
     --row2: #A4A049;
     --bar-radius: 3px;
     --bar-height: 15px;
+
+    /* Vertical layout knobs — kept in sync with the slider defaults in
+     * the sidebar so a fresh load matches the on-device firmware
+     * constants (40/8/5/3/14/32). `recomputeLayout()` overwrites these
+     * on load with the slider values, but a static viewer (no JS) and
+     * anyone diffing the CSS should see the same numbers. */
+    --header-h: 40px;
+    --inter-gap: 8px;
+    --footer-top-margin: 5px;
+    --footer-bottom-margin: 3px;
+    --footer-h: 14px;
+    --bar-y: 32px;
 
     width: 320px;
     height: 240px;
@@ -143,19 +156,44 @@
   }
   .title-icon > svg { display: block; width: 100%; height: 100%; }
 
-  /* Rows. Two cards, 88 px tall, 304 wide, centred, with 8 px gap. */
+  /* Rows. Two cards, 304 wide, centred. Height and y-positions are
+   * computed in JS from --header-h / --inter-gap / --footer-*-margin
+   * so the layout sliders stay in sync with the visual. */
   .row {
     position: absolute;
     left: 8px; right: 8px;
     width: 304px;
-    height: 88px;
+    height: var(--row-h);
     background: var(--card-bg);
     border-radius: 8px;
     padding: 6px;
     box-sizing: border-box;
   }
-  .row.r1 { top: 48px; }   /* 40 + 8 */
-  .row.r2 { top: 144px; }  /* 40 + 8 + 88 + 8 */
+  .row.r1 { top: var(--row1-top); }
+  .row.r2 { top: var(--row2-top); }
+
+  /* Footer band — owner client-id (LVGL DOT-truncated) on the left,
+   * `updated YYYY-MM-DD HH:MM` (UTC) on the right. Same Montserrat 10
+   * font as the firmware footer. Bottom margin is configurable. */
+  .footer {
+    position: absolute;
+    left: 8px; right: 8px;
+    bottom: var(--footer-bottom-margin);
+    height: var(--footer-h);
+    font-family: "Montserrat", sans-serif;
+    font-size: 10px;
+    line-height: var(--footer-h);
+    color: var(--footer-fg);
+    display: flex;
+    justify-content: space-between;
+    pointer-events: none;
+  }
+  .footer .cid {
+    max-width: 184px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
 
   .chip {
     position: absolute;
@@ -176,9 +214,13 @@
     font-family: "Montserrat", sans-serif;
   }
 
+  /* Bar Y is driven by --bar-y, which sits in the card's *content* area
+   * (after the 6 px padding). So the absolute top inside the card is
+   * 6 + bar-y. The slider in the sidebar updates --bar-y directly. */
   .bar {
     position: absolute;
-    left: 6px; top: 40px;
+    left: 6px;
+    top: calc(6px + var(--bar-y));
     width: 292px;
     height: var(--bar-height);
     background: var(--bar-track);
@@ -334,6 +376,11 @@
           <div class="bar"><i style="width:17%"></i></div>
           <div class="countdown body" id="cd2">resets in 4d 02h</div>
         </div>
+
+        <div class="footer">
+          <div class="cid">claude@yutingyang.com</div>
+          <div class="ts">updated 2026-05-21 21:48</div>
+        </div>
       </div>
     </div>
 
@@ -402,6 +449,10 @@
         <input type="color" id="c-cd" data-var="--countdown-fg" value="#B0ACA0">
       </div>
       <div class="swatch-row">
+        <label for="c-footer">Footer text (owner + updated)</label>
+        <input type="color" id="c-footer" data-var="--footer-fg" value="#5C5C5C">
+      </div>
+      <div class="swatch-row">
         <label for="c-row1">Row 1 bar fill</label>
         <input type="color" id="c-row1" data-var="--row1" value="#DE7356">
       </div>
@@ -425,6 +476,30 @@
       <div class="swatch-row">
         <label for="bar-height">Height <span id="bar-height-val">15 px</span></label>
         <input type="range" id="bar-height" min="2" max="40" step="1" value="15" style="width:90px">
+      </div>
+    </div>
+
+    <h2>Layout (px)</h2>
+    <div class="group" id="layout-group">
+      <div class="swatch-row">
+        <label for="inter-gap">Inter-row gap <span id="inter-gap-val">8 px</span></label>
+        <input type="range" id="inter-gap" min="0" max="20" step="1" value="8" style="width:90px">
+      </div>
+      <div class="swatch-row">
+        <label for="footer-top-margin">Footer top margin <span id="footer-top-margin-val">5 px</span></label>
+        <input type="range" id="footer-top-margin" min="0" max="30" step="1" value="5" style="width:90px">
+      </div>
+      <div class="swatch-row">
+        <label for="footer-bottom-margin">Footer bottom margin <span id="footer-bottom-margin-val">3 px</span></label>
+        <input type="range" id="footer-bottom-margin" min="0" max="30" step="1" value="3" style="width:90px">
+      </div>
+      <div class="swatch-row">
+        <label for="bar-y">Bar Y (in card content) <span id="bar-y-val">32 px</span></label>
+        <input type="range" id="bar-y" min="0" max="60" step="1" value="32" style="width:90px">
+      </div>
+      <div class="swatch-row">
+        <label>Row height (derived)</label>
+        <span id="row-h-val" style="color:var(--accent); font-family: ui-monospace, monospace; font-size:12px;">80 px</span>
       </div>
     </div>
 
@@ -657,6 +732,54 @@
   }
   barHeightEl.addEventListener("input", applyBarHeight);
   applyBarHeight();
+
+  // Layout sliders. Row height is derived so the four vertical regions
+  // (header / row1 / row2 / footer) always sum to 240. If the chosen
+  // margins would force a negative row height the row-h readout turns
+  // red — the user is asking for more whitespace than the panel has.
+  const interGapEl    = $("inter-gap");
+  const footerTopEl   = $("footer-top-margin");
+  const footerBottomEl= $("footer-bottom-margin");
+  const barYEl        = $("bar-y");
+  const interGapValEl    = $("inter-gap-val");
+  const footerTopValEl   = $("footer-top-margin-val");
+  const footerBottomValEl= $("footer-bottom-margin-val");
+  const barYValEl        = $("bar-y-val");
+  const rowHValEl        = $("row-h-val");
+
+  const HEADER_H = 40;
+  const FOOTER_H = 14;
+  const PANEL_H  = 240;
+
+  function recomputeLayout() {
+    const g  = parseInt(interGapEl.value, 10);
+    const ft = parseInt(footerTopEl.value, 10);
+    const fb = parseInt(footerBottomEl.value, 10);
+    const by = parseInt(barYEl.value, 10);
+
+    // [HEADER_H][g][row][g][row][ft][FOOTER_H][fb] == PANEL_H
+    const rowH = (PANEL_H - HEADER_H - g - g - ft - FOOTER_H - fb) / 2;
+
+    interGapValEl.textContent     = g  + " px";
+    footerTopValEl.textContent    = ft + " px";
+    footerBottomValEl.textContent = fb + " px";
+    barYValEl.textContent         = by + " px";
+    rowHValEl.textContent         = rowH + " px";
+    rowHValEl.style.color = rowH < 24 ? "#ff6b6b" : "var(--accent)";
+
+    panelEl.style.setProperty("--inter-gap", g + "px");
+    panelEl.style.setProperty("--footer-top-margin", ft + "px");
+    panelEl.style.setProperty("--footer-bottom-margin", fb + "px");
+    panelEl.style.setProperty("--footer-h", FOOTER_H + "px");
+    panelEl.style.setProperty("--bar-y", by + "px");
+    panelEl.style.setProperty("--row-h", rowH + "px");
+    panelEl.style.setProperty("--row1-top", (HEADER_H + g) + "px");
+    panelEl.style.setProperty("--row2-top", (HEADER_H + g + rowH + g) + "px");
+  }
+  [interGapEl, footerTopEl, footerBottomEl, barYEl].forEach(el => {
+    el.addEventListener("input", recomputeLayout);
+  });
+  recomputeLayout();
 
   redraw();
 </script>

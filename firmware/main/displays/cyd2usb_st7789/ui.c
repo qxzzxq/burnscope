@@ -67,7 +67,7 @@ static char s_visible_agent[SNAPSHOT_AGENT_MAX] = "";
 /*
  * Cached client-id per known agent, fetched from NVS once per visible
  * cycle. We intentionally never read NVS from the LVGL render path —
- * `refresh_footer_cache_locked` runs only when we swap to a new agent.
+ * `refresh_footer_cid` runs only when we swap to a new agent.
  * Index 0 = "claude", 1 = "codex"; mirrors the agent name array below.
  */
 static const char *const FOOTER_AGENTS[] = { "claude", "codex" };

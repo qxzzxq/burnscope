@@ -137,9 +137,21 @@ static const char *const KNOWN_AGENTS[] = { "claude", "codex" };
 /*
  * Read `X-BurnScope-Client-Id` into `out`. Returns:
  *   - 0 on success (NUL-terminated, possibly empty).
- *   - -1 if the header is too long for our cap (caller should 401).
+ *   - -1 if the header is too long, missing, or contains characters
+ *     that would need JSON-string escaping. `/health` writes the
+ *     stored value naked into its JSON body, so we forbid `"`, `\`,
+ *     and control bytes at intake rather than escape on output.
+ *     Caller should 401.
  * `out` is always NUL-terminated on return.
  */
+static bool client_id_byte_ok(unsigned char c)
+{
+    /* Printable ASCII excluding the two JSON-string metacharacters.
+     * Emails and Claude userIDs comfortably fit this set; rejecting
+     * anything else early keeps the /health writer simple. */
+    return c >= 0x20 && c != '"' && c != '\\' && c < 0x7F;
+}
+
 static int read_client_id_header(httpd_req_t *req, char *out, size_t cap)
 {
     out[0] = '\0';
@@ -155,6 +167,12 @@ static int read_client_id_header(httpd_req_t *req, char *out, size_t cap)
     if (httpd_req_get_hdr_value_str(req, "X-BurnScope-Client-Id", out, cap) != ESP_OK) {
         out[0] = '\0';
         return -1;
+    }
+    for (size_t i = 0; out[i] != '\0'; ++i) {
+        if (!client_id_byte_ok((unsigned char)out[i])) {
+            out[0] = '\0';
+            return -1;
+        }
     }
     return 0;
 }
@@ -484,15 +502,15 @@ static bool authorize_health(httpd_req_t *req)
     /* Survey populated slots first. */
     char slots[KNOWN_AGENT_COUNT][BURNSCOPE_CLIENT_ID_MAX];
     bool slot_filled[KNOWN_AGENT_COUNT] = { false };
-    bool any_filled = false;
+    int  filled_count = 0;
     for (size_t i = 0; i < KNOWN_AGENT_COUNT; ++i) {
         slots[i][0] = '\0';
         if (nvs_store_load_client_id(KNOWN_AGENTS[i], slots[i], sizeof(slots[i])) == ESP_OK) {
             slot_filled[i] = true;
-            any_filled = true;
+            filled_count++;
         }
     }
-    if (!any_filled) {
+    if (filled_count == 0) {
         /* No bindings yet — accept anything so first contact works. */
         return true;
     }
@@ -500,7 +518,7 @@ static bool authorize_health(httpd_req_t *req)
     char header[BURNSCOPE_CLIENT_ID_MAX];
     if (read_client_id_header(req, header, sizeof(header)) != 0 || header[0] == '\0') {
         ESP_LOGW(TAG, "/health missing X-BurnScope-Client-Id (have %d binding(s))",
-                 (int)KNOWN_AGENT_COUNT);
+                 filled_count);
         httpd_resp_set_status(req, "401 Unauthorized");
         httpd_resp_set_type(req, "application/json");
         const char *body = "{\"error\":\"client id required\"}";
@@ -554,6 +572,13 @@ static esp_err_t health_get_handler(httpd_req_t *req)
                        BURNSCOPE_FW_VERSION,
                        (unsigned long)uptime_s,
                        (unsigned long)free_heap);
+    /* snprintf returns <0 on encoding error and >=cap on truncation.
+     * Either would corrupt agents_writer_t's off / overflow detection;
+     * fail cleanly instead. */
+    if (off < 0 || (size_t)off >= cap) {
+        free(body);
+        return httpd_resp_send_500(req);
+    }
 
     agents_writer_t w = { .body = body, .cap = cap, .off = (size_t)off, .first = true };
     snapshot_store_foreach(append_agent, &w);

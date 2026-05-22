@@ -20,6 +20,7 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "nvs.h"
 
 #include "nvs_store.h"
 #include "snapshot.h"

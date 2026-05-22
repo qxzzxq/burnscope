@@ -288,15 +288,26 @@ static esp_err_t summary_post_handler(httpd_req_t *req)
         return reject_400(req, "invalid AgentSnapshot");
     }
 
-    if (!snapshot_store_put(&snap)) {
+    switch (snapshot_store_put(&snap)) {
+    case SNAPSHOT_PUT_OK:
+        ESP_LOGI(TAG, "snapshot accepted: agent=%s sessions=%d",
+                 snap.agent, snap.session_count);
+        httpd_resp_set_status(req, "204 No Content");
+        httpd_resp_send(req, NULL, 0);
+        return ESP_OK;
+    case SNAPSHOT_PUT_STALE: {
+        /* Monotonic-guard reject. Honest about *why* with a 409 so the
+         * daemon can log/skip rather than silently retry. */
+        const char *body = "{\"error\":\"stale captured_at\"}";
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, body, strlen(body));
+        return ESP_OK;
+    }
+    case SNAPSHOT_PUT_NO_SLOT:
+    default:
         return httpd_resp_send_500(req);
     }
-
-    ESP_LOGI(TAG, "snapshot accepted: agent=%s sessions=%d",
-             snap.agent, snap.session_count);
-    httpd_resp_set_status(req, "204 No Content");
-    httpd_resp_send(req, NULL, 0);
-    return ESP_OK;
 }
 
 /* --------------------------------------------------------------------- */

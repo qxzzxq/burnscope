@@ -51,7 +51,7 @@ static lv_obj_t *s_agent_screen  = NULL;
 static lv_obj_t *s_agent_icon    = NULL;     /* header brand icon (lv_image) */
 static lv_obj_t *s_agent_label   = NULL;     /* "Usage" or agent name */
 static lv_obj_t *s_footer_left   = NULL;     /* bound client_id (subtle gray) */
-static lv_obj_t *s_footer_right  = NULL;     /* "updated YYYY-MM-DD HH:MM" UTC */
+static lv_obj_t *s_footer_right  = NULL;     /* "updated N min ago" (relative) */
 typedef struct {
     lv_obj_t *card;
     lv_obj_t *type_lbl;
@@ -306,10 +306,11 @@ static void build_agent_screen(void)
     /* Footer band. Warm off-white that sits in the same family as the
      * row labels — readable but smaller than the body type, so the eye
      * lands on the percentages first. The right-hand timestamp formatter
-     * writes UTC (firmware has no TZ knowledge — NTP gives us
-     * seconds-since-epoch, that's all). Truncation on the left label is
-     * handled by LVGL: dots mode replaces the overflow with an ellipsis
-     * when the label exceeds its width. */
+     * renders the snapshot age as a relative phrase ("N min ago"), so
+     * firmware never needs to care about the user's timezone — only the
+     * delta between two unix timestamps matters. Truncation on the left
+     * label is handled by LVGL: dots mode replaces the overflow with an
+     * ellipsis when the label exceeds its width. */
     const lv_color_t FOOTER_FG = lv_color_hex(0x5C5C5C);
 
     s_footer_left = lv_label_create(scr);
@@ -330,29 +331,36 @@ static void build_agent_screen(void)
 }
 
 /*
- * Format `captured_at` (unix seconds, UTC) into `out` as
- * "updated YYYY-MM-DD HH:MM". When NTP hasn't synced yet (captured_at
- * is plausibly bogus, < 2023-11-14) we write the empty string so the
- * footer right-half stays clean. */
-static void format_updated_utc(int64_t captured_at, char *out, size_t n)
+ * Format the age of `captured_at` (unix seconds) into `out` as a short
+ * relative phrase: "updated <1 min ago", "updated N min ago", "updated
+ * N hr ago", or "updated N days ago". Relative phrasing means we never
+ * have to know the user's timezone — only the delta between two unix
+ * timestamps matters. When either clock is unsynced (captured_at or
+ * the local wall clock < 2023-11-14) we write the empty string so the
+ * footer right-half stays clean. A negative delta (snapshot slightly
+ * in the future from clock skew) is rendered as "<1 min ago" rather
+ * than something nonsensical. */
+static void format_updated_relative(int64_t captured_at, char *out, size_t n)
 {
+    if (n == 0) return;
+    out[0] = '\0';
     if (captured_at < 1700000000) {
-        if (n > 0) out[0] = '\0';
         return;
     }
-    time_t t = (time_t)captured_at;
-    struct tm gm;
-    if (gmtime_r(&t, &gm) == NULL) {
-        if (n > 0) out[0] = '\0';
+    int64_t now = (int64_t)time(NULL);
+    if (now < 1700000000) {
         return;
     }
-    /* `ts` holds the bare strftime output "YYYY-MM-DD HH:MM" (16 chars
-     * + NUL = 17 bytes; 24 leaves ample slack). The "updated " prefix
-     * is added by the snprintf into `out` below, where the caller-
-     * supplied `n` is sized for the full 24-char banner + NUL. */
-    char ts[24];
-    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M", &gm);
-    snprintf(out, n, "updated %s", ts);
+    int64_t delta = now - captured_at;
+    if (delta < 60) {
+        snprintf(out, n, "updated <1 min ago");
+    } else if (delta < 3600) {
+        snprintf(out, n, "updated %d min ago", (int)(delta / 60));
+    } else if (delta < 86400) {
+        snprintf(out, n, "updated %d hr ago", (int)(delta / 3600));
+    } else {
+        snprintf(out, n, "updated %d days ago", (int)(delta / 86400));
+    }
 }
 
 static void render_footer_locked(const agent_snapshot_t *snap)
@@ -370,7 +378,7 @@ static void render_footer_locked(const agent_snapshot_t *snap)
     lv_label_set_text(s_footer_left, cid);
 
     char buf[32];
-    format_updated_utc(snap->captured_at, buf, sizeof(buf));
+    format_updated_relative(snap->captured_at, buf, sizeof(buf));
     lv_label_set_text(s_footer_right, buf);
 }
 

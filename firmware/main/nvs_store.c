@@ -18,6 +18,12 @@ static const char *TAG = "nvs";
  * `factory_reset.c`). */
 #define NS_PAIR         "burnscope_pair"
 
+/* LCD silicon-id cache (RDID1 byte). Lives in its own namespace so the
+ * AP-mode reprovision path's `nvs_store_erase_client_ids` can't wipe it
+ * by accident — the cache is hardware-derived, not credential. */
+#define NS_LCD          "burnscope_lcd"
+#define KEY_LCD_ID      "id"
+
 static esp_err_t open_ro(const char *ns, nvs_handle_t *out)
 {
     return nvs_open(ns, NVS_READONLY, out);
@@ -226,6 +232,54 @@ esp_err_t nvs_store_erase_client_ids(void)
     nvs_close(h);
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "erased all pairing slots");
+    }
+    return err;
+}
+
+/* --------------------------------------------------------------------- */
+/* LCD silicon-id cache                                                    */
+/* --------------------------------------------------------------------- */
+
+esp_err_t nvs_store_load_lcd_id(uint8_t *out)
+{
+    if (out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t h;
+    esp_err_t err = open_ro(NS_LCD, &h);
+    if (err != ESP_OK) {
+        /* Namespace absent before the first save — empty slot. */
+        return ESP_ERR_NVS_NOT_FOUND;
+    }
+    err = nvs_get_u8(h, KEY_LCD_ID, out);
+    nvs_close(h);
+    return err;
+}
+
+esp_err_t nvs_store_save_lcd_id(uint8_t id)
+{
+    /* Skip-write-when-equal: the LCD ID never changes once a board is
+     * built, so this only writes once per device lifetime. */
+    uint8_t cur = 0;
+    if (nvs_store_load_lcd_id(&cur) == ESP_OK && cur == id) {
+        return ESP_OK;
+    }
+
+    nvs_handle_t h;
+    esp_err_t err = open_rw(NS_LCD, &h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "nvs_open RW (lcd) failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    err = nvs_set_u8(h, KEY_LCD_ID, id);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "cached LCD ID 0x%02x", id);
+    } else {
+        ESP_LOGE(TAG, "failed to cache LCD ID: %s", esp_err_to_name(err));
     }
     return err;
 }

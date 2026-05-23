@@ -1,0 +1,939 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>BurnScope · AMOLED 1.43 layout tuner</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700&display=block" rel="stylesheet">
+<style>
+  /*
+   * BurnScope AMOLED-1.43 layout tuner.
+   *
+   * Renders the 466×466 round-display agent screen as inline SVG so the arcs
+   * are pixel-accurate at every zoom level. Every value the firmware will
+   * compile in is exposed as a slider in the sidebar; the snippet block at
+   * the bottom emits a JSON blob + C `#define` table that gets pasted into
+   * `firmware/main/displays/amoled_sh8601/ui.c` once the layout is locked.
+   *
+   * Mirrors the role of `font-preview.html` for the cyd2usb profile.
+   */
+  :root {
+    --bg: #0b0b0c;
+    --text: #e5e5e5;
+    --muted: #888;
+    --accent: #4FC3F7;
+    --warn: #ffb24a;
+    --danger: #ff6b6b;
+  }
+  html, body {
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.4 -apple-system, "Helvetica Neue", Arial, sans-serif;
+    margin: 0;
+    padding: 0;
+  }
+  .app {
+    display: grid;
+    grid-template-columns: auto 360px;
+    gap: 32px;
+    padding: 28px;
+    align-items: start;
+  }
+  .stage { display: flex; flex-direction: column; gap: 12px; align-items: flex-start; }
+  .stage-controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .stage-controls button {
+    background: #1b1b1d;
+    color: var(--text);
+    border: 1px solid #2a2a2d;
+    border-radius: 6px;
+    padding: 4px 10px;
+    font: inherit;
+    cursor: pointer;
+  }
+  .stage-controls button.on {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  /* The 466×466 panel, scaled via CSS transform without affecting layout. */
+  .panel-wrap {
+    background: #1a1a1c;
+    padding: 12px;
+    border-radius: 12px;
+    border: 1px solid #2a2a2d;
+    width: calc(466px * 1.25 + 24px);
+    height: calc(466px * 1.25 + 24px);
+    box-sizing: border-box;
+    display: flex;
+    align-items: flex-start;
+    justify-content: flex-start;
+  }
+  .panel {
+    width: 466px;
+    height: 466px;
+    background: #000;
+    position: relative;
+    overflow: hidden;
+    transform-origin: 0 0;
+    transform: scale(1.25);
+    /* Hardware round mask. The AMOLED only displays pixels inside the
+     * 233 px disc; outside that radius is invisible. We replicate the mask
+     * via CSS so layouts that bleed outside the disc visibly clip. */
+    -webkit-mask-image: radial-gradient(circle at 50% 50%, #000 232.5px, transparent 233px);
+            mask-image: radial-gradient(circle at 50% 50%, #000 232.5px, transparent 233px);
+  }
+  .panel.no-mask {
+    -webkit-mask-image: none;
+            mask-image: none;
+  }
+
+  /* SVG layer hosts the arcs + guides. DOM layer hosts text + chips. */
+  .panel svg { position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
+  .panel .dom { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; }
+
+  .header-label {
+    position: absolute;
+    left: 0; right: 0;
+    text-align: center;
+    font-family: "Montserrat", sans-serif;
+    font-weight: 400;
+    line-height: 1;
+    color: #F9F2DF;
+    transform: translateY(-50%);
+  }
+  .core-primary {
+    position: absolute;
+    left: 0; right: 0;
+    text-align: center;
+    font-family: "Montserrat", sans-serif;
+    font-weight: 500;
+    line-height: 1;
+    color: #F9F2DF;
+    transform: translateY(-50%);
+  }
+  .core-secondary {
+    position: absolute;
+    left: 0; right: 0;
+    text-align: center;
+    font-family: "Montserrat", sans-serif;
+    font-weight: 400;
+    line-height: 1;
+    color: #B0ACA0;
+    transform: translateY(-50%);
+  }
+  .core-icon {
+    position: absolute;
+    transform: translate(-50%, -50%);
+  }
+  .core-icon > svg { display: block; width: 100%; height: 100%; }
+
+  .pill {
+    position: absolute;
+    transform: translate(-50%, -50%);
+    background: #2E2E2E;
+    color: #F9F2DF;
+    font-family: "Montserrat", sans-serif;
+    border-radius: 6px;
+    padding: 2px 8px;
+    line-height: 1.1;
+    white-space: nowrap;
+  }
+  .pill-countdown {
+    position: absolute;
+    transform: translateY(-50%);
+    font-family: "Montserrat", sans-serif;
+    color: #B0ACA0;
+    line-height: 1;
+    white-space: nowrap;
+  }
+  /* Footer is two stacked, centred lines: updated-time on top, email
+   * below. Full panel width so the centring is relative to the disc.
+   * line-height > 1 leaves room for descenders (p, g, y); without it,
+   * `overflow: hidden` clips the bottom curves. */
+  .footer-line {
+    position: absolute;
+    left: 0; right: 0;
+    text-align: center;
+    transform: translateY(-50%);
+    font-family: "Montserrat", sans-serif;
+    color: #5C5C5C;
+    line-height: 1.4;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* Splash overlay — toggled by the screen selector. */
+  .splash {
+    position: absolute;
+    left: 0; right: 0; top: 0; bottom: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    color: #F9F2DF;
+    font-family: "Montserrat", sans-serif;
+    text-align: center;
+  }
+  .splash.on { display: flex; }
+  .splash .title { font-weight: 400; }
+  .splash .status { font-weight: 400; max-width: 360px; }
+  .splash .version { color: #808080; font-weight: 400; }
+
+  /* Sidebar */
+  .sidebar {
+    background: #131316;
+    border: 1px solid #2a2a2d;
+    border-radius: 10px;
+    padding: 18px;
+    max-height: calc(100vh - 56px);
+    overflow-y: auto;
+  }
+  .sidebar h2 {
+    margin: 16px 0 8px 0;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .sidebar h2:first-child { margin-top: 0; }
+  .group { margin-bottom: 10px; }
+  .slider-row {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 6px;
+  }
+  .slider-row label {
+    font-size: 12px;
+    color: var(--muted);
+    margin: 0;
+  }
+  .slider-row .val {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 12px;
+    color: var(--accent);
+    min-width: 56px;
+    text-align: right;
+  }
+  .slider-row input[type="range"] {
+    grid-column: 1 / -1;
+    width: 100%;
+    margin: 0;
+  }
+  .row-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+  select {
+    width: 100%;
+    background: #1c1c1f;
+    color: var(--text);
+    border: 1px solid #2a2a2d;
+    border-radius: 6px;
+    padding: 6px 8px;
+    font: inherit;
+  }
+  .seg {
+    display: inline-flex;
+    border: 1px solid #2a2a2d;
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  .seg button {
+    background: #1b1b1d;
+    color: var(--text);
+    border: 0;
+    border-right: 1px solid #2a2a2d;
+    padding: 4px 10px;
+    font: inherit;
+    cursor: pointer;
+  }
+  .seg button:last-child { border-right: 0; }
+  .seg button.on { background: #232328; color: var(--accent); }
+
+  .check-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--muted);
+    margin-bottom: 6px;
+  }
+
+  /* Locked palette swatches — read-only, sanity-check only. */
+  .swatch-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 6px;
+  }
+  .swatch {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 11px;
+    color: var(--muted);
+  }
+  .swatch i {
+    display: block;
+    width: 14px; height: 14px;
+    border-radius: 3px;
+    border: 1px solid #2a2a2d;
+  }
+
+  /* Snippet box — the JSON + C-defines copy-paste target. */
+  .snippet {
+    margin-top: 16px;
+    padding: 10px 12px;
+    background: #0e0e10;
+    border: 1px solid #2a2a2d;
+    border-radius: 8px;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 11px;
+    color: #cde;
+    white-space: pre;
+    user-select: all;
+    overflow-x: auto;
+  }
+  .save-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-top: 12px;
+  }
+  .save-row button {
+    background: #1b1b1d;
+    color: var(--text);
+    border: 1px solid #2a2a2d;
+    border-radius: 6px;
+    padding: 6px 12px;
+    font: inherit;
+    cursor: pointer;
+  }
+  .save-row button:hover { border-color: var(--accent); color: var(--accent); }
+  .save-row input[type="file"] { display: none; }
+  .save-row .hint { font-size: 11px; color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <div class="stage">
+    <div class="stage-controls">
+      <span style="color:var(--muted)">Scale</span>
+      <button data-scale="1">1×</button>
+      <button data-scale="1.25" class="on">1.25×</button>
+      <button data-scale="1.5">1.5×</button>
+
+      <span style="color:var(--muted); margin-left:12px">Screen</span>
+      <button data-screen="agent" class="on">Agent</button>
+      <button data-screen="splash">Splash</button>
+
+      <span style="color:var(--muted); margin-left:12px">Mask</span>
+      <button data-mask="on" class="on">On</button>
+      <button data-mask="off">Off</button>
+
+      <span style="color:var(--muted); margin-left:12px">Guides</span>
+      <button data-guides="on">On</button>
+      <button data-guides="off" class="on">Off</button>
+    </div>
+
+    <div class="panel-wrap" id="panel-wrap">
+      <div class="panel" id="panel">
+        <svg id="svg" viewBox="0 0 466 466"></svg>
+        <div class="dom" id="dom"></div>
+        <div class="splash" id="splash">
+          <div class="title"   id="splash-title">BurnScope</div>
+          <div class="status"  id="splash-status">Waiting for daemon...</div>
+          <div class="version" id="splash-version">v0.4.1</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <aside class="sidebar">
+    <h2>Agent / data</h2>
+    <div class="group row-2">
+      <div>
+        <label>Agent</label>
+        <select id="agent">
+          <option value="claude">Claude</option>
+          <option value="codex">Codex</option>
+        </select>
+      </div>
+      <div>
+        <label>Sessions</label>
+        <div class="seg" id="seg-sessions">
+          <button data-n="1">1</button>
+          <button data-n="2" class="on">2</button>
+        </div>
+      </div>
+    </div>
+    <div class="group">
+      <div class="slider-row">
+        <label>Primary % (R0)</label><span class="val" id="p0v">78</span>
+        <input type="range" id="p0" min="0" max="100" step="1" value="78">
+      </div>
+      <div class="slider-row">
+        <label>Secondary % (R1)</label><span class="val" id="p1v">40</span>
+        <input type="range" id="p1" min="0" max="100" step="1" value="40">
+      </div>
+    </div>
+    <div class="group">
+      <div class="check-row"><input type="checkbox" id="unsynced"> <label for="unsynced">Clock unsynced (countdowns → "syncing…")</label></div>
+      <div class="check-row"><input type="checkbox" id="unpaired"> <label for="unpaired">Footer unpaired (NVS empty)</label></div>
+    </div>
+
+    <h2>Rings (px / deg)</h2>
+    <div class="group" id="ring-group"></div>
+
+    <h2>Arc sweep</h2>
+    <div class="group">
+      <div class="slider-row">
+        <label>Start angle</label><span class="val" id="arc_startv">135°</span>
+        <input type="range" id="arc_start" min="0" max="360" step="1" value="135">
+      </div>
+      <div class="slider-row">
+        <label>Sweep</label><span class="val" id="arc_sweepv">270°</span>
+        <input type="range" id="arc_sweep" min="60" max="340" step="1" value="270">
+      </div>
+      <div class="check-row"><input type="checkbox" id="rounded_caps" checked> <label for="rounded_caps">Rounded arc caps</label></div>
+    </div>
+
+    <h2>Central core (icon · chips · percentages)</h2>
+    <div class="group" id="core-group"></div>
+
+    <h2>Footer</h2>
+    <div class="group" id="footer-group"></div>
+
+    <h2>Palette (locked)</h2>
+    <div class="group swatch-grid" id="swatches"></div>
+
+    <h2>Snippet — paste into <code>ui.c</code></h2>
+    <div class="snippet" id="snippet"></div>
+    <div class="save-row">
+      <button type="button" id="save-json">Save config as JSON</button>
+      <button type="button" id="load-json-btn">Load…</button>
+      <input type="file" id="load-json" accept="application/json,.json">
+      <span class="hint">Geometry only — preview data (mock %s) excluded.</span>
+    </div>
+  </aside>
+
+</div>
+
+<script>
+  // -------- brand icon SVG (reused from font-preview.html) --------
+  const CLAUDE_BURST_D = "M4.709 15.955l4.72-2.647.08-.23-.08-.128H9.2l-.79-.048-2.698-.073-2.339-.097-2.266-.122-.571-.121L0 11.784l.055-.352.48-.321.686.06 1.52.103 2.278.158 1.652.097 2.449.255h.389l.055-.157-.134-.098-.103-.097-2.358-1.596-2.552-1.688-1.336-.972-.724-.491-.364-.462-.158-1.008.656-.722.881.06.225.061.893.686 1.908 1.476 2.491 1.833.365.304.145-.103.019-.073-.164-.274-1.355-2.446-1.446-2.49-.644-1.032-.17-.619a2.97 2.97 0 01-.104-.729L6.283.134 6.696 0l.996.134.42.364.62 1.414 1.002 2.229 1.555 3.03.456.898.243.832.091.255h.158V9.01l.128-1.706.237-2.095.23-2.695.08-.76.376-.91.747-.492.584.28.48.685-.067.444-.286 1.851-.559 2.903-.364 1.942h.212l.243-.242.985-1.306 1.652-2.064.73-.82.85-.904.547-.431h1.033l.76 1.129-.34 1.166-1.064 1.347-.881 1.142-1.264 1.7-.79 1.36.073.11.188-.02 2.856-.606 1.543-.28 1.841-.315.833.388.091.395-.328.807-1.969.486-2.309.462-3.439.813-.042.03.049.061 1.549.146.662.036h1.622l3.02.225.79.522.474.638-.079.485-1.215.62-1.64-.389-3.829-.91-1.312-.329h-.182v.11l1.093 1.068 2.006 1.81 2.509 2.33.127.578-.322.455-.34-.049-2.205-1.657-.851-.747-1.926-1.62h-.128v.17l.444.649 2.345 3.521.122 1.08-.17.353-.608.213-.668-.122-1.374-1.925-1.415-2.167-1.143-1.943-.14.08-.674 7.254-.316.37-.729.28-.607-.461-.322-.747.322-1.476.389-1.924.315-1.53.286-1.9.17-.632-.012-.042-.14.018-1.434 1.967-2.18 2.945-1.726 1.845-.414.164-.717-.37.067-.662.401-.589 2.388-3.036 1.44-1.882.93-1.086-.006-.158h-.055L4.132 18.56l-1.13.146-.487-.456.061-.746.231-.243 1.908-1.312-.006.006z";
+  const ICON = {
+    claude: `<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="${CLAUDE_BURST_D}" fill="#D97757" fill-rule="nonzero"/></svg>`,
+    codex:  `<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M19.503 0H4.496A4.496 4.496 0 000 4.496v15.007A4.496 4.496 0 004.496 24h15.007A4.496 4.496 0 0024 19.503V4.496A4.496 4.496 0 0019.503 0z" fill="#fff"/><path d="M9.064 3.344a4.578 4.578 0 012.285-.312c1 .115 1.891.54 2.673 1.275.01.01.024.017.037.021a.09.09 0 00.043 0 4.55 4.55 0 013.046.275l.047.022.116.057a4.581 4.581 0 012.188 2.399c.209.51.313 1.041.315 1.595a4.24 4.24 0 01-.134 1.223.123.123 0 00.03.115c.594.607.988 1.33 1.183 2.17.289 1.425-.007 2.71-.887 3.854l-.136.166a4.548 4.548 0 01-2.201 1.388.123.123 0 00-.081.076c-.191.551-.383 1.023-.74 1.494-.9 1.187-2.222 1.846-3.711 1.838-1.187-.006-2.239-.44-3.157-1.302a.107.107 0 00-.105-.024c-.388.125-.78.143-1.204.138a4.441 4.441 0 01-1.945-.466 4.544 4.544 0 01-1.61-1.335c-.152-.202-.303-.392-.414-.617a5.81 5.81 0 01-.37-.961 4.582 4.582 0 01-.014-2.298.124.124 0 00.006-.056.085.085 0 00-.027-.048 4.467 4.467 0 01-1.034-1.651 3.896 3.896 0 01-.251-1.192 5.189 5.189 0 01.141-1.6c.337-1.112.982-1.985 1.933-2.618.212-.141.413-.251.601-.33.215-.089.43-.164.646-.227a.098.098 0 00.065-.066 4.51 4.51 0 01.829-1.615 4.535 4.535 0 011.837-1.388zm3.482 10.565a.637.637 0 000 1.272h3.636a.637.637 0 100-1.272h-3.636zM8.462 9.23a.637.637 0 00-1.106.631l1.272 2.224-1.266 2.136a.636.636 0 101.095.649l1.454-2.455a.636.636 0 00.005-.64L8.462 9.23z" fill="url(#tu-codex-grad)"/><defs><linearGradient id="tu-codex-grad" x1="12" x2="12" y1="3" y2="21" gradientUnits="userSpaceOnUse"><stop stop-color="#B1A7FF"/><stop offset=".5" stop-color="#7A9DFF"/><stop offset="1" stop-color="#3941FF"/></linearGradient></defs></svg>`,
+  };
+
+  // -------- palette (locked, mirrors ui.c) --------
+  const PALETTE = {
+    claude: ["#DE7356", "#A4A049", "#B0BEC5"],
+    codex:  ["#81C3DD", "#A4A049", "#B0BEC5"],
+  };
+  const TRACK_HEX        = "#2F2F2F";
+  const LABEL_FG_HEX     = "#F9F2DF";
+  const COUNTDOWN_FG_HEX = "#B0ACA0";
+  const FOOTER_FG_HEX    = "#5C5C5C";
+  const CHIP_BG_HEX      = "#2E2E2E";
+  const SPLASH_VERSION   = "#808080";
+  const BG_HEX           = "#000000";
+
+  // -------- defaults: the starting point in docs/ui/amoled_sh8601.md --------
+  const STATE = {
+    cx: 233, cy: 233,
+    safe_radius: 220,
+    /* Two concentric arcs only — primary (R0) + secondary (R1). The
+     * core stacks both percentages vertically; the session `type`
+     * (e.g. "current"/"weekly") rides above each as a small chip. */
+    rings: [
+      { outer: 215, inner: 190 },
+      { outer: 184, inner: 164 },
+    ],
+    arc_start_deg: 135,
+    arc_sweep_deg: 270,
+    rounded_caps: true,
+    core: {
+      icon_size: 70,
+      icon_y: 130,
+      /* Type chip above the primary % (e.g., "current"). */
+      chip_primary_y: 195,
+      /* Primary % (row 0). */
+      primary_y: 235,
+      primary_font: 60,
+      /* Type chip above the secondary % (e.g., "weekly"). */
+      chip_secondary_y: 285,
+      /* Secondary % (row 1) — replaces the old type-tag slot. */
+      secondary_y: 315,
+      secondary_font: 35,
+      /* Shared chip styling for both type chips. */
+      chip_font: 15,
+      chip_radius: 4,
+      chip_pad_h: 5,
+      chip_pad_v: 3,
+      /* Countdown ("5h 32m") rides to the right of each percentage,
+       * baseline-aligned, with this horizontal gap from the % glyphs. */
+      countdown_gap: 10,
+      countdown_font: 14,
+    },
+    /* Footer is two centred lines stacked at the bottom of the disc:
+     * `updated_y` carries the relative timestamp ("updated 3 min ago");
+     * `email_y` carries the user identifier underneath it. */
+    footer: { updated_y: 410, email_y: 430, font: 16 },
+    data: {
+      agent: "claude",
+      session_count: 2,
+      /* Session names match CYD's font-preview defaults so both tuners
+       * show the same chip text. "current" = the rolling window, "weekly"
+       * = the weekly quota — these are the wire-format `type` values. */
+      sessions: [
+        { type: "current", pct: 0.78, countdown: "5h 32m" },
+        { type: "weekly",  pct: 0.40, countdown: "2d 14h" },
+      ],
+      client_id: "user@example.com",
+      updated_phrase: "updated 3 min ago",
+      unsynced: false,
+      unpaired: false,
+    },
+  };
+
+  // -------- DOM helpers --------
+  const $ = id => document.getElementById(id);
+  const svg = $("svg");
+  const dom = $("dom");
+  const panel = $("panel");
+
+  // Convert (cx,cy,r,angle) → SVG coords. SVG y axis grows downward; angles
+  // are measured clockwise from 3 o'clock (LVGL convention) to match the
+  // firmware's arc angles 1:1.
+  function polar(cx, cy, r, deg) {
+    const rad = (deg * Math.PI) / 180;
+    return [cx + r * Math.cos(rad), cy + r * Math.sin(rad)];
+  }
+
+  /* Emit a stroked arc as a <circle> + stroke-dasharray. SVG's path-based
+   * A-arc commands can render unevenly at long sweeps (the round cap on
+   * one end may drop out depending on the renderer); the circle+dasharray
+   * pattern caps both ends of the visible dash reliably. The circle is
+   * rotated by `startDeg` so the dash begins at the requested start
+   * angle; sweep is clockwise (which is the SVG circle's natural stroke
+   * direction). */
+  function arcCircle(cx, cy, r, strokeW, startDeg, sweepDeg, color, cap) {
+    if (sweepDeg <= 0) return "";
+    const C = 2 * Math.PI * r;
+    const visible = Math.min(sweepDeg, 360) / 360 * C;
+    const gap = C - visible + 1;  /* +1 keeps the hidden segment definitively gap */
+    return `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" ` +
+           `stroke="${color}" stroke-width="${strokeW}" ` +
+           `stroke-linecap="${cap}" ` +
+           `stroke-dasharray="${visible} ${gap}" ` +
+           `transform="rotate(${startDeg} ${cx} ${cy})"/>`;
+  }
+
+  // -------- render: SVG arcs --------
+  function renderSVG() {
+    const { cx, cy, safe_radius, rings, arc_start_deg, arc_sweep_deg, rounded_caps, data } = STATE;
+    const pal = PALETTE[data.agent];
+    const cap = rounded_caps ? "round" : "butt";
+    let s = "";
+
+    // Mask cutout indicator (purely visual — the CSS mask actually clips).
+    s += `<circle cx="${cx}" cy="${cy}" r="233" fill="none" stroke="rgba(255,255,255,0.04)" stroke-width="1"/>`;
+
+    // Optional guides (visible disc edge + safe radius). Toggled via the
+    // top-of-stage "Guides" button. We render them inside an explicit
+    // <g class="guides"> so the toggle just flips a CSS display rule.
+    s += `<g class="guides" style="display:${state.guides ? "block" : "none"}">`;
+    s += `  <circle cx="${cx}" cy="${cy}" r="233" fill="none" stroke="#4FC3F7" stroke-width="1" stroke-dasharray="3 4" opacity="0.6"/>`;
+    s += `  <circle cx="${cx}" cy="${cy}" r="${safe_radius}" fill="none" stroke="#FFB24A" stroke-width="1" stroke-dasharray="3 4" opacity="0.5"/>`;
+    s += `</g>`;
+
+    // Two rings, outer→inner. Track + indicator share the same end-cap
+    // style so the visible bar reads as one shape: when caps are rounded,
+    // both ends of the overall sweep (track's terminus at the unfilled
+    // side and the indicator's tip) are rounded; when not, both are butt.
+    for (let i = 0; i < rings.length; ++i) {
+      if (i >= data.session_count) continue;
+      const ring = rings[i];
+      const mid = (ring.outer + ring.inner) / 2;
+      const strokeW = ring.outer - ring.inner;
+      const indicatorSweep = arc_sweep_deg * data.sessions[i].pct;
+      s += arcCircle(cx, cy, mid, strokeW, arc_start_deg, arc_sweep_deg, TRACK_HEX, cap);
+      if (indicatorSweep > 0) {
+        s += arcCircle(cx, cy, mid, strokeW, arc_start_deg, indicatorSweep, pal[i], cap);
+      }
+    }
+    svg.innerHTML = s;
+  }
+
+  // -------- render: DOM overlays (core, footer) --------
+  function renderDOM() {
+    const S = STATE;
+    const D = S.data;
+    const C = S.core;
+    let s = "";
+
+    // Core icon (top).
+    s += `<div class="core-icon" style="left:${S.cx}px; top:${C.icon_y}px; width:${C.icon_size}px; height:${C.icon_size}px;">${ICON[D.agent]}</div>`;
+
+    // Both percentages live in the core, stacked vertically. Each has
+    // a small chip riding above (session `type`) and a countdown
+    // ("reset time") floating to the right of the % glyphs.
+    const chipStyle =
+      `font-size:${C.chip_font}px;` +
+      `border-radius:${C.chip_radius}px;` +
+      `padding:${C.chip_pad_v}px ${C.chip_pad_h}px;`;
+
+    /* renderPctRow — emit a centred percentage with a countdown that
+     * hangs off the right edge of the % glyphs. The countdown is an
+     * absolutely-positioned child of the % `<span>`, anchored to the
+     * span's right edge (`left:100%`) and bottom (`bottom:0`) so its
+     * baseline aligns with the % baseline. The wrapper is full-width
+     * + text-align:center, which keeps the % centred regardless of
+     * the countdown's width — mirroring `recenter_at(pct_label)` +
+     * countdown-right-of-pct in `ui.c`. */
+    function renderPctRow(klass, pctY, pctFont, color, session) {
+      const pctText = `${Math.round(session.pct * 100)}%`;
+      const cdText  = session.countdown || "";
+      const wrapStyle =
+        `position:absolute; left:0; right:0; top:${pctY}px;` +
+        `text-align:center; transform:translateY(-50%);` +
+        `font-family:'Montserrat', sans-serif; line-height:1;` +
+        `color:${color};`;
+      const pctSpanStyle =
+        `position:relative; display:inline-block;` +
+        `font-size:${pctFont}px; font-weight:${klass === "primary" ? 500 : 400};`;
+      const cdSpanStyle =
+        `position:absolute; left:100%; bottom:0;` +
+        `margin-left:${C.countdown_gap}px;` +
+        `font-size:${C.countdown_font}px; color:#5C5C5C;` +
+        `line-height:1; white-space:nowrap;`;
+      return (
+        `<div class="core-pct-row core-${klass}" style="${wrapStyle}">` +
+          `<span style="${pctSpanStyle}">${escapeHTML(pctText)}` +
+            (cdText ? `<span style="${cdSpanStyle}">${escapeHTML(cdText)}</span>` : "") +
+          `</span>` +
+        `</div>`
+      );
+    }
+
+    /* Chip text = session `type` (e.g., "current"/"weekly") — matches
+     * CYD's font-preview chip labels. The wire-format type field drives
+     * this; the firmware renders it verbatim. */
+    if (D.session_count >= 1) {
+      s += `<div class="pill core-chip" style="left:${S.cx}px; top:${C.chip_primary_y}px; ${chipStyle}">${escapeHTML(D.sessions[0].type)}</div>`;
+      s += renderPctRow("primary", C.primary_y, C.primary_font, "#F9F2DF", D.sessions[0]);
+    }
+    if (D.session_count >= 2) {
+      s += `<div class="pill core-chip" style="left:${S.cx}px; top:${C.chip_secondary_y}px; ${chipStyle}">${escapeHTML(D.sessions[1].type)}</div>`;
+      s += renderPctRow("secondary", C.secondary_y, C.secondary_font, "#F9F2DF", D.sessions[1]);
+    }
+
+    // Footer.
+    const cidText = D.unpaired ? "unpaired" : D.client_id;
+    const tsText  = D.unpaired || D.unsynced ? "" : D.updated_phrase;
+    s += `<div class="footer-line" style="top:${S.footer.updated_y}px; font-size:${S.footer.font}px;">${escapeHTML(tsText)}</div>`;
+    s += `<div class="footer-line" style="top:${S.footer.email_y}px; font-size:${S.footer.font}px;">${escapeHTML(cidText)}</div>`;
+
+    dom.innerHTML = s;
+  }
+
+  function escapeHTML(s) {
+    return String(s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+
+  // -------- render: snippet (JSON + C defines) --------
+  function renderSnippet() {
+    const S = STATE;
+    const C = S.core;
+    const lines = [];
+    lines.push("/* Generated by firmware/scripts/amoled-preview.html — paste into ui.c. */");
+    lines.push(`#define AMOLED_CX                  ${S.cx}`);
+    lines.push(`#define AMOLED_CY                  ${S.cy}`);
+    lines.push(`#define AMOLED_SAFE_RADIUS         ${S.safe_radius}`);
+    for (let i = 0; i < S.rings.length; ++i) {
+      lines.push(`#define AMOLED_R${i}_OUTER            ${S.rings[i].outer}`);
+      lines.push(`#define AMOLED_R${i}_INNER            ${S.rings[i].inner}`);
+    }
+    lines.push(`#define AMOLED_ARC_START_DEG       ${S.arc_start_deg}`);
+    lines.push(`#define AMOLED_ARC_SWEEP_DEG       ${S.arc_sweep_deg}`);
+    lines.push(`#define AMOLED_ARC_ROUNDED_CAPS    ${S.rounded_caps ? 1 : 0}`);
+    lines.push(`#define AMOLED_CORE_ICON_SIZE      ${C.icon_size}`);
+    lines.push(`#define AMOLED_CORE_ICON_Y         ${C.icon_y}`);
+    lines.push(`#define AMOLED_CORE_CHIP_PRIMARY_Y   ${C.chip_primary_y}`);
+    lines.push(`#define AMOLED_CORE_PRIMARY_Y      ${C.primary_y}`);
+    lines.push(`#define AMOLED_CORE_PRIMARY_FONT   ${C.primary_font}`);
+    lines.push(`#define AMOLED_CORE_CHIP_SECONDARY_Y ${C.chip_secondary_y}`);
+    lines.push(`#define AMOLED_CORE_SECONDARY_Y    ${C.secondary_y}`);
+    lines.push(`#define AMOLED_CORE_SECONDARY_FONT ${C.secondary_font}`);
+    lines.push(`#define AMOLED_CORE_CHIP_FONT      ${C.chip_font}`);
+    lines.push(`#define AMOLED_CORE_CHIP_RADIUS    ${C.chip_radius}`);
+    lines.push(`#define AMOLED_CORE_CHIP_PAD_H     ${C.chip_pad_h}`);
+    lines.push(`#define AMOLED_CORE_CHIP_PAD_V     ${C.chip_pad_v}`);
+    lines.push(`#define AMOLED_CORE_COUNTDOWN_GAP  ${C.countdown_gap}`);
+    lines.push(`#define AMOLED_CORE_COUNTDOWN_FONT ${C.countdown_font}`);
+    lines.push(`#define AMOLED_FOOTER_UPDATED_Y    ${S.footer.updated_y}`);
+    lines.push(`#define AMOLED_FOOTER_EMAIL_Y      ${S.footer.email_y}`);
+    lines.push(`#define AMOLED_FOOTER_FONT         ${S.footer.font}`);
+    $("snippet").textContent = lines.join("\n");
+  }
+
+  // -------- one redraw entrypoint --------
+  const state = { scale: 1.25, screen: "agent", mask: true, guides: false };
+  function render() {
+    renderSVG();
+    renderDOM();
+    renderSnippet();
+    // Per-ring percentage readouts.
+    $("p0v").textContent = Math.round(STATE.data.sessions[0].pct * 100);
+    $("p1v").textContent = Math.round(STATE.data.sessions[1].pct * 100);
+    // Splash visibility.
+    $("splash").classList.toggle("on", state.screen === "splash");
+    // The agent SVG/DOM is always present; we just stack splash over it.
+    // Apply splash typography from the spec.
+    $("splash-title").style.fontSize = "28px";
+    $("splash-status").style.fontSize = "24px";
+    $("splash-version").style.fontSize = "14px";
+  }
+
+  // -------- slider factory --------
+  // mountSliders fills a `<div class="group">` with N labelled sliders that
+  // mutate STATE[path] and trigger a redraw. `path` is a dotted accessor.
+  function mountSliders(parentId, specs) {
+    const parent = $(parentId);
+    let html = "";
+    for (const s of specs) {
+      const v = get(STATE, s.path);
+      /* data-path lets the loader (Load… button) walk values back into
+       * the right slider without having to re-list every mapping. */
+      html += `<div class="slider-row"><label>${s.label}</label><span class="val" id="${s.id}v">${fmt(v, s.unit)}</span><input type="range" id="${s.id}" data-path="${s.path}" data-unit="${s.unit || ""}" min="${s.min}" max="${s.max}" step="${s.step || 1}" value="${v}"></div>`;
+    }
+    parent.innerHTML = html;
+    for (const s of specs) {
+      const el = $(s.id);
+      el.addEventListener("input", () => {
+        const num = parseFloat(el.value);
+        set(STATE, s.path, num);
+        $(s.id + "v").textContent = fmt(num, s.unit);
+        render();
+      });
+    }
+  }
+  function fmt(v, unit) {
+    if (unit === "deg") return v + "°";
+    if (unit === "px")  return v + " px";
+    return String(v);
+  }
+  function get(obj, path) { return path.split(".").reduce((o, k) => o[k], obj); }
+  function set(obj, path, val) {
+    const ks = path.split(".");
+    const last = ks.pop();
+    ks.reduce((o, k) => o[k], obj)[last] = val;
+  }
+
+  // -------- mount UI --------
+  mountSliders("ring-group", [
+    { id: "r0_outer", path: "rings.0.outer", label: "R0 outer", min: 160, max: 230, unit: "px" },
+    { id: "r0_inner", path: "rings.0.inner", label: "R0 inner", min: 140, max: 220, unit: "px" },
+    { id: "r1_outer", path: "rings.1.outer", label: "R1 outer", min: 140, max: 220, unit: "px" },
+    { id: "r1_inner", path: "rings.1.inner", label: "R1 inner", min: 120, max: 210, unit: "px" },
+    { id: "safe_radius", path: "safe_radius", label: "Safe radius (guide)", min: 190, max: 233, unit: "px" },
+  ]);
+  mountSliders("core-group", [
+    { id: "core_icon_size",      path: "core.icon_size",       label: "Icon size",       min: 24,  max: 96,  unit: "px" },
+    { id: "core_icon_y",         path: "core.icon_y",          label: "Icon Y",          min: 100, max: 220, unit: "px" },
+    { id: "core_chip_primary_y", path: "core.chip_primary_y",  label: "Primary chip Y",  min: 140, max: 240, unit: "px" },
+    { id: "core_primary_y",      path: "core.primary_y",       label: "Primary % Y",     min: 180, max: 280, unit: "px" },
+    { id: "core_primary_font",   path: "core.primary_font",    label: "Primary % font",  min: 24,  max: 80,  unit: "px" },
+    { id: "core_chip_secondary_y", path: "core.chip_secondary_y", label: "Secondary chip Y", min: 220, max: 320, unit: "px" },
+    { id: "core_secondary_y",    path: "core.secondary_y",     label: "Secondary % Y",   min: 240, max: 360, unit: "px" },
+    { id: "core_secondary_font", path: "core.secondary_font",  label: "Secondary % font", min: 16, max: 56, unit: "px" },
+    { id: "core_chip_font",      path: "core.chip_font",       label: "Chip font",       min: 10,  max: 22,  unit: "px" },
+    { id: "core_chip_radius",    path: "core.chip_radius",     label: "Chip radius",     min: 0,   max: 14,  unit: "px" },
+    { id: "core_chip_pad_h",     path: "core.chip_pad_h",      label: "Chip pad H",      min: 0,   max: 16,  unit: "px" },
+    { id: "core_chip_pad_v",     path: "core.chip_pad_v",      label: "Chip pad V",      min: 0,   max: 10,  unit: "px" },
+  ]);
+  mountSliders("footer-group", [
+    { id: "footer_updated_y", path: "footer.updated_y", label: "Updated Y", min: 360, max: 450, unit: "px" },
+    { id: "footer_email_y",   path: "footer.email_y",   label: "Email Y",   min: 380, max: 460, unit: "px" },
+    { id: "footer_font",      path: "footer.font",      label: "Footer font", min: 10, max: 22, unit: "px" },
+  ]);
+
+  // Arc start/sweep sliders — separate group, special unit.
+  $("arc_start").addEventListener("input", e => {
+    STATE.arc_start_deg = parseInt(e.target.value, 10);
+    $("arc_startv").textContent = STATE.arc_start_deg + "°";
+    render();
+  });
+  $("arc_sweep").addEventListener("input", e => {
+    STATE.arc_sweep_deg = parseInt(e.target.value, 10);
+    $("arc_sweepv").textContent = STATE.arc_sweep_deg + "°";
+    render();
+  });
+  $("rounded_caps").addEventListener("change", e => {
+    STATE.rounded_caps = e.target.checked;
+    render();
+  });
+
+  // Data sliders (used_pct per ring + state checkboxes).
+  $("p0").addEventListener("input", e => { STATE.data.sessions[0].pct = +e.target.value / 100; render(); });
+  $("p1").addEventListener("input", e => { STATE.data.sessions[1].pct = +e.target.value / 100; render(); });
+  $("agent").addEventListener("change", e => { STATE.data.agent = e.target.value; render(); });
+  $("unsynced").addEventListener("change", e => { STATE.data.unsynced = e.target.checked; render(); });
+  $("unpaired").addEventListener("change", e => { STATE.data.unpaired = e.target.checked; render(); });
+
+  // Session-count segmented control.
+  document.querySelectorAll("#seg-sessions button").forEach(b => {
+    b.addEventListener("click", () => {
+      document.querySelectorAll("#seg-sessions button").forEach(x => x.classList.remove("on"));
+      b.classList.add("on");
+      STATE.data.session_count = parseInt(b.dataset.n, 10);
+      render();
+    });
+  });
+
+  // Stage-control buttons (scale / screen / mask / guides).
+  document.querySelectorAll(".stage-controls button[data-scale]").forEach(b => {
+    b.addEventListener("click", () => {
+      state.scale = parseFloat(b.dataset.scale);
+      panel.style.transform = `scale(${state.scale})`;
+      document.getElementById("panel-wrap").style.width  = `calc(466px * ${state.scale} + 24px)`;
+      document.getElementById("panel-wrap").style.height = `calc(466px * ${state.scale} + 24px)`;
+      document.querySelectorAll(".stage-controls button[data-scale]").forEach(x => x.classList.toggle("on", x === b));
+    });
+  });
+  document.querySelectorAll(".stage-controls button[data-screen]").forEach(b => {
+    b.addEventListener("click", () => {
+      state.screen = b.dataset.screen;
+      document.querySelectorAll(".stage-controls button[data-screen]").forEach(x => x.classList.toggle("on", x === b));
+      render();
+    });
+  });
+  document.querySelectorAll(".stage-controls button[data-mask]").forEach(b => {
+    b.addEventListener("click", () => {
+      state.mask = (b.dataset.mask === "on");
+      panel.classList.toggle("no-mask", !state.mask);
+      document.querySelectorAll(".stage-controls button[data-mask]").forEach(x => x.classList.toggle("on", x === b));
+    });
+  });
+  document.querySelectorAll(".stage-controls button[data-guides]").forEach(b => {
+    b.addEventListener("click", () => {
+      state.guides = (b.dataset.guides === "on");
+      document.querySelectorAll(".stage-controls button[data-guides]").forEach(x => x.classList.toggle("on", x === b));
+      render();
+    });
+  });
+
+  // Palette swatches.
+  const SWATCHES = [
+    ["claude R0", PALETTE.claude[0]],
+    ["claude R1", PALETTE.claude[1]],
+    ["codex R0",  PALETTE.codex[0]],
+    ["codex R1",  PALETTE.codex[1]],
+    ["track",     TRACK_HEX],
+    ["label fg",  LABEL_FG_HEX],
+    ["countdown", COUNTDOWN_FG_HEX],
+    ["footer",    FOOTER_FG_HEX],
+    ["chip bg",   CHIP_BG_HEX],
+    ["bg",        BG_HEX],
+  ];
+  $("swatches").innerHTML = SWATCHES.map(
+    ([name, hex]) => `<div class="swatch"><i style="background:${hex}"></i><span>${name} <code style="color:#888">${hex}</code></span></div>`
+  ).join("");
+
+  // -------- save / load configuration --------
+  // What we persist: geometry + the locked palette (for reference). What
+  // we skip: the `data` block (mock used_pcts, agent toggle, state flags)
+  // since those are preview affordances, not layout that the firmware
+  // compiles in. Round-tripping a saved file restores every slider and
+  // re-renders.
+  function configToJSON() {
+    const { data, ...geometry } = STATE;  /* eslint-disable-line no-unused-vars */
+    return {
+      schema: "burnscope.amoled_sh8601.layout.v1",
+      saved_at: new Date().toISOString(),
+      geometry,
+      palette: {
+        claude: PALETTE.claude,
+        codex:  PALETTE.codex,
+        track:  TRACK_HEX,
+        label_fg: LABEL_FG_HEX,
+        countdown_fg: COUNTDOWN_FG_HEX,
+        footer_fg: FOOTER_FG_HEX,
+        chip_bg: CHIP_BG_HEX,
+        bg: BG_HEX,
+      },
+    };
+  }
+
+  $("save-json").addEventListener("click", () => {
+    const json = JSON.stringify(configToJSON(), null, 2);
+    const blob = new Blob([json], { type: "application/json" });
+    const url  = URL.createObjectURL(blob);
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `amoled-layout-${stamp}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  });
+
+  $("load-json-btn").addEventListener("click", () => $("load-json").click());
+  $("load-json").addEventListener("change", async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const obj = JSON.parse(text);
+      if (!obj.geometry) throw new Error("missing `geometry` block");
+      /* Shallow-merge geometry into STATE so the mock `data` block (and
+       * any future keys we haven't persisted) stays intact. */
+      Object.assign(STATE, obj.geometry);
+      /* Mirror loaded values back onto every slider so the UI matches
+       * what STATE now holds. */
+      document.querySelectorAll("input[type=range][data-path]").forEach(el => {
+        const path = el.dataset.path;
+        const unit = el.dataset.unit || "";
+        const v = getDotted(STATE, path);
+        if (typeof v === "number") {
+          el.value = String(v);
+          const lbl = $(el.id + "v");
+          if (lbl) lbl.textContent = fmt(v, unit);
+        }
+      });
+      /* Arc + boolean controls. */
+      $("arc_start").value = STATE.arc_start_deg;
+      $("arc_startv").textContent = STATE.arc_start_deg + "°";
+      $("arc_sweep").value = STATE.arc_sweep_deg;
+      $("arc_sweepv").textContent = STATE.arc_sweep_deg + "°";
+      $("rounded_caps").checked = !!STATE.rounded_caps;
+      render();
+    } catch (err) {
+      alert("Failed to load config: " + err.message);
+    } finally {
+      e.target.value = "";  /* allow re-loading the same file */
+    }
+  });
+
+  /* Dotted accessor used by the load handler — mirrors `get()` above
+   * but tolerates missing intermediate keys. The slider mount records
+   * its `data-path` so loaders can walk it back. */
+  function getDotted(obj, path) {
+    return path.split(".").reduce((o, k) => (o == null ? o : o[k]), obj);
+  }
+
+  render();
+</script>
+</body>
+</html>

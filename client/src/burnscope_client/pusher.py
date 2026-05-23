@@ -1,22 +1,32 @@
 """HTTP client for talking to the ESP32 — POST /summary and GET /health.
 
 Both calls send the `X-BurnScope-Client-Id` header so the ESP32 can enforce
-per-agent TOFU pairing. The header value is the SHA-256 hex derived in
-`identity.py`. See `docs/client-spec-v2.html` § 3 (Identity & pairing) and
-§ 4 (Wire-format additions).
+per-agent TOFU pairing. See `docs/client-spec-v2.html` § 3 (Identity &
+pairing) and § 4 (Wire-format additions).
+
+`push_to_all()` is the multi-device fan-out used by both collectors: it
+runs per-device pushes in parallel and returns one `PushResult` per
+device so the caller can drop on 401 and keep on transport failure
+without writing its own gather logic.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from dataclasses import dataclass
+from typing import Literal
 
 import httpx
 
+from .host_cache import PairedDevice
 from .schema import AgentSnapshot
 
 log = logging.getLogger(__name__)
 
 CLIENT_ID_HEADER = "X-BurnScope-Client-Id"
+
+PushKind = Literal["ok", "auth", "transport"]
 
 
 class PushError(RuntimeError):
@@ -24,9 +34,27 @@ class PushError(RuntimeError):
 
 
 class PushAuthError(PushError):
-    """Raised on 401 — host is reachable but our client_id doesn't match the
-    paired hash. Callers must NOT invalidate the host cache for this error.
+    """Raised on 401 — device is reachable but our client_id doesn't match
+    the bound slot. Callers must NOT silently drop the host on this; the
+    multi-device caller drops only this `(agent, device_id)` from its
+    paired list, leaving other agents' bindings to the same device intact.
     """
+
+
+@dataclass(frozen=True)
+class PushResult:
+    """Per-device outcome from `push_to_all`.
+
+    `kind` lets the caller distinguish:
+      - "ok"        → record success.
+      - "auth"      → silently drop this device from the agent's paired list.
+      - "transport" → keep the device, record a per-device failure; retry
+                      on the next fire.
+    """
+
+    device_id: str
+    ok: bool
+    kind: PushKind
 
 
 async def push(
@@ -61,6 +89,41 @@ async def push(
             f"{url} returned {response.status_code}: {response.text[:200]}"
         )
     log.info("POST %s → %d", url, response.status_code)
+
+
+async def push_to_all(
+    snapshot: AgentSnapshot,
+    devices: list[PairedDevice],
+    client_id: str,
+    client: httpx.AsyncClient,
+) -> dict[str, PushResult]:
+    """Fan out `snapshot` to every device in `devices`, in parallel.
+
+    Returns one `PushResult` per device, keyed by `device_id`. The two
+    exception types `push()` raises are translated:
+      - `PushAuthError` → `kind="auth"`
+      - `PushError`     → `kind="transport"`
+    Any other exception (programmer error, `asyncio.CancelledError`)
+    propagates and aborts the whole fan-out, by design.
+
+    Empty `devices` returns an empty dict.
+    """
+    if not devices:
+        return {}
+
+    async def _one(device: PairedDevice) -> PushResult:
+        try:
+            await push(snapshot, device.host, client_id, client)
+        except PushAuthError as exc:
+            log.info("push %s rejected with 401: %s", device.device_id, exc)
+            return PushResult(device_id=device.device_id, ok=False, kind="auth")
+        except PushError as exc:
+            log.warning("push %s transport failure: %s", device.device_id, exc)
+            return PushResult(device_id=device.device_id, ok=False, kind="transport")
+        return PushResult(device_id=device.device_id, ok=True, kind="ok")
+
+    results = await asyncio.gather(*(_one(d) for d in devices))
+    return {r.device_id: r for r in results}
 
 
 async def fetch_health(

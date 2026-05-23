@@ -5,3 +5,7 @@ dependencies:
   espressif/esp_lvgl_port: "^2"
   lvgl/lvgl: "^9"
   espressif/mdns: "^1.8.0"
+  # SH8601 / CO5300 round-AMOLED panel driver (QSPI command framing).
+  # Used by the amoled_sh8601 profile only — pulled in unconditionally so
+  # the manifest stays simple; harmless when the cyd2usb profile is active.
+  espressif/esp_lcd_sh8601: "^2.0"

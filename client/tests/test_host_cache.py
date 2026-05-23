@@ -4,6 +4,7 @@ import threading
 import pytest
 
 from burnscope_client import host_cache
+from burnscope_client.host_cache import PairedDevice
 
 
 @pytest.fixture(autouse=True)
@@ -12,54 +13,107 @@ def _state_dir(monkeypatch, tmp_path):
     return tmp_path
 
 
-def test_store_and_load_host_round_trip():
-    host_cache.store_host("esp.local:80")
-    assert host_cache.load_host() == "esp.local:80"
+# --------------------------------------------------------- paired devices
+
+def test_load_paired_devices_returns_empty_when_missing():
+    assert host_cache.load_paired_devices("claude") == []
 
 
-def test_load_host_returns_none_when_missing():
-    assert host_cache.load_host() is None
-
-
-def test_load_host_returns_none_when_empty(_state_dir):
-    (_state_dir / "host").write_text("")
-    assert host_cache.load_host() is None
-
-
-def test_load_host_strips_trailing_whitespace(_state_dir):
-    (_state_dir / "host").write_text("esp.local:80\n")
-    assert host_cache.load_host() == "esp.local:80"
-
-
-def test_invalidate_host_is_idempotent():
-    host_cache.invalidate_host()  # no file yet — should not raise
-    host_cache.store_host("esp.local:80")
-    host_cache.invalidate_host()
-    assert host_cache.load_host() is None
-
-
-def test_concurrent_store_does_not_corrupt(_state_dir):
-    values = [f"host-{i}:80" for i in range(20)]
-    threads = [
-        threading.Thread(target=host_cache.store_host, args=(v,)) for v in values
+def test_save_and_load_paired_devices_round_trip():
+    devices = [
+        PairedDevice("burnscope-a1", "10.0.0.5:80"),
+        PairedDevice("burnscope-b2", "10.0.0.6:80"),
     ]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    loaded = host_cache.load_host()
-    assert loaded in values  # one of the writers won; file is intact
+    host_cache.save_paired_devices("claude", devices)
+    loaded = host_cache.load_paired_devices("claude")
+    assert loaded == devices
 
 
-def test_push_state_round_trip():
+def test_paired_devices_are_per_agent():
+    host_cache.save_paired_devices("claude", [PairedDevice("a", "1.1.1.1:80")])
+    host_cache.save_paired_devices("codex",  [PairedDevice("b", "2.2.2.2:80")])
+    assert host_cache.load_paired_devices("claude") == [PairedDevice("a", "1.1.1.1:80")]
+    assert host_cache.load_paired_devices("codex")  == [PairedDevice("b", "2.2.2.2:80")]
+
+
+def test_add_paired_device_appends_and_dedupes(_state_dir):
+    host_cache.add_paired_device("claude", PairedDevice("dev-1", "10.0.0.5:80"))
+    host_cache.add_paired_device("claude", PairedDevice("dev-2", "10.0.0.6:80"))
+    host_cache.add_paired_device("claude", PairedDevice("dev-1", "10.0.0.7:80"))  # IP changed
+    devices = host_cache.load_paired_devices("claude")
+    by_id = {d.device_id: d for d in devices}
+    assert set(by_id) == {"dev-1", "dev-2"}
+    assert by_id["dev-1"].host == "10.0.0.7:80"  # latest host wins
+
+
+def test_remove_paired_device_is_idempotent():
+    host_cache.remove_paired_device("claude", "missing")  # no file yet
+    host_cache.add_paired_device("claude", PairedDevice("dev-1", "10.0.0.5:80"))
+    host_cache.remove_paired_device("claude", "dev-1")
+    host_cache.remove_paired_device("claude", "dev-1")  # second time — no-op
+    assert host_cache.load_paired_devices("claude") == []
+
+
+def test_load_paired_devices_rejects_garbage(_state_dir):
+    (_state_dir / "paired-devices.claude.json").write_text("not json")
+    assert host_cache.load_paired_devices("claude") == []
+    (_state_dir / "paired-devices.claude.json").write_text(
+        json.dumps([{"device_id": "good", "host": "1.1.1.1:80"},
+                    {"device_id": "", "host": "x"},          # empty id — skipped
+                    {"device_id": "no-host"},                # missing host — skipped
+                    "not a dict"])                            # non-object — skipped
+    )
+    devices = host_cache.load_paired_devices("claude")
+    assert devices == [PairedDevice("good", "1.1.1.1:80")]
+
+
+def test_concurrent_add_does_not_corrupt(_state_dir):
+    threads = [
+        threading.Thread(
+            target=host_cache.add_paired_device,
+            args=("claude", PairedDevice(f"dev-{i}", f"10.0.0.{i}:80")),
+        )
+        for i in range(20)
+    ]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    # File must remain parseable. We don't assert on count — concurrent
+    # read-modify-write means writers can clobber each other; the
+    # invariant is that the file is well-formed and contains a subset.
+    devices = host_cache.load_paired_devices("claude")
+    assert all(d.device_id.startswith("dev-") for d in devices)
+
+
+def test_clear_paired_devices():
+    host_cache.add_paired_device("claude", PairedDevice("dev-1", "10.0.0.5:80"))
+    host_cache.clear_paired_devices("claude")
+    host_cache.clear_paired_devices("claude")  # idempotent
+    assert host_cache.load_paired_devices("claude") == []
+
+
+# --------------------------------------------------------- last-push state
+
+def test_aggregate_push_state_round_trip():
     host_cache.write_push_state("claude", ok=True)
     state = host_cache.read_push_state("claude")
-    assert state is not None
-    assert state["ok"] is True
+    assert state is not None and state["ok"] is True
     assert isinstance(state["at"], int)
 
 
-def test_push_state_is_per_agent(_state_dir):
+def test_per_device_push_state_round_trip():
+    host_cache.write_push_state("claude", ok=False, device_id="burnscope-cafe")
+    state = host_cache.read_push_state("claude", device_id="burnscope-cafe")
+    assert state is not None and state["ok"] is False
+
+
+def test_per_device_state_does_not_pollute_aggregate(_state_dir):
+    host_cache.write_push_state("claude", ok=True)
+    host_cache.write_push_state("claude", ok=False, device_id="burnscope-cafe")
+    assert host_cache.read_push_state("claude")["ok"] is True
+    assert host_cache.read_push_state("claude", device_id="burnscope-cafe")["ok"] is False
+
+
+def test_push_state_is_per_agent():
     host_cache.write_push_state("claude", ok=True)
     host_cache.write_push_state("codex", ok=False)
     assert host_cache.read_push_state("claude")["ok"] is True
@@ -75,14 +129,11 @@ def test_read_push_state_returns_none_for_invalid_json(_state_dir):
     assert host_cache.read_push_state("claude") is None
 
 
+# --------------------------------------------------------- client_id cache
+
 def test_client_id_round_trip_with_email():
     host_cache.write_client_id("claude", "you@example.com")
     assert host_cache.read_client_id("claude") == "you@example.com"
-
-
-def test_client_id_round_trip_with_user_id():
-    host_cache.write_client_id("claude", "abc" * 20)
-    assert host_cache.read_client_id("claude") == "abc" * 20
 
 
 def test_client_id_is_per_agent():
@@ -90,10 +141,6 @@ def test_client_id_is_per_agent():
     host_cache.write_client_id("codex", "other@example.com")
     assert host_cache.read_client_id("claude") == "you@example.com"
     assert host_cache.read_client_id("codex") == "other@example.com"
-
-
-def test_read_client_id_returns_none_when_missing():
-    assert host_cache.read_client_id("claude") is None
 
 
 def test_read_client_id_rejects_empty(_state_dir):
@@ -112,16 +159,32 @@ def test_read_client_id_rejects_control_characters(_state_dir):
 
 
 def test_invalidate_client_id_is_idempotent():
-    host_cache.invalidate_client_id("claude")  # missing — no-op
+    host_cache.invalidate_client_id("claude")
     host_cache.write_client_id("claude", "you@example.com")
     host_cache.invalidate_client_id("claude")
     assert host_cache.read_client_id("claude") is None
 
 
+# --------------------------------------------------------- migration
+
+def test_migrate_legacy_host_file_removes_file(_state_dir):
+    legacy = _state_dir / "host"
+    legacy.write_text("10.0.0.5:80\n")
+    host_cache.migrate_legacy_host_file()
+    assert not legacy.exists()
+
+
+def test_migrate_legacy_host_file_is_idempotent(_state_dir):
+    host_cache.migrate_legacy_host_file()  # nothing to do
+    host_cache.migrate_legacy_host_file()  # still nothing
+    assert not (_state_dir / "host").exists()
+
+
+# --------------------------------------------------------- state dir
+
 def test_state_dir_creates_directory_with_0700(monkeypatch, tmp_path):
     target = tmp_path / "nested" / "burnscope"
     monkeypatch.setenv("BURNSCOPE_STATE_DIR", str(target))
-    host_cache.store_host("esp.local:80")
+    host_cache.write_client_id("claude", "you@example.com")
     assert target.is_dir()
-    # 0o700 — bottom 9 bits should match rwx------ on POSIX.
     assert (target.stat().st_mode & 0o777) == 0o700

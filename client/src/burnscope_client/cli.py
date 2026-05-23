@@ -1,10 +1,11 @@
-"""Installer, status, and pair-reset CLI. Not a daemon entry point.
+"""Installer, status, pair, and pair-reset CLI. Not a daemon entry point.
 
 Subcommands:
 
   burnscope install   {claude,codex}
   burnscope uninstall {claude,codex}
   burnscope status
+  burnscope pair [--agent {claude,codex}]
   burnscope pair-reset
 
 Claude install is OS-agnostic (just patches `~/.claude/settings.json`).
@@ -15,6 +16,7 @@ on Linux, manual-instructions everywhere else.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import shutil
@@ -23,6 +25,8 @@ import sys
 from pathlib import Path
 
 from . import host_cache
+from .discovery import discover_all
+from .host_cache import PairedDevice
 
 CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 CLAUDE_STATUSLINE_COMMAND = f"{sys.executable} -m burnscope_client.claude_statusline"
@@ -98,7 +102,19 @@ def main(argv: list[str] | None = None) -> int:
     p_uninstall.add_argument("agent", choices=["claude", "codex"])
 
     sub.add_parser("status", help="Print local wiring status")
-    sub.add_parser("pair-reset", help="Forget the cached ESP32 host")
+
+    p_pair = sub.add_parser(
+        "pair",
+        help="Discover unpaired displays on the LAN and add them to the paired list",
+    )
+    p_pair.add_argument(
+        "--agent",
+        choices=["claude", "codex"],
+        default=None,
+        help="Restrict pairing to one agent (default: both)",
+    )
+
+    sub.add_parser("pair-reset", help="Forget paired devices and cached client_ids")
 
     args = parser.parse_args(argv)
 
@@ -108,13 +124,78 @@ def main(argv: list[str] | None = None) -> int:
         return _uninstall(args.agent)
     if args.cmd == "status":
         return _status()
+    if args.cmd == "pair":
+        return _pair(args.agent)
     if args.cmd == "pair-reset":
-        host_cache.invalidate_host()
+        host_cache.migrate_legacy_host_file()
         for agent in ("claude", "codex"):
+            host_cache.clear_paired_devices(agent)
             host_cache.invalidate_client_id(agent)
-        print("Forgot cached ESP32 host and per-agent client_ids.")
+        print("Forgot paired devices and per-agent client_ids.")
         return 0
     return 1
+
+
+# ====================================================================== pair
+
+
+def _pair(agent_filter: str | None) -> int:
+    """Run mDNS discovery and add free devices to the agent's paired list.
+
+    The TOFU claim itself happens on the next real push (statusline fire
+    or Codex notification), which will silently drop any device that 401s
+    because someone else won the race.
+    """
+    host_cache.migrate_legacy_host_file()
+    agents = ("claude", "codex") if agent_filter is None else (agent_filter,)
+
+    exit_code = 0
+    for agent in agents:
+        if host_cache.read_client_id(agent) is None:
+            print(
+                f"[{agent}] no cached client_id "
+                f"(~/.burnscope/client-id.{agent} missing) — skipping. "
+                f"Run the {agent} collector at least once to populate it."
+            )
+            exit_code = 1
+            continue
+        added = _pair_one_agent(agent)
+        if added is None:
+            exit_code = 1
+            continue
+        if not added:
+            print(f"[{agent}] no claimable devices on the LAN.")
+            continue
+        joined = ", ".join(f"{d.device_id} ({d.host})" for d in added)
+        print(
+            f"[{agent}] added {len(added)} device(s) to paired list: {joined}. "
+            f"Next push will claim via TOFU."
+        )
+    return exit_code
+
+
+def _pair_one_agent(agent: str) -> list[PairedDevice] | None:
+    """Discover free devices for `agent` and dedupe-merge them into the file.
+
+    Returns the list of newly-added PairedDevices, an empty list when
+    discovery succeeded but found nothing claimable, or None on a
+    discovery error.
+    """
+    try:
+        discovered = asyncio.run(discover_all(agent=agent))
+    except Exception as exc:
+        print(f"[{agent}] mDNS discovery failed: {exc}")
+        return None
+
+    known = {d.device_id for d in host_cache.load_paired_devices(agent)}
+    added: list[PairedDevice] = []
+    for device in discovered:
+        if device.device_id in known:
+            continue
+        candidate = PairedDevice(device_id=device.device_id, host=device.host)
+        host_cache.add_paired_device(agent, candidate)
+        added.append(candidate)
+    return added
 
 
 # ==================================================================== claude
@@ -299,14 +380,26 @@ def _install_codex_manual() -> int:
 
 def _status() -> int:
     print(f"State directory: {host_cache.state_dir()}")
-    print(f"Cached host:     {host_cache.load_host() or '<none>'}")
 
     for agent in ("claude", "codex"):
         state = host_cache.read_push_state(agent)
         cid = host_cache.read_client_id(agent)
-        cid_short = f"{cid[:12]}…" if cid else "<not cached>"
-        print(f"Last push {agent}: {state or '<none>'}")
-        print(f"Client-id {agent}: {cid_short}")
+        cid_short = f"{cid[:32]}…" if cid and len(cid) > 32 else (cid or "<not cached>")
+        devices = host_cache.load_paired_devices(agent)
+        print(f"--- {agent} ---")
+        print(f"  client_id:   {cid_short}")
+        print(f"  aggregate:   {state or '<none>'}")
+        if not devices:
+            print("  paired:      <none>")
+        else:
+            for device in devices:
+                per_device = host_cache.read_push_state(
+                    agent, device_id=device.device_id
+                )
+                print(
+                    f"  paired:      {device.device_id} @ {device.host} "
+                    f"→ {per_device or '<no push yet>'}"
+                )
 
     claude_settings = _read_json(CLAUDE_SETTINGS_PATH) or {}
     sl = claude_settings.get("statusLine")

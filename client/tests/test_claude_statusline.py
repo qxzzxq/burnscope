@@ -1,11 +1,12 @@
 import io
 import json
-import sys
 from unittest.mock import MagicMock
 
 import pytest
 
 from burnscope_client import claude_statusline, host_cache
+from burnscope_client.host_cache import PairedDevice
+from burnscope_client.pusher import PushResult
 
 
 @pytest.fixture(autouse=True)
@@ -24,6 +25,8 @@ def _payload(five=23.5, seven=41.2, present=True):
         }
     }
 
+
+# ============================================================ foreground
 
 def test_foreground_renders_with_pending_indicator(monkeypatch, capsys):
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(_payload())))
@@ -52,9 +55,7 @@ def test_foreground_uses_check_indicator_after_successful_push(monkeypatch, caps
     monkeypatch.setattr(claude_statusline.subprocess, "Popen", MagicMock())
 
     claude_statusline.main([])
-
-    line = capsys.readouterr().out.strip()
-    assert line.endswith("✓")
+    assert capsys.readouterr().out.strip().endswith("✓")
 
 
 def test_foreground_uses_cross_indicator_after_failed_push(monkeypatch, capsys):
@@ -63,9 +64,7 @@ def test_foreground_uses_cross_indicator_after_failed_push(monkeypatch, capsys):
     monkeypatch.setattr(claude_statusline.subprocess, "Popen", MagicMock())
 
     claude_statusline.main([])
-
-    line = capsys.readouterr().out.strip()
-    assert line.endswith("✗")
+    assert capsys.readouterr().out.strip().endswith("✗")
 
 
 def test_foreground_no_rate_limits_renders_dashes_and_skips_push(monkeypatch, capsys):
@@ -75,9 +74,7 @@ def test_foreground_no_rate_limits_renders_dashes_and_skips_push(monkeypatch, ca
 
     rc = claude_statusline.main([])
     assert rc == 0
-
-    out = capsys.readouterr().out.strip()
-    assert "—" in out
+    assert "—" in capsys.readouterr().out
     popen.assert_not_called()
 
 
@@ -91,136 +88,243 @@ def test_foreground_garbage_stdin_still_renders(monkeypatch, capsys):
     popen.assert_not_called()
 
 
-def test_push_mode_writes_ok_on_successful_push(monkeypatch):
-    snapshot_dict = {
-        "agent": "claude",
-        "captured_at": 1779050146,
-        "sessions": [
-            {"type": "current", "used_pct": 0.23, "resets_at": 1779066600},
-            {"type": "weekly", "used_pct": 0.41, "resets_at": 1779156000},
-        ],
-    }
-    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(snapshot_dict)))
+# ================================================================== push
+
+_SNAP = {
+    "agent": "claude",
+    "captured_at": 1779050146,
+    "sessions": [
+        {"type": "current", "used_pct": 0.23, "resets_at": 1779066600},
+        {"type": "weekly",  "used_pct": 0.41, "resets_at": 1779156000},
+    ],
+}
+
+
+def _stub_stdin(monkeypatch, payload=None):
     monkeypatch.setattr(
-        claude_statusline.identity, "claude_user_identifier", lambda: "uuid-xyz"
+        "sys.stdin", io.StringIO(json.dumps(payload if payload is not None else _SNAP))
     )
 
-    async def fake_push(snap, host, client_id, client):
-        assert host == "esp.local:80"
-        assert client_id == "uuid-xyz"  # passed through as plaintext
-        assert snap.agent == "claude"
 
-    monkeypatch.setattr(claude_statusline, "push", fake_push)
-    monkeypatch.setattr(claude_statusline.host_cache, "load_host", lambda: "esp.local:80")
+def _stub_identity(monkeypatch, value="me@example.com"):
+    monkeypatch.setattr(
+        claude_statusline.identity, "claude_user_identifier", lambda: value
+    )
+
+
+def _stub_push_to_all(monkeypatch, results):
+    async def fake_push_to_all(snapshot, devices, client_id, client):
+        return {r.device_id: r for r in results}
+    monkeypatch.setattr(claude_statusline, "push_to_all", fake_push_to_all)
+
+
+def _stub_discover_none(monkeypatch):
+    async def fake_discover_all(timeout=10.0, agent=None, zc=None):
+        return []
+    monkeypatch.setattr(claude_statusline, "discover_all", fake_discover_all)
+
+
+def test_push_uses_cached_paired_list_without_discovery(monkeypatch):
+    _stub_stdin(monkeypatch)
+    _stub_identity(monkeypatch)
+    host_cache.add_paired_device("claude", PairedDevice("dev-a", "10.0.0.5:80"))
+    host_cache.add_paired_device("claude", PairedDevice("dev-b", "10.0.0.6:80"))
+
+    def boom(*a, **kw):
+        raise AssertionError("discover_all must not run when paired list is hot")
+    monkeypatch.setattr(claude_statusline, "discover_all", boom)
+
+    seen_devices = []
+
+    async def fake_push_to_all(snapshot, devices, client_id, client):
+        seen_devices.extend(devices)
+        return {d.device_id: PushResult(d.device_id, True, "ok") for d in devices}
+
+    monkeypatch.setattr(claude_statusline, "push_to_all", fake_push_to_all)
 
     rc = claude_statusline.main(["--push"])
     assert rc == 0
-    state = host_cache.read_push_state("claude")
-    assert state["ok"] is True
-    # First successful derive should populate the cache.
-    assert host_cache.read_client_id("claude") is not None
+    assert {d.device_id for d in seen_devices} == {"dev-a", "dev-b"}
+    assert host_cache.read_push_state("claude")["ok"] is True
+    assert host_cache.read_push_state("claude", device_id="dev-a")["ok"] is True
 
 
-def test_push_mode_uses_cached_client_id_without_re_reading_claude_json(monkeypatch):
-    snapshot_dict = {
-        "agent": "claude",
-        "captured_at": 1779050146,
-        "sessions": [
-            {"type": "current", "used_pct": 0.23, "resets_at": 1779066600},
+def test_push_auto_pairs_when_paired_list_empty(monkeypatch):
+    """Empty list → discover_all + per-device claim, then fan-out."""
+    _stub_stdin(monkeypatch)
+    _stub_identity(monkeypatch)
+    host_cache.write_client_id("claude", "me@example.com")
+
+    from burnscope_client.discovery import DiscoveredDevice
+
+    async def fake_discover_all(timeout=10.0, agent=None, zc=None):
+        return [
+            DiscoveredDevice("dev-free-1", "10.0.0.5:80", False, False),
+            DiscoveredDevice("dev-free-2", "10.0.0.6:80", False, True),
+        ]
+
+    monkeypatch.setattr(claude_statusline, "discover_all", fake_discover_all)
+
+    claim_calls = []
+
+    async def fake_push(snap, host, client_id, client):
+        claim_calls.append((host, client_id))
+
+    monkeypatch.setattr(claude_statusline, "push", fake_push)
+
+    async def fake_push_to_all(snapshot, devices, client_id, client):
+        return {d.device_id: PushResult(d.device_id, True, "ok") for d in devices}
+
+    monkeypatch.setattr(claude_statusline, "push_to_all", fake_push_to_all)
+
+    rc = claude_statusline.main(["--push"])
+    assert rc == 0
+    assert len(claim_calls) == 2
+    paired = host_cache.load_paired_devices("claude")
+    assert {d.device_id for d in paired} == {"dev-free-1", "dev-free-2"}
+
+
+def test_push_auto_pair_silently_skips_401(monkeypatch):
+    _stub_stdin(monkeypatch)
+    _stub_identity(monkeypatch)
+
+    from burnscope_client.discovery import DiscoveredDevice
+
+    async def fake_discover_all(timeout=10.0, agent=None, zc=None):
+        return [
+            DiscoveredDevice("dev-ok",      "10.0.0.5:80", False, False),
+            DiscoveredDevice("dev-stolen",  "10.0.0.6:80", False, False),
+        ]
+
+    monkeypatch.setattr(claude_statusline, "discover_all", fake_discover_all)
+
+    async def fake_push(snap, host, client_id, client):
+        if host == "10.0.0.6:80":
+            raise claude_statusline.PushAuthError("401")
+
+    monkeypatch.setattr(claude_statusline, "push", fake_push)
+
+    async def fake_push_to_all(snapshot, devices, client_id, client):
+        return {d.device_id: PushResult(d.device_id, True, "ok") for d in devices}
+
+    monkeypatch.setattr(claude_statusline, "push_to_all", fake_push_to_all)
+
+    claude_statusline.main(["--push"])
+    paired = {d.device_id for d in host_cache.load_paired_devices("claude")}
+    assert paired == {"dev-ok"}
+
+
+def test_push_silently_drops_device_on_401(monkeypatch):
+    """A 401 from one device removes only that (agent, device) pair."""
+    _stub_stdin(monkeypatch)
+    _stub_identity(monkeypatch)
+    host_cache.add_paired_device("claude", PairedDevice("dev-keep", "10.0.0.5:80"))
+    host_cache.add_paired_device("claude", PairedDevice("dev-drop", "10.0.0.6:80"))
+
+    _stub_push_to_all(
+        monkeypatch,
+        [
+            PushResult("dev-keep", True,  "ok"),
+            PushResult("dev-drop", False, "auth"),
         ],
-    }
-    cached = "f" * 64
+    )
+
+    claude_statusline.main(["--push"])
+
+    remaining = {d.device_id for d in host_cache.load_paired_devices("claude")}
+    assert remaining == {"dev-keep"}
+    assert host_cache.read_push_state("claude", device_id="dev-drop")["ok"] is False
+    assert host_cache.read_push_state("claude", device_id="dev-keep")["ok"] is True
+
+
+def test_push_keeps_device_on_transport_error(monkeypatch):
+    _stub_stdin(monkeypatch)
+    _stub_identity(monkeypatch)
+    host_cache.add_paired_device("claude", PairedDevice("dev-flaky", "10.0.0.5:80"))
+
+    _stub_push_to_all(
+        monkeypatch,
+        [PushResult("dev-flaky", False, "transport")],
+    )
+
+    rc = claude_statusline.main(["--push"])
+    assert rc == 1
+    # Device must stay in the paired list — transport failure isn't ownership.
+    paired = {d.device_id for d in host_cache.load_paired_devices("claude")}
+    assert paired == {"dev-flaky"}
+    assert host_cache.read_push_state("claude", device_id="dev-flaky")["ok"] is False
+    assert host_cache.read_push_state("claude")["ok"] is False
+
+
+def test_push_writes_aggregate_ok_only_when_every_device_succeeds(monkeypatch):
+    _stub_stdin(monkeypatch)
+    _stub_identity(monkeypatch)
+    host_cache.add_paired_device("claude", PairedDevice("dev-a", "10.0.0.5:80"))
+    host_cache.add_paired_device("claude", PairedDevice("dev-b", "10.0.0.6:80"))
+
+    _stub_push_to_all(
+        monkeypatch,
+        [
+            PushResult("dev-a", True,  "ok"),
+            PushResult("dev-b", False, "transport"),
+        ],
+    )
+
+    claude_statusline.main(["--push"])
+    assert host_cache.read_push_state("claude")["ok"] is False
+
+
+def test_push_uses_cached_client_id_without_re_reading_claude_json(monkeypatch):
+    _stub_stdin(monkeypatch)
+    cached = "you@example.com"
     host_cache.write_client_id("claude", cached)
-    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(snapshot_dict)))
+    host_cache.add_paired_device("claude", PairedDevice("dev-a", "10.0.0.5:80"))
 
     def boom():
-        raise AssertionError(
-            "claude_user_identifier should NOT be called when client_id is cached"
-        )
-
+        raise AssertionError("identity.claude_user_identifier must not be called")
     monkeypatch.setattr(claude_statusline.identity, "claude_user_identifier", boom)
-    monkeypatch.setattr(
-        claude_statusline.host_cache, "load_host", lambda: "esp.local:80"
-    )
 
-    received: list[str] = []
+    seen_ids: list[str] = []
 
-    async def fake_push(snap, host, client_id, client):
-        received.append(client_id)
+    async def fake_push_to_all(snapshot, devices, client_id, client):
+        seen_ids.append(client_id)
+        return {d.device_id: PushResult(d.device_id, True, "ok") for d in devices}
 
-    monkeypatch.setattr(claude_statusline, "push", fake_push)
+    monkeypatch.setattr(claude_statusline, "push_to_all", fake_push_to_all)
 
-    rc = claude_statusline.main(["--push"])
-    assert rc == 0
-    assert received == [cached]
+    claude_statusline.main(["--push"])
+    assert seen_ids == [cached]
 
 
-def test_push_mode_writes_fail_and_invalidates_host_on_push_error(monkeypatch):
-    snapshot_dict = {
-        "agent": "claude",
-        "captured_at": 1779050146,
-        "sessions": [
-            {"type": "current", "used_pct": 0.23, "resets_at": 1779066600},
-        ],
-    }
-    host_cache.store_host("esp.local:80")
-    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(snapshot_dict)))
-    monkeypatch.setattr(
-        claude_statusline.identity, "claude_user_identifier", lambda: "uuid-xyz"
-    )
-
-    async def fake_push(*args, **kwargs):
-        raise claude_statusline.PushError("transport failed")
-
-    monkeypatch.setattr(claude_statusline, "push", fake_push)
+def test_push_returns_failure_when_no_devices_and_discovery_empty(monkeypatch):
+    _stub_stdin(monkeypatch)
+    _stub_identity(monkeypatch)
+    _stub_discover_none(monkeypatch)
 
     rc = claude_statusline.main(["--push"])
     assert rc == 1
-    assert host_cache.load_host() is None
     assert host_cache.read_push_state("claude")["ok"] is False
 
 
-def test_push_mode_preserves_host_cache_on_auth_error(monkeypatch):
-    snapshot_dict = {
-        "agent": "claude",
-        "captured_at": 1779050146,
-        "sessions": [
-            {"type": "current", "used_pct": 0.23, "resets_at": 1779066600},
-        ],
-    }
-    host_cache.store_host("esp.local:80")
-    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(snapshot_dict)))
-    monkeypatch.setattr(
-        claude_statusline.identity, "claude_user_identifier", lambda: "uuid-xyz"
-    )
-
-    async def fake_push(*args, **kwargs):
-        raise claude_statusline.PushAuthError("401")
-
-    monkeypatch.setattr(claude_statusline, "push", fake_push)
-
-    rc = claude_statusline.main(["--push"])
-    assert rc == 1
-    # Host cache must survive — auth issue isn't a reachability issue.
-    assert host_cache.load_host() == "esp.local:80"
-    assert host_cache.read_push_state("claude")["ok"] is False
-
-
-def test_push_mode_writes_fail_when_identity_unavailable(monkeypatch):
-    snapshot_dict = {
-        "agent": "claude",
-        "captured_at": 1779050146,
-        "sessions": [
-            {"type": "current", "used_pct": 0.23, "resets_at": 1779066600},
-        ],
-    }
-    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(snapshot_dict)))
+def test_push_writes_fail_when_identity_unavailable(monkeypatch):
+    _stub_stdin(monkeypatch)
 
     def boom():
         raise claude_statusline.identity.IdentityError("no credentials")
-
     monkeypatch.setattr(claude_statusline.identity, "claude_user_identifier", boom)
 
     rc = claude_statusline.main(["--push"])
     assert rc == 1
     assert host_cache.read_push_state("claude")["ok"] is False
+
+
+def test_push_migrates_legacy_host_file(monkeypatch, _isolate_state):
+    """First push after v2 upgrade deletes the legacy `host` file."""
+    legacy = _isolate_state / "host"
+    legacy.write_text("esp.local:80\n")
+    _stub_stdin(monkeypatch)
+    _stub_identity(monkeypatch)
+    _stub_discover_none(monkeypatch)
+
+    claude_statusline.main(["--push"])
+    assert not legacy.exists()

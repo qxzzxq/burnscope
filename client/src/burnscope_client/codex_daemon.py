@@ -47,8 +47,15 @@ import httpx  # noqa: E402
 
 from . import host_cache  # noqa: E402
 from ._log import configure_logging  # noqa: E402
-from .discovery import discover_esp32  # noqa: E402
-from .pusher import PushAuthError, PushError, fetch_health, push  # noqa: E402
+from .discovery import discover_all  # noqa: E402
+from .host_cache import PairedDevice  # noqa: E402
+from .pusher import (  # noqa: E402
+    PushAuthError,
+    PushError,
+    fetch_health,
+    push,
+    push_to_all,
+)
 from .schema import AgentSnapshot, SessionSnapshot  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -57,6 +64,7 @@ AGENT_NAME = "codex"
 APP_SERVER_CMD = ("codex", "app-server")
 CLIENT_NAME = "burnscope"
 HEALTH_INTERVAL_S = 30.0
+DISCOVERY_TIMEOUT_S = 5.0
 BACKOFF_INITIAL_S = 1.0
 BACKOFF_MAX_S = 60.0
 REQUEST_TIMEOUT_S = 30.0
@@ -297,6 +305,7 @@ class CodexDaemon:
     # --------------------------------------------------------------- pusher
 
     async def _pusher_loop(self) -> None:
+        host_cache.migrate_legacy_host_file()
         async with httpx.AsyncClient() as client:
             while True:
                 snapshot = await self._snapshot_queue.get()
@@ -309,22 +318,25 @@ class CodexDaemon:
             log.warning("no client_id; skipping push")
             host_cache.write_push_state(AGENT_NAME, ok=False)
             return
-        host = await self._resolve_host()
-        if host is None:
-            log.warning("no host available; skipping push")
+
+        devices = await self._resolve_paired_devices(snapshot, client)
+        if not devices:
+            log.warning("no paired codex devices; skipping push")
             host_cache.write_push_state(AGENT_NAME, ok=False)
             return
-        try:
-            await push(snapshot, host, self._client_id, client)
-        except PushAuthError as exc:
-            log.error("auth rejected: %s", exc)
-            host_cache.write_push_state(AGENT_NAME, ok=False)
-        except PushError as exc:
-            log.warning("push failed, invalidating host: %s", exc)
-            host_cache.invalidate_host()
-            host_cache.write_push_state(AGENT_NAME, ok=False)
-        else:
-            host_cache.write_push_state(AGENT_NAME, ok=True)
+
+        results = await push_to_all(snapshot, devices, self._client_id, client)
+        overall_ok = True
+        for device_id, result in results.items():
+            host_cache.write_push_state(
+                AGENT_NAME, ok=result.ok, device_id=device_id
+            )
+            if result.kind == "auth":
+                log.info("dropping %s from codex paired list (401)", device_id)
+                host_cache.remove_paired_device(AGENT_NAME, device_id)
+            if not result.ok:
+                overall_ok = False
+        host_cache.write_push_state(AGENT_NAME, ok=overall_ok)
 
     # --------------------------------------------------------------- health
 
@@ -334,32 +346,63 @@ class CodexDaemon:
                 await asyncio.sleep(HEALTH_INTERVAL_S)
                 if self._client_id is None:
                     continue
-                host = host_cache.load_host()
-                if host is None:
+                devices = host_cache.load_paired_devices(AGENT_NAME)
+                if not devices:
                     continue
-                body = await fetch_health(host, self._client_id, client)
-                if body is None:
-                    host_cache.invalidate_host()
-                    continue
-                if self._last_snapshot is None:
-                    continue
-                if _firmware_diverged(body, self._last_snapshot):
-                    log.info("firmware diverged; re-enqueuing last snapshot")
+                diverged_any = False
+                for device in devices:
+                    body = await fetch_health(device.host, self._client_id, client)
+                    if body is None:
+                        host_cache.write_push_state(
+                            AGENT_NAME, ok=False, device_id=device.device_id
+                        )
+                        continue
+                    if self._last_snapshot is not None and _firmware_diverged(
+                        body, self._last_snapshot
+                    ):
+                        diverged_any = True
+                if diverged_any and self._last_snapshot is not None:
+                    log.info(
+                        "firmware diverged on >=1 device; re-enqueuing last snapshot"
+                    )
                     self._enqueue_bounded(self._last_snapshot)
 
-    # ----------------------------------------------------------- host cache
+    # ----------------------------------------------------------- device list
 
-    async def _resolve_host(self) -> str | None:
-        cached = host_cache.load_host()
+    async def _resolve_paired_devices(
+        self, snapshot: AgentSnapshot, client: httpx.AsyncClient
+    ) -> list[PairedDevice]:
+        """Steady state: read the cache. First run: discover + claim."""
+        cached = host_cache.load_paired_devices(AGENT_NAME)
         if cached:
-            log.debug("host cache hit: %s", cached)
+            log.debug("paired-devices.%s hit (%d device(s))", AGENT_NAME, len(cached))
             return cached
-        log.debug("host cache miss; running mDNS discovery")
-        found = await discover_esp32()
-        if found:
-            host_cache.store_host(found)
-            log.debug("host cached: %s", found)
-        return found
+        log.info("paired-devices.%s empty; running auto-pair discovery", AGENT_NAME)
+        assert self._client_id is not None
+        # Unfiltered so devices already TOFU-bound to us (paired_<agent>=1
+        # with our client_id) get re-claimed after a paired-devices.json
+        # wipe. Mismatches are silently skipped on 401 below.
+        discovered = await discover_all(timeout=DISCOVERY_TIMEOUT_S)
+        claimed: list[PairedDevice] = []
+        for device in discovered:
+            candidate = PairedDevice(device_id=device.device_id, host=device.host)
+            try:
+                await push(snapshot, candidate.host, self._client_id, client)
+            except PushAuthError:
+                log.info("auto-pair skipped %s (401)", candidate.device_id)
+                continue
+            except PushError as exc:
+                log.info(
+                    "auto-pair skipped %s (transport): %s", candidate.device_id, exc
+                )
+                continue
+            log.info("auto-pair claimed %s at %s", candidate.device_id, candidate.host)
+            host_cache.add_paired_device(AGENT_NAME, candidate)
+            host_cache.write_push_state(
+                AGENT_NAME, ok=True, device_id=candidate.device_id
+            )
+            claimed.append(candidate)
+        return claimed
 
 
 # ============================================================== module-level

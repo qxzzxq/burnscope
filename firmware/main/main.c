@@ -22,6 +22,12 @@
 #include "watchdog.h"
 #include "wifi.h"
 
+#ifdef CONFIG_BURNSCOPE_AMOLED_DEMO
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "demo.h"
+#endif
+
 static const char *TAG = "burnscope";
 
 static void on_snapshot(const agent_snapshot_t *snap, void *user)
@@ -98,6 +104,17 @@ static void init_nvs(void)
 void app_main(void)
 {
     ESP_LOGI(TAG, "BurnScope firmware_version=%s starting", BURNSCOPE_FW_VERSION);
+
+#ifdef CONFIG_BURNSCOPE_AMOLED_DEMO
+    /* Driver-verification build: bring up the panel, render a static
+     * test pattern, and sleep forever. Skip NVS / Wi-Fi / HTTP / NTP
+     * entirely — the goal is to exercise only the SH8601 + LVGL path. */
+    ESP_LOGI(TAG, "BURNSCOPE_AMOLED_DEMO=y — running test pattern only");
+    amoled_demo_run();
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(60000));
+    }
+#endif
 
     init_nvs();
     display_profile_init();

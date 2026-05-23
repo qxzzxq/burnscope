@@ -213,7 +213,7 @@
   <tr><td class="mono">claude_statusline.py</td><td>Statusline-hook entry point. Short-lived, fires per event.</td></tr>
   <tr><td class="mono">codex_daemon.py</td><td>Long-lived process owning the <code>codex app-server</code> subprocess.</td></tr>
   <tr><td class="mono">identity.py</td><td>Returns Claude's plaintext identifier (<code>oauthAccount.emailAddress</code> from <code>~/.claude.json</code>, or <code>userID</code> fallback) for the <code>X-BurnScope-Client-Id</code> header.</td></tr>
-  <tr><td class="mono">host_cache.py</td><td>Atomic file-backed cache of the discovered ESP32 host.</td></tr>
+  <tr><td class="mono">host_cache.py</td><td>Atomic file-backed cache of per-agent paired devices and last-push state.</td></tr>
 </table>
 
 <h4>What's preserved</h4>
@@ -221,8 +221,8 @@
 <table>
   <tr><th>v1 / v2</th><th>Notes</th></tr>
   <tr><td class="mono">schema.py</td><td><code>SessionSnapshot</code> / <code>AgentSnapshot</code> unchanged. Wire format is backward-compatible.</td></tr>
-  <tr><td class="mono">discovery.py</td><td>mDNS browsing. Now consumed by both collectors via <code>host_cache.py</code>.</td></tr>
-  <tr><td class="mono">pusher.py</td><td><code>POST /summary</code> and <code>GET /health</code> client. Extended with the <code>X-BurnScope-Client-Id</code> header.</td></tr>
+  <tr><td class="mono">discovery.py</td><td>mDNS browsing. Returns every resolved device with its per-agent paired hint; per-agent filtering is a parameter to <code>discover_all()</code>.</td></tr>
+  <tr><td class="mono">pusher.py</td><td><code>POST /summary</code> and <code>GET /health</code> client. Carries the <code>X-BurnScope-Client-Id</code> header. Extended with <code>push_to_all()</code> for fan-out.</td></tr>
   <tr><td class="mono">cli.py</td><td>Rewritten as an installer / status tool, not a daemon entry point.</td></tr>
 </table>
 
@@ -251,13 +251,15 @@ flowchart LR
 
     subgraph BState["~/.burnscope/ (state dir)"]
       direction TB
-      host[("host<br/>mDNS cache")]
-      lpclaude[("last-push.claude<br/>indicator for next fire")]
-      lpcodex[("last-push.codex<br/>burnscope status only")]
+      pdclaude[("paired-devices.claude.json<br/>list of {device_id, host}")]
+      pdcodex[("paired-devices.codex.json<br/>list of {device_id, host}")]
+      lpclaude[("last-push.claude<br/>aggregate indicator")]
+      lpcodex[("last-push.codex<br/>aggregate indicator")]
     end
   end
 
-  esp32[("ESP32<br/>POST /summary · GET /health<br/>NVS: paired identifier per agent<br/>(displayed on screen)")]
+  esp32X[("ESP32 #X<br/>POST /summary · GET /health<br/>mDNS TXT: paired_claude, paired_codex")]
+  esp32Y[("ESP32 #Y<br/>(same protocol)")]
 
   %% Claude wiring
   cc -- "stdin JSON" --> hook
@@ -265,23 +267,26 @@ flowchart LR
   creds -. "emailAddress / userID" .-> hook
   lpclaude -. "previous outcome" .-> hook
   hook -- "spawn" --> bgpush
-  bgpush --> host
+  bgpush --> pdclaude
   bgpush --> lpclaude
-  bgpush -. "POST<br/>X-BurnScope-Client-Id<br/>(plaintext email / userID)" .-> esp32
+  bgpush -. "fan-out POST<br/>X-BurnScope-Client-Id" .-> esp32X
+  bgpush -. "fan-out POST" .-> esp32Y
 
   %% Codex wiring
   cas -- "stdout notifications" --> codexd
   codexd -- "stdin JSON-RPC" --> cas
-  codexd --> host
+  codexd --> pdcodex
   codexd --> lpcodex
-  codexd -. "POST<br/>X-BurnScope-Client-Id<br/>(plaintext email)" .-> esp32
+  codexd -. "fan-out POST<br/>X-BurnScope-Client-Id" .-> esp32X
+  codexd -. "fan-out POST" .-> esp32Y
 </pre>
 </div>
 
 <p>
-  Two collectors, one ESP32. They share <strong>only</strong> the
-  ESP32-host cache file and the wire-format target — no IPC, no shared
-  process state, no shared token.
+  Two collectors, N ESP32 displays. The collectors share <strong>nothing</strong> on
+  disk — each manages its own per-agent paired-device list and its own
+  last-push state. No IPC, no shared process state, no shared token, no
+  shared cache file.
 </p>
 
 <!-- =============================================================== -->
@@ -357,15 +362,97 @@ flowchart LR
   <tr><td>Same user, two laptops, both Codex</td><td>Both read the same <code>account.email</code> → identical → both accepted. ✓</td></tr>
   <tr><td>Same user, Claude on one laptop and Codex on another</td><td>Per-agent slots claimed independently. ESP32 shows both. ✓</td></tr>
   <tr><td>Two users on same LAN, each own ESP32</td><td>Different emails → each ESP32 only accepts its owner. ✓</td></tr>
+  <tr><td>One user, multiple ESP32 displays on the same LAN</td><td>Client tracks a per-agent list of paired devices; each push fans out to all of them in parallel. See <a href="#multi-device">§3.1</a>.</td></tr>
+  <tr><td>Two users + one shared display + partially-claimed slots</td><td>Per-agent claim semantics. User A's Codex can hold one slot while User B's Claude holds the other; the display surfaces both labels on their respective rows. See <a href="#multi-device">§3.1</a>.</td></tr>
   <tr><td>First-run race attack</td><td>Same TOFU surface as bare TOFU. Mitigation: pair while ESP32 is on your bench before exposing to LAN.</td></tr>
   <tr><td>PII on the LAN</td><td>The identifier (your email) is transmitted plaintext over your local network. Accepted trade-off in exchange for a human-readable label on the display.</td></tr>
+</table>
+
+<h3 id="multi-device">3.1 Multi-device pairing (per-agent slots)</h3>
+
+<p>
+  The client supports one user owning multiple ESP32 displays simultaneously,
+  and tells different users which devices on the LAN are still up for grabs.
+  Pairing remains <strong>per-agent slot</strong>, matching the firmware's
+  existing NVS schema — no firmware NVS change. What's new is the
+  client-side multi-device tracking and the mDNS visibility into per-agent
+  claim state.
+</p>
+
+<h4>Slot independence</h4>
+
+<p>
+  A device's <code>claude</code> slot and its <code>codex</code> slot are
+  independent claims. Different users may end up holding different slots on
+  the same physical display.
+</p>
+
+<p>Worked example:</p>
+
+<ul>
+  <li>User A: <code>claude_A@example.com</code> + <code>codex_A@example.com</code>.</li>
+  <li>User B: <code>claude_B@example.com</code> only.</li>
+  <li>User A pairs his Claude to screen X and his Codex to screen Y.
+      Screen X advertises <code>paired_claude=1, paired_codex=0</code>;
+      screen Y advertises <code>paired_claude=0, paired_codex=1</code>.</li>
+  <li>User B's <code>burnscope pair</code> claims her Claude on screen Y
+      (its <code>claude</code> slot is free); screen X is skipped
+      (<code>paired_claude=1</code>). Afterward, screen Y's display shows
+      <code>claude_B@example.com</code> and <code>codex_A@example.com</code>
+      side by side on their respective rows.</li>
+</ul>
+
+<h4>mDNS visibility</h4>
+
+<p>
+  The firmware advertises two TXT records — <code>paired_claude</code> and
+  <code>paired_codex</code> — that mirror the NVS slot state (see
+  <a href="#wire-additions">§4.3</a>). Each per-agent collector filters
+  discovery results to devices where <em>its</em> slot is still
+  <code>0</code>, then attempts to claim each via a normal
+  <code>POST /summary</code>. <strong>The TXT record is an advisory hint
+  only</strong> — the firmware's HTTP response (<code>204</code> claims,
+  <code>401</code> rejects) is the authoritative answer when mDNS caches go
+  stale.
+</p>
+
+<h4>Client-side state model</h4>
+
+<p>
+  Each collector maintains its own paired-device list in
+  <code>~/.burnscope/paired-devices.&lt;agent&gt;.json</code>. A device may
+  legitimately appear in both lists (User A's normal case above). The
+  Claude collector never reads or writes the Codex collector's file, and
+  vice versa.
+</p>
+
+<h4>Failure modes</h4>
+
+<table>
+  <tr><th>Event</th><th>Behavior</th></tr>
+  <tr>
+    <td>Push to device returns <code>401</code></td>
+    <td><strong>Silently drop</strong> from this agent's paired list (<code>remove_paired_device(agent, device_id)</code>). No log, no error surfaced to the user. The device may be re-claimed on the next <code>burnscope pair</code> if it returns to <code>paired_&lt;agent&gt;=0</code>.</td>
+  </tr>
+  <tr>
+    <td>Push to device transport-fails</td>
+    <td>Keep in list; record <code>ok:false</code> in <code>last-push.&lt;agent&gt;.&lt;device_id&gt;</code>. Next push retries.</td>
+  </tr>
+  <tr>
+    <td>New device appears on the LAN after first-run</td>
+    <td>Run <code>burnscope pair</code>; the collector re-discovers any newly-visible <code>paired_&lt;agent&gt;=0</code> device and adds it to the agent's paired list. The TOFU claim itself fires on the next push (statusline fire or Codex notification), which 401-drops the device if another laptop won the race.</td>
+  </tr>
+  <tr>
+    <td>Auto-pair-on-first-run race (two clients claiming the same free device simultaneously)</td>
+    <td>NVS is serialized — first writer wins. The loser sees <code>401</code> on its first push and silently drops the device.</td>
+  </tr>
 </table>
 
 <!-- =============================================================== -->
 <h2 id="wire-additions">4. Wire-format additions</h2>
 
 <p>
-  Two additions to <a href="./wire-format.md">wire-format.md</a>, both
+  Three additions to <a href="./wire-format.md">wire-format.md</a>, all
   backward-compatible:
 </p>
 
@@ -413,6 +500,29 @@ flowchart LR
   Together, the two guards mean a multi-laptop, multi-session deployment
   always converges to the freshest snapshot from an authorized client per
   agent.
+</p>
+
+<h4>4.3 Per-agent mDNS TXT records</h4>
+
+<p>
+  The firmware adds two TXT items to its
+  <code>_burnscope._tcp.local.</code> service advertisement:
+</p>
+
+<table>
+  <tr><th>TXT key</th><th>Value</th><th>Semantics</th></tr>
+  <tr><td class="mono">paired_claude</td><td><code>0</code> or <code>1</code></td><td><code>1</code> iff the <code>claude</code> NVS pairing slot holds a non-empty identifier.</td></tr>
+  <tr><td class="mono">paired_codex</td><td><code>0</code> or <code>1</code></td><td><code>1</code> iff the <code>codex</code> NVS pairing slot holds a non-empty identifier.</td></tr>
+</table>
+
+<p>
+  The firmware updates the relevant <code>paired_&lt;agent&gt;</code>
+  item via <code>mdns_service_txt_item_set</code> whenever the slot
+  transitions (TOFU claim flips <code>0 → 1</code>; factory-reset flips
+  back to <code>0</code>). HTTP-level auth is unchanged — the TXT
+  record is an advisory hint for client-side filtering, and the
+  <code>204</code> / <code>401</code> HTTP response remains the
+  authoritative answer.
 </p>
 
 <!-- =============================================================== -->
@@ -473,47 +583,71 @@ flowchart LR
 </div>
 
 <p>
-  Manages the three files in the user's state directory. The state
-  directory is <code>~/.burnscope/</code> on both macOS and Linux
-  (no XDG branching — explicit and predictable across platforms; tools
-  like <code>ssh</code>, <code>aws</code>, and <code>gh</code> use the
-  same dot-directory pattern). Atomic writes via
-  <code>tempfile.NamedTemporaryFile</code> + <code>os.replace</code> so
-  concurrent statusline fires from multiple Claude sessions can't corrupt
-  any file. Directory is created lazily on first write with mode
-  <code>0700</code>.
+  Manages the files in the user's state directory. The state directory is
+  <code>~/.burnscope/</code> on both macOS and Linux (no XDG branching —
+  explicit and predictable across platforms; tools like <code>ssh</code>,
+  <code>aws</code>, and <code>gh</code> use the same dot-directory pattern).
+  Atomic writes via <code>tempfile.NamedTemporaryFile</code> +
+  <code>os.replace</code> so concurrent statusline fires from multiple
+  Claude sessions can't corrupt any file. Directory is created lazily on
+  first write with mode <code>0700</code>.
 </p>
 
 <table>
   <tr><th>File</th><th>Owner</th><th>Reader(s)</th><th>Purpose</th></tr>
-  <tr><td class="mono">host</td><td>both collectors</td><td>both collectors</td><td>Cached ESP32 host (string). Written after a successful mDNS resolve, deleted on transport failure.</td></tr>
-  <tr><td class="mono">last-push.claude</td><td><code>claude_statusline.py --push</code> child</td><td><code>claude_statusline.py</code> on the next fire, and <code>cli.py status</code></td><td>Outcome of the most recent Claude push (<code>ok</code> / <code>fail</code> with a timestamp). Drives the <code>✓</code> / <code>✗</code> indicator in the next-fire statusline output.</td></tr>
-  <tr><td class="mono">last-push.codex</td><td><code>codex_daemon.py</code> pusher coroutine</td><td><code>cli.py status</code></td><td>Same shape as Claude's, but consumed only by external observers — the daemon already remembers its own state in memory.</td></tr>
+  <tr><td class="mono">paired-devices.claude.json</td><td>Claude collector (statusline <code>--push</code> child)</td><td>Claude collector, <code>cli.py</code> (status, pair, pair-reset)</td><td>List of <code>{device_id, host}</code> entries representing displays whose <code>claude</code> NVS slot is bound to this laptop's identifier.</td></tr>
+  <tr><td class="mono">paired-devices.codex.json</td><td>Codex daemon pusher coroutine</td><td>Codex daemon, <code>cli.py</code></td><td>Same shape as Claude's list, for the <code>codex</code> slot.</td></tr>
+  <tr><td class="mono">last-push.claude</td><td>Claude collector</td><td>Claude collector (next fire indicator), <code>cli.py status</code></td><td>Aggregated outcome of the most recent fan-out push (<code>{"ok": bool, "at": unix_seconds}</code>). <code>ok</code> is true iff every paired device responded <code>204</code>. Drives the <code>✓</code> / <code>✗</code> indicator on the next statusline fire.</td></tr>
+  <tr><td class="mono">last-push.codex</td><td>Codex daemon</td><td><code>cli.py status</code></td><td>Same shape as Claude's aggregate.</td></tr>
+  <tr><td class="mono">last-push.{agent}.{device_id}</td><td>collectors</td><td><code>cli.py status</code></td><td>Per-device push outcome, written alongside the aggregate. Lets <code>burnscope status</code> show which specific display is failing without polluting the next-fire indicator.</td></tr>
 </table>
 
 <table>
   <tr><th>Symbol</th><th>Signature</th><th>Description</th></tr>
-  <tr><td class="mono">load_host</td><td><code>() → str | None</code></td><td>Returns cached host, or <code>None</code> if absent / malformed.</td></tr>
-  <tr><td class="mono">store_host</td><td><code>(host: str) → None</code></td><td>Atomic write.</td></tr>
-  <tr><td class="mono">invalidate_host</td><td><code>() → None</code></td><td>Removes the cache file. Called on push transport failure to force rediscovery next attempt.</td></tr>
-  <tr><td class="mono">write_push_state</td><td><code>(agent: str, ok: bool) → None</code></td><td>Writes <code>last-push.&lt;agent&gt;</code> atomically with <code>{"ok": bool, "at": unix_seconds}</code>.</td></tr>
-  <tr><td class="mono">read_push_state</td><td><code>(agent: str) → dict | None</code></td><td>Returns the parsed state, or <code>None</code> if absent / malformed.</td></tr>
+  <tr><td class="mono">PairedDevice</td><td><em>(dataclass)</em></td><td><code>device_id: str, host: str</code>. <code>device_id</code> is derived from the mDNS hostname (e.g. <code>burnscope-a1b2</code>), which the firmware seeds from the WiFi MAC — stable across IP changes and per-unit unique. The mDNS instance name (human-facing "BurnScope" label) is only used as a fallback when the SRV record is missing.</td></tr>
+  <tr><td class="mono">load_paired_devices</td><td><code>(agent: str) → list[PairedDevice]</code></td><td>Reads <code>paired-devices.&lt;agent&gt;.json</code>; returns <code>[]</code> if absent or malformed.</td></tr>
+  <tr><td class="mono">save_paired_devices</td><td><code>(agent: str, devices: list[PairedDevice]) → None</code></td><td>Atomic write.</td></tr>
+  <tr><td class="mono">add_paired_device</td><td><code>(agent: str, device: PairedDevice) → None</code></td><td>Read-modify-write; deduplicates by <code>device_id</code>. Updates the stored <code>host</code> if the same <code>device_id</code> moves to a new IP.</td></tr>
+  <tr><td class="mono">remove_paired_device</td><td><code>(agent: str, device_id: str) → None</code></td><td>No-op if the device is not in the list.</td></tr>
+  <tr><td class="mono">write_push_state</td><td><code>(agent: str, ok: bool, device_id: str | None = None) → None</code></td><td>Writes the aggregate <code>last-push.&lt;agent&gt;</code>, or the per-device <code>last-push.&lt;agent&gt;.&lt;device_id&gt;</code> when <code>device_id</code> is given.</td></tr>
+  <tr><td class="mono">read_push_state</td><td><code>(agent: str, device_id: str | None = None) → dict | None</code></td><td>Returns the parsed state, or <code>None</code> if absent / malformed.</td></tr>
+  <tr><td class="mono">migrate_legacy_host_file</td><td><code>() → None</code></td><td>One-shot: if the v1 <code>host</code> file exists, delete it. No state migration — the auto-pair-on-first-run path will re-claim devices via the existing per-agent TOFU bindings (firmware returns <code>204</code> immediately since the slot is already bound to this identifier).</td></tr>
 </table>
 
-<div class="module-header">
-  <h3 id="discovery"><code>discovery.py</code></h3>
-  <span class="path">preserved from v1; minor signature change</span>
-</div>
-
 <p>
-  mDNS browse for <code>_burnscope._tcp.local.</code>. v1's single async
-  call signature remains; both v2 collectors call it through
-  <code>host_cache.py</code>'s "load → discover → store" idiom.
+  The legacy v1 functions (<code>load_host</code> / <code>store_host</code>
+  / <code>invalidate_host</code>) are removed. Callers operate on the
+  per-agent device lists instead.
 </p>
 
 <div class="module-header">
+  <h3 id="discovery"><code>discovery.py</code></h3>
+  <span class="path">extended for multi-device, per-agent filtering</span>
+</div>
+
+<p>
+  mDNS browse for <code>_burnscope._tcp.local.</code>. Returns every
+  resolved instance (not just the first), parsing the TXT record for
+  per-agent claim hints.
+</p>
+
+<table>
+  <tr><th>Symbol</th><th>Signature</th><th>Description</th></tr>
+  <tr>
+    <td class="mono">DiscoveredDevice</td>
+    <td><em>(dataclass)</em></td>
+    <td><code>device_id: str, host: str, paired_claude: bool, paired_codex: bool</code>. Booleans default to <code>True</code> when the TXT record is missing (legacy firmware → treat as "leave alone").</td>
+  </tr>
+  <tr>
+    <td class="mono">discover_all</td>
+    <td><code>(timeout: float = 10.0, agent: str | None = None) → list[DiscoveredDevice]</code></td>
+    <td>Browses for the full <code>timeout</code> (no early-exit). When <code>agent</code> is passed, the result is filtered to devices where <code>paired_&lt;agent&gt; is False</code>. With <code>agent=None</code> the caller gets every device on the LAN with both flags exposed.</td>
+  </tr>
+</table>
+
+<div class="module-header">
   <h3 id="pusher"><code>pusher.py</code></h3>
-  <span class="path">preserved from v1; extended with client-id header</span>
+  <span class="path">extended with fan-out push</span>
 </div>
 
 <table>
@@ -523,21 +657,32 @@ flowchart LR
     <td><code>(snapshot: AgentSnapshot, host: str, client_id: str, client: httpx.AsyncClient) → None</code></td>
   </tr>
   <tr>
+    <td class="mono">push_to_all</td>
+    <td><code>(snapshot: AgentSnapshot, devices: list[PairedDevice], client_id: str, client: httpx.AsyncClient) → dict[str, PushResult]</code></td>
+  </tr>
+  <tr>
     <td class="mono">fetch_health</td>
     <td><code>(host: str, client_id: str, client: httpx.AsyncClient) → dict | None</code></td>
   </tr>
   <tr>
-    <td class="mono">PushError</td>
-    <td><em>(exception)</em> — raised on transport failure, non-2xx, or 401.</td>
+    <td class="mono">PushResult</td>
+    <td><em>(dataclass)</em> — <code>device_id: str, ok: bool, kind: Literal["ok","auth","transport"]</code>. Returned by <code>push_to_all</code>, one per device.</td>
+  </tr>
+  <tr>
+    <td class="mono">PushError, PushAuthError</td>
+    <td><em>(exceptions)</em> — raised by the single-host <code>push()</code>. <code>PushAuthError</code> covers 401; <code>PushError</code> covers transport / other non-2xx.</td>
   </tr>
 </table>
 
 <p>
-  Both functions add <code>X-BurnScope-Client-Id: &lt;hash&gt;</code> to the
-  outgoing request. <code>401</code> responses raise <code>PushError</code>
-  with a recognizable subclass so callers can decide whether to invalidate
-  the host cache (transport failure) or surface a "not paired" error
-  (auth failure — host is right, identity is wrong).
+  All requests carry the plaintext <code>X-BurnScope-Client-Id</code> header.
+  <code>push_to_all</code> dispatches per-device pushes in parallel via
+  <code>asyncio.gather(return_exceptions=True)</code>, catches the two
+  exception classes internally, and returns one <code>PushResult</code>
+  per device. The caller (per-agent collector) inspects the dict and
+  decides per device: <code>kind="auth"</code> → drop from paired list;
+  <code>kind="transport"</code> → keep, mark per-device failure;
+  <code>kind="ok"</code> → record success.
 </p>
 
 <div class="module-header">
@@ -640,14 +785,32 @@ flowchart LR
   </tr>
   <tr>
     <td class="mono">burnscope status</td>
-    <td>Prints: cached ESP32 host, last push state per agent (from the
-        state files), whether the Codex launchd job is loaded, whether
-        the Claude statusline hook is configured. Useful for debugging.</td>
+    <td>Prints: per-agent paired devices with their last-push outcome
+        (from <code>last-push.&lt;agent&gt;.&lt;device_id&gt;</code>),
+        whether the Codex launchd job is loaded, whether the Claude
+        statusline hook is configured. Useful for debugging.</td>
+  </tr>
+  <tr>
+    <td class="mono">burnscope pair [--agent {claude,codex}]</td>
+    <td>Explicit re-discovery. For each agent whose
+        <code>client_id</code> is known (cached in
+        <code>~/.burnscope/client-id.&lt;agent&gt;</code>), runs
+        <code>discover_all(agent=…)</code> and merges every visible
+        <code>paired_&lt;agent&gt;=0</code> device into the agent's
+        paired list via <code>add_paired_device</code>. The TOFU claim
+        itself happens on the next push (statusline fire or Codex
+        notification), which silently drops the device on
+        <code>401</code> if another laptop won the race. With
+        <code>--agent</code> the operation is restricted to that agent.
+        Useful when a new display was added after first-run, or after
+        moving devices between LANs.</td>
   </tr>
   <tr>
     <td class="mono">burnscope pair-reset</td>
-    <td>Removes the host cache so the next push rediscovers. Does not
-        touch the ESP32 NVS — that's a firmware-side reset.</td>
+    <td>Wipes both per-agent paired-device lists and the cached
+        client_id files. Next push (or <code>burnscope pair</code>)
+        re-discovers and re-claims. Does not touch ESP32 NVS — that's
+        a firmware-side reset.</td>
   </tr>
 </table>
 
@@ -675,22 +838,36 @@ flowchart LR
   <li><strong>Spawn detached child</strong>:
       <code>Popen([sys.executable, __file__, "--push"], stdin=PIPE, start_new_session=True)</code>.
       Write the snapshot JSON to its stdin, close stdin, exit.</li>
-  <li><strong>(Child) Resolve host</strong> via
-      <code>host_cache.load()</code>; on cache miss run mDNS,
-      <code>host_cache.store()</code> the result.</li>
   <li><strong>(Child) Resolve client_id</strong> from
       <code>host_cache.read_client_id("claude")</code>; on cache miss, call
       <code>identity.claude_user_identifier()</code> (reads
       <code>~/.claude.json</code>) and persist via
-      <code>host_cache.write_client_id("claude", id)</code>. The value
-      goes plaintext into the <code>X-BurnScope-Client-Id</code> header.</li>
-  <li><strong>(Child) POST /summary</strong> with the header. On
-      success: <code>write_push_state("claude", ok=True)</code>. On
-      transport failure: <code>invalidate_host()</code> then
-      <code>write_push_state("claude", ok=False)</code>. On
-      <code>401</code>: <code>write_push_state("claude", ok=False)</code>
-      but do <em>not</em> invalidate the host cache (the device is
-      reachable; identity is the issue).</li>
+      <code>host_cache.write_client_id("claude", id)</code>.</li>
+  <li><strong>(Child) Resolve paired devices</strong>:
+      <code>devices = load_paired_devices("claude")</code>. If the list is
+      empty (first-run or post-<code>pair-reset</code>), run
+      <code>discover_all(agent="claude")</code>, attempt to claim each
+      discovered device by POSTing the snapshot with our client_id, and
+      <code>add_paired_device("claude", device)</code> on every
+      <code>204</code>. <code>401</code> and transport failures are
+      silently skipped during this auto-pair phase (next fire retries).</li>
+  <li><strong>(Child) Fan-out push</strong> via
+      <code>push_to_all(snapshot, devices, client_id, client)</code>.
+      For each <code>PushResult</code>:
+      <ul>
+        <li><code>kind="ok"</code> → <code>write_push_state("claude", ok=True, device_id=…)</code>.</li>
+        <li><code>kind="auth"</code> → silently drop via
+            <code>remove_paired_device("claude", device_id)</code>;
+            no aggregate state change attributable to this device.</li>
+        <li><code>kind="transport"</code> → keep in list;
+            <code>write_push_state("claude", ok=False, device_id=…)</code>.</li>
+      </ul>
+  </li>
+  <li><strong>(Child) Aggregate indicator</strong>:
+      <code>write_push_state("claude", ok=all_devices_ok)</code>. The
+      aggregate drives the next statusline fire's indicator. If the
+      paired list is empty after step 7 (no devices on the LAN), the
+      aggregate is <code>ok=False</code> with no per-device entries.</li>
 </ol>
 
 <p>
@@ -737,25 +914,34 @@ flowchart LR
 
 <ol>
   <li>Await a snapshot from the queue.</li>
-  <li><code>host = load_host()</code>; on miss, discover and
-      <code>store_host()</code>.</li>
-  <li><code>POST /summary</code> with the cached client_id header.</li>
-  <li>On success: <code>write_push_state("codex", ok=True)</code>.</li>
-  <li>On transport failure: <code>invalidate_host()</code>,
-      <code>write_push_state("codex", ok=False)</code>.</li>
-  <li>On <code>401</code>:
-      <code>write_push_state("codex", ok=False)</code>; do not
-      invalidate the host cache.</li>
+  <li><code>devices = load_paired_devices("codex")</code>. If empty, run
+      <code>discover_all(agent="codex")</code>, attempt to claim each
+      via <code>POST /summary</code> with the cached client_id, and
+      <code>add_paired_device("codex", device)</code> on every
+      <code>204</code>. Silent skip on <code>401</code> / transport.</li>
+  <li><code>results = await push_to_all(snapshot, devices, client_id, client)</code>.</li>
+  <li>Per device: <code>kind="ok"</code> →
+      <code>write_push_state("codex", ok=True, device_id=…)</code>;
+      <code>kind="auth"</code> → silently
+      <code>remove_paired_device("codex", device_id)</code>;
+      <code>kind="transport"</code> → keep, record per-device failure.</li>
+  <li>Aggregate: <code>write_push_state("codex", ok=all_devices_ok)</code>.</li>
 </ol>
 
 <h4>Health coroutine (every 30 s)</h4>
 
 <ol>
-  <li><code>GET /health</code> with the client_id header.</li>
-  <li>On transport failure: <code>invalidate_host()</code>.</li>
+  <li>For each device in <code>load_paired_devices("codex")</code>:
+      <code>GET /health</code> with the client_id header.</li>
+  <li>On transport failure: record per-device failure; do not remove
+      from list (user opts in via <code>burnscope pair-reset</code>).</li>
+  <li>On <code>401</code>: silently
+      <code>remove_paired_device("codex", device_id)</code>.</li>
   <li>On success: compare body's per-agent <code>sessions</code> against
-      the last pushed snapshot. On divergence (firmware lost state),
-      enqueue the latest snapshot for re-push.</li>
+      the last pushed snapshot. On divergence for any device (firmware
+      lost state), enqueue the latest snapshot to re-push to <em>all</em>
+      paired devices (<code>push_to_all</code> is idempotent on
+      already-fresh devices).</li>
 </ol>
 
 <h4>Subprocess failure</h4>
@@ -806,19 +992,27 @@ burnscope status           # confirm wiring</code></pre>
   </tr>
   <tr>
     <td class="mono">host_cache.py</td>
-    <td>Atomic write under concurrent <code>store_host()</code> calls. <code>load_host()</code> returns <code>None</code> for missing/empty/garbage files. <code>invalidate_host()</code> is idempotent. <code>write_push_state</code> / <code>read_push_state</code> round-trip per agent without cross-contamination. <code>read_client_id</code> rejects empty, overlong (&gt; 254 chars), and control-character payloads but accepts arbitrary printable ASCII (email or userID).</td>
+    <td>Atomic write under concurrent <code>save_paired_devices()</code> calls. <code>load_paired_devices(agent)</code> returns <code>[]</code> for missing/empty/garbage files. <code>add_paired_device</code> deduplicates by <code>device_id</code> and updates the stored host when the IP changes. <code>remove_paired_device</code> is idempotent. Per-agent state files do not cross-contaminate. <code>migrate_legacy_host_file()</code> removes the v1 <code>host</code> file when present and is a no-op otherwise.</td>
+  </tr>
+  <tr>
+    <td class="mono">discovery.py</td>
+    <td>Browses for the full timeout, returns every resolved device. TXT-record parsing honors <code>paired_claude</code> / <code>paired_codex</code> and defaults to <code>True</code> when missing. <code>discover_all(agent="claude")</code> filters out devices with <code>paired_claude=1</code>. Tests mock zeroconf <code>ServiceStateChange</code> events with varied TXT payloads.</td>
   </tr>
   <tr>
     <td class="mono">pusher.py</td>
-    <td>Header is on every request and carries the plaintext identifier verbatim. <code>401</code> raises a distinct subclass. Transport errors raise the generic <code>PushError</code>.</td>
+    <td>Header is on every request and carries the plaintext identifier verbatim. <code>401</code> raises <code>PushAuthError</code>; transport errors raise <code>PushError</code>. <code>push_to_all</code> runs per-device pushes in parallel, catches both exception classes, and returns one <code>PushResult</code> per device including the correct <code>kind</code>. Empty device list returns empty dict.</td>
   </tr>
   <tr>
     <td class="mono">claude_statusline.py</td>
-    <td>End-to-end with mocked stdin: statusline output format, push child spawned with correct args, indicator file read for previous state. <code>rate_limits</code>-absent path doesn't push. <code>--push</code> mode hits the client_id cache and only re-reads <code>~/.claude.json</code> on miss.</td>
+    <td>End-to-end with mocked stdin: statusline output format, push child spawned with correct args, indicator file read for previous state. <code>rate_limits</code>-absent path doesn't push. <code>--push</code> mode: empty paired-list triggers auto-pair (discovery + per-device claim); cached non-empty list skips discovery; fan-out push records per-device outcomes; <code>401</code> from one device removes only that device from the agent's list; <code>kind="transport"</code> preserves the device but writes <code>ok:false</code> per-device.</td>
   </tr>
   <tr>
     <td class="mono">codex_daemon.py</td>
-    <td>Integration with mocked app-server subprocess: bootstrap sequence; account.email becomes the wire-level client_id verbatim; rateLimits/updated → push; subprocess EOF triggers restart with backoff; health divergence triggers re-push.</td>
+    <td>Integration with mocked app-server subprocess: bootstrap sequence; account.email becomes the wire-level client_id verbatim; rateLimits/updated → push; subprocess EOF triggers restart with backoff; multi-device fan-out push semantics match the Claude collector; health divergence on any one device triggers re-push to all.</td>
+  </tr>
+  <tr>
+    <td class="mono">cli.py</td>
+    <td><code>burnscope pair</code> with no flag attempts both agents (skipping agents whose <code>client-id.&lt;agent&gt;</code> is missing); <code>--agent</code> restricts to one. <code>burnscope status</code> reads per-agent device lists and per-device last-push files. <code>burnscope pair-reset</code> wipes both paired-device files and both client-id caches.</td>
   </tr>
   <tr>
     <td>firmware: client_id auth</td>
@@ -845,19 +1039,38 @@ burnscope status           # confirm wiring</code></pre>
   <li>Run <code>burnscope install claude</code> and
       <code>burnscope install codex</code>.</li>
   <li>(Firmware) Flash the v2 firmware build, which includes the
-      client-id auth and the monotonic guard. NVS will be empty on first
-      boot, allowing TOFU pairing.</li>
+      client-id auth, the monotonic guard, and the per-agent mDNS TXT
+      records. NVS will be empty on first boot, allowing TOFU pairing.</li>
   <li>Start a Claude Code session; the statusline fires and pairs the
       Claude slot. The Codex daemon (already loaded by launchd) pairs the
       Codex slot at its first push.</li>
 </ol>
+
+<h4>v2 → v2+multi-device upgrade</h4>
+
+<p>
+  An existing v2 client deployment had a single-host
+  <code>~/.burnscope/host</code> file. On the first read after upgrade,
+  <code>migrate_legacy_host_file()</code> deletes the file. No state
+  conversion is performed. Each collector's first fire afterward hits
+  the empty paired-list branch, runs discovery, and re-claims devices
+  via the existing per-agent TOFU bindings — the firmware returns
+  <code>204</code> immediately because the agent slot is already bound
+  to this laptop's identifier, and the device lands in the per-agent
+  paired list. Zero-shim migration.
+</p>
 
 <p>
   No data is migrated. The wire format is backward-compatible at the
   payload level, so an old v1 firmware would still accept v2 client
   pushes (it just ignores the new header and the monotonic logic isn't
   enforced). A new v2 firmware will, however, reject v1 client pushes
-  once paired — by design.
+  once paired — by design. Firmware older than the per-agent TXT update
+  is treated by the v2 client as "leave alone" (both
+  <code>paired_&lt;agent&gt;</code> default to <code>True</code> when
+  the TXT records are absent), so legacy devices are not auto-claimed —
+  the user must <code>burnscope pair-reset</code> the firmware (factory
+  reset) to bring it into the multi-device pool.
 </p>
 
 <hr>

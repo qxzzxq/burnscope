@@ -50,6 +50,7 @@
 ## Before You Code
 - Confirm the requirements and acceptance criteria are clear. Ask for clarification when uncertain rather than guessing.
 - For non-trivial work, sketch the approach (data model, interfaces, edge cases) before writing code.
+- Before reinventing the wheel, search for existing demo code from the vendor or community first.
 
 ## Safety
 - Never commit secrets, credentials, or `.env` files.

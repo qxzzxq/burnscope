@@ -24,6 +24,7 @@
 #include "esp_timer.h"
 #include "nvs.h"
 
+#include "mdns_svc.h"
 #include "nvs_store.h"
 #include "snapshot.h"
 #include "version.h"
@@ -217,6 +218,9 @@ static bool authorize_summary(httpd_req_t *req, const char *agent)
             httpd_resp_send_500(req);
             return false;
         }
+        /* Flip paired_<agent>=1 in the mDNS TXT so other clients on the
+         * LAN stop offering this slot for pairing. */
+        mdns_svc_refresh_paired(agent);
         /* Don't log the bound identifier (typically an email) at info
          * level — keep PII out of the serial log. Length is enough to
          * confirm a non-empty bind for diagnostics. */

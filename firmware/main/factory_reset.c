@@ -13,6 +13,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "mdns_svc.h"
 #include "nvs_store.h"
 
 static const char *TAG = "factory";
@@ -51,9 +52,18 @@ static void task(void *arg)
                      * after reboot — the user would just see the same
                      * screen and try again. Reset the hold counter and
                      * leave the device running so they can re-attempt
-                     * (or read the serial log for the underlying error). */
+                     * (or read the serial log for the underlying error).
+                     * If the pairing slots *were* wiped we still need to
+                     * reflect that in the mDNS TXT so other LAN clients
+                     * see the device as free; the alternative (stale
+                     * paired_*=1) would silently lock the device out of
+                     * future discovery. */
                     ESP_LOGE(TAG, "factory reset aborted: erase_creds failed: %s",
                              esp_err_to_name(cred_err));
+                    if (pair_err == ESP_OK) {
+                        mdns_svc_refresh_paired("claude");
+                        mdns_svc_refresh_paired("codex");
+                    }
                     held = 0;
                     continue;
                 }

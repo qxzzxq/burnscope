@@ -99,10 +99,12 @@ async def push_to_all(
 ) -> dict[str, PushResult]:
     """Fan out `snapshot` to every device in `devices`, in parallel.
 
-    Returns one `PushResult` per device, keyed by `device_id`. Exceptions
-    from `push()` are translated into `kind="auth"` (PushAuthError) or
-    `kind="transport"` (PushError / unexpected) so the caller never has
-    to catch — it just inspects the result dict.
+    Returns one `PushResult` per device, keyed by `device_id`. The two
+    exception types `push()` raises are translated:
+      - `PushAuthError` → `kind="auth"`
+      - `PushError`     → `kind="transport"`
+    Any other exception (programmer error, `asyncio.CancelledError`)
+    propagates and aborts the whole fan-out, by design.
 
     Empty `devices` returns an empty dict.
     """

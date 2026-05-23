@@ -604,7 +604,7 @@ flowchart LR
 
 <table>
   <tr><th>Symbol</th><th>Signature</th><th>Description</th></tr>
-  <tr><td class="mono">PairedDevice</td><td><em>(dataclass)</em></td><td><code>device_id: str, host: str</code>. <code>device_id</code> is the mDNS instance name (e.g. <code>burnscope-A1B2</code>), stable across IP changes.</td></tr>
+  <tr><td class="mono">PairedDevice</td><td><em>(dataclass)</em></td><td><code>device_id: str, host: str</code>. <code>device_id</code> is derived from the mDNS hostname (e.g. <code>burnscope-a1b2</code>), which the firmware seeds from the WiFi MAC — stable across IP changes and per-unit unique. The mDNS instance name (human-facing "BurnScope" label) is only used as a fallback when the SRV record is missing.</td></tr>
   <tr><td class="mono">load_paired_devices</td><td><code>(agent: str) → list[PairedDevice]</code></td><td>Reads <code>paired-devices.&lt;agent&gt;.json</code>; returns <code>[]</code> if absent or malformed.</td></tr>
   <tr><td class="mono">save_paired_devices</td><td><code>(agent: str, devices: list[PairedDevice]) → None</code></td><td>Atomic write.</td></tr>
   <tr><td class="mono">add_paired_device</td><td><code>(agent: str, device: PairedDevice) → None</code></td><td>Read-modify-write; deduplicates by <code>device_id</code>. Updates the stored <code>host</code> if the same <code>device_id</code> moves to a new IP.</td></tr>

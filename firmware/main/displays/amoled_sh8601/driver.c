@@ -56,8 +56,8 @@ static uint8_t resolve_lcd_id(void)
 
     const uint8_t id = amoled_sh8601_read_lcd_id();
     if (nvs_open(NVS_NS_AMOLED, NVS_READWRITE, &h) == ESP_OK) {
-        if (nvs_set_u8(h, NVS_KEY_LCD_ID, id) == ESP_OK) {
-            nvs_commit(h);
+        if (nvs_set_u8(h, NVS_KEY_LCD_ID, id) == ESP_OK
+            && nvs_commit(h) == ESP_OK) {
             ESP_LOGI(TAG, "Cached LCD ID 0x%02x to NVS", id);
         }
         nvs_close(h);
@@ -172,8 +172,9 @@ lv_display_t *amoled_sh8601_driver_init(void)
     ESP_ERROR_CHECK(esp_lcd_panel_set_gap(panel_handle, is_sh8601 ? 0 : 6, 0));
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
 
-    /* LVGL port — 80-row stripe buffers, DMA-friendly, RGB565 with the
-     * byte swap LVGL's RGB565 format needs for big-endian-on-wire SPI. */
+    /* LVGL port — 40-row stripe buffers (see disp_cfg below), DMA-
+     * friendly, RGB565 with the byte swap LVGL's RGB565 format needs
+     * for big-endian-on-wire SPI. */
     const lvgl_port_cfg_t lvgl_cfg = ESP_LVGL_PORT_INIT_CONFIG();
     ESP_ERROR_CHECK(lvgl_port_init(&lvgl_cfg));
 

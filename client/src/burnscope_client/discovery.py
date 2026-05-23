@@ -34,9 +34,12 @@ _LEGACY_PAIRED_DEFAULT = True
 class DiscoveredDevice:
     """One BurnScope display visible on the LAN.
 
-    `device_id` is the mDNS instance name with the service-type suffix
-    stripped (e.g. `burnscope-a1b2`). It is stable across IP changes and
-    safe to use as a dictionary key on the client side.
+    `device_id` is derived from the mDNS hostname (`info.server`,
+    e.g. `burnscope-a1b2`). Because the firmware seeds the hostname
+    from the WiFi MAC, the id is stable across IP changes and per-unit
+    unique, so it is safe to use as a dictionary key on the client
+    side. The mDNS *instance name* (the human-facing "BurnScope" label)
+    is only used as a fallback when the SRV record is missing.
     """
 
     device_id: str
@@ -66,7 +69,6 @@ async def discover_all(
     own_zc = zc is None
     zc = zc or AsyncZeroconf()
     devices: dict[str, DiscoveredDevice] = {}
-    resolved_event = asyncio.Event()
     resolve_tasks: set[asyncio.Task] = set()
 
     log.debug("mDNS browse start: %s (timeout=%.1fs)", SERVICE_TYPE, timeout)
@@ -74,9 +76,7 @@ async def discover_all(
     def _on_change(zeroconf, service_type, name, state_change):
         if state_change is not ServiceStateChange.Added:
             return
-        task = asyncio.create_task(
-            _resolve(zc, service_type, name, devices, resolved_event)
-        )
+        task = asyncio.create_task(_resolve(zc, service_type, name, devices))
         resolve_tasks.add(task)
         task.add_done_callback(resolve_tasks.discard)
 
@@ -102,7 +102,6 @@ async def _resolve(
     service_type: str,
     name: str,
     sink: dict[str, DiscoveredDevice],
-    resolved_event: asyncio.Event,
 ) -> None:
     info = AsyncServiceInfo(service_type, name)
     if not await info.async_request(zc.zeroconf, 3000):
@@ -134,7 +133,6 @@ async def _resolve(
         paired_codex=paired_codex,
     )
     sink[device_id] = device
-    resolved_event.set()
 
 
 def _device_id_from(info: AsyncServiceInfo, name: str, service_type: str) -> str:

@@ -440,7 +440,7 @@ flowchart LR
   </tr>
   <tr>
     <td>New device appears on the LAN after first-run</td>
-    <td>Run <code>burnscope pair</code>; the collector re-discovers and claims any newly-visible <code>paired_&lt;agent&gt;=0</code> device.</td>
+    <td>Run <code>burnscope pair</code>; the collector re-discovers any newly-visible <code>paired_&lt;agent&gt;=0</code> device and adds it to the agent's paired list. The TOFU claim itself fires on the next push (statusline fire or Codex notification), which 401-drops the device if another laptop won the race.</td>
   </tr>
   <tr>
     <td>Auto-pair-on-first-run race (two clients claiming the same free device simultaneously)</td>
@@ -792,12 +792,15 @@ flowchart LR
   </tr>
   <tr>
     <td class="mono">burnscope pair [--agent {claude,codex}]</td>
-    <td>Explicit re-discovery and claim. For each agent whose
+    <td>Explicit re-discovery. For each agent whose
         <code>client_id</code> is known (cached in
         <code>~/.burnscope/client-id.&lt;agent&gt;</code>), runs
-        <code>discover_all(agent=…)</code>, attempts to claim every
-        device whose <code>paired_&lt;agent&gt;=0</code>, and persists
-        successes via <code>add_paired_device</code>. With
+        <code>discover_all(agent=…)</code> and merges every visible
+        <code>paired_&lt;agent&gt;=0</code> device into the agent's
+        paired list via <code>add_paired_device</code>. The TOFU claim
+        itself happens on the next push (statusline fire or Codex
+        notification), which silently drops the device on
+        <code>401</code> if another laptop won the race. With
         <code>--agent</code> the operation is restricted to that agent.
         Useful when a new display was added after first-run, or after
         moving devices between LANs.</td>

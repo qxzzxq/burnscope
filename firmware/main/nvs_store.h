@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "esp_err.h"
 
@@ -71,3 +72,19 @@ esp_err_t nvs_store_save_client_id(const char *agent, const char *id);
  * claimed by a fresh owner.
  */
 esp_err_t nvs_store_erase_client_ids(void);
+
+/**
+ * Load the cached LCD silicon ID (RDID1 byte) into `*out`. Returns
+ * `ESP_ERR_NVS_NOT_FOUND` when the slot is empty (first boot — the
+ * caller bit-bangs the ID and persists it via `nvs_store_save_lcd_id`).
+ * This is a non-credential cache, but routing it through `nvs_store`
+ * keeps every persisted byte under one auditable wrapper.
+ */
+esp_err_t nvs_store_load_lcd_id(uint8_t *out);
+
+/**
+ * Persist the LCD silicon ID. Skip-write-when-equal, same defence as
+ * `nvs_store_save_creds`, so a hardware that re-reads RDID1 on every
+ * boot does not wear the NVS partition.
+ */
+esp_err_t nvs_store_save_lcd_id(uint8_t id);

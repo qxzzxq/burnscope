@@ -22,7 +22,7 @@
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_sh8601.h"
 #include "esp_lvgl_port.h"
-#include "nvs.h"
+#include "nvs_store.h"
 #include "read_lcd_id.h"
 
 /* RDID1 (0xDA) values observed on the Waveshare 1.43" dual-sourced
@@ -30,38 +30,20 @@
  * under the pull-up. */
 #define SH8601_RDID1  0x86
 
-/* NVS slot for the cached LCD ID. Profile-private namespace — kept out
- * of nvs_store.h on purpose (that API is the audited typed-accessor
- * surface for credentials / pairing). One byte, written once on first
- * boot, read on every subsequent boot to skip the ~360 ms bit-bang. */
-#define NVS_NS_AMOLED   "amoled"
-#define NVS_KEY_LCD_ID  "lcd_id"
-
 static const char *TAG = "amoled_drv";
 
 /* Probe RDID1, prefer NVS cache. Falls back to a fresh bit-bang on
- * cache miss and persists the result for next boot. */
+ * cache miss and persists the result via the typed nvs_store wrapper
+ * (every persisted byte routes through nvs_store for auditability). */
 static uint8_t resolve_lcd_id(void)
 {
-    nvs_handle_t h;
-    if (nvs_open(NVS_NS_AMOLED, NVS_READONLY, &h) == ESP_OK) {
-        uint8_t cached = 0;
-        const esp_err_t err = nvs_get_u8(h, NVS_KEY_LCD_ID, &cached);
-        nvs_close(h);
-        if (err == ESP_OK) {
-            ESP_LOGI(TAG, "LCD ID from NVS cache: 0x%02x", cached);
-            return cached;
-        }
+    uint8_t cached = 0;
+    if (nvs_store_load_lcd_id(&cached) == ESP_OK) {
+        ESP_LOGI(TAG, "LCD ID from NVS cache: 0x%02x", cached);
+        return cached;
     }
-
     const uint8_t id = amoled_sh8601_read_lcd_id();
-    if (nvs_open(NVS_NS_AMOLED, NVS_READWRITE, &h) == ESP_OK) {
-        if (nvs_set_u8(h, NVS_KEY_LCD_ID, id) == ESP_OK
-            && nvs_commit(h) == ESP_OK) {
-            ESP_LOGI(TAG, "Cached LCD ID 0x%02x to NVS", id);
-        }
-        nvs_close(h);
-    }
+    (void)nvs_store_save_lcd_id(id);
     return id;
 }
 

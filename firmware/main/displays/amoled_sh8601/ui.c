@@ -84,11 +84,9 @@ static lv_obj_t *s_status_label  = NULL;
 static lv_obj_t *s_agent_screen        = NULL;
 static lv_obj_t *s_core_icon           = NULL;
 static lv_obj_t *s_chip_primary        = NULL;  /* row-0 type pill   */
-static lv_obj_t *s_primary_row         = NULL;  /* % + countdown row */
 static lv_obj_t *s_core_primary        = NULL;  /* M48 percentage    */
 static lv_obj_t *s_core_primary_cd     = NULL;  /* M14 countdown     */
 static lv_obj_t *s_chip_secondary      = NULL;
-static lv_obj_t *s_secondary_row       = NULL;
 static lv_obj_t *s_core_secondary      = NULL;  /* M36 percentage    */
 static lv_obj_t *s_core_secondary_cd   = NULL;
 static lv_obj_t *s_footer_updated      = NULL;  /* "updated N ago"   */
@@ -269,12 +267,12 @@ static void build_ring(lv_obj_t *parent, int ring_idx, int outer_r, int inner_r)
                          AMOLED_ARC_START_DEG + AMOLED_ARC_SWEEP_DEG);
     lv_arc_set_value(arc, 0);
 
-    /* Track (main) — dim grey, square caps; indicator — per-agent
+    /* Track (main) — dim grey, rounded caps; indicator — per-agent
      * colour, rounded caps. Border + padding off so the arc lives
      * exactly inside its bounding box. */
     lv_obj_set_style_arc_width(arc, stroke, LV_PART_MAIN);
     lv_obj_set_style_arc_color(arc, lv_color_hex(0x2F2F2F), LV_PART_MAIN);
-    lv_obj_set_style_arc_rounded(arc, false, LV_PART_MAIN);
+    lv_obj_set_style_arc_rounded(arc, true, LV_PART_MAIN);
 
     lv_obj_set_style_arc_width(arc, stroke, LV_PART_INDICATOR);
     lv_obj_set_style_arc_rounded(arc, true, LV_PART_INDICATOR);
@@ -305,50 +303,41 @@ static lv_obj_t *build_chip(lv_obj_t *parent, int center_y)
     return chip;
 }
 
-/* Build a "{percentage} {countdown}" row container. Children are
- * bottom-aligned within the row (so the countdown baseline sits flush
- * with the percentage bottom). Returns the container; %_label and
- * cd_label are populated via out-pointers. */
-static lv_obj_t *build_pct_row(lv_obj_t *parent,
-                               const lv_font_t *pct_font,
-                               lv_obj_t **out_pct, lv_obj_t **out_cd)
+/* Create the % label and its countdown sibling as direct children of
+ * `parent`. They are positioned independently so the percentage can
+ * be centred on the disc while the countdown floats off to the right
+ * — centring the *pair* together would pull the % off-axis as the
+ * countdown width changes. */
+static void build_pct_pair(lv_obj_t *parent, const lv_font_t *pct_font,
+                           lv_obj_t **out_pct, lv_obj_t **out_cd)
 {
-    lv_obj_t *row = lv_obj_create(parent);
-    lv_obj_remove_style_all(row);
-    lv_obj_set_size(row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-    /* main_place=start, cross_place=end (bottom-align children),
-     * track_place=end. Children sit at the bottom of the row's
-     * content box. */
-    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
-                          LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
-    lv_obj_set_style_pad_column(row, AMOLED_CORE_COUNTDOWN_GAP, 0);
-    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *pct = lv_label_create(row);
+    lv_obj_t *pct = lv_label_create(parent);
     lv_label_set_text(pct, "0%");
     lv_obj_set_style_text_font(pct, pct_font, 0);
     lv_obj_set_style_text_color(pct, lv_color_hex(0xF9F2DF), 0);
 
-    lv_obj_t *cd = lv_label_create(row);
+    lv_obj_t *cd = lv_label_create(parent);
     lv_label_set_text(cd, "");
     lv_obj_set_style_text_font(cd, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(cd, lv_color_hex(0x5C5C5C), 0);
 
     *out_pct = pct;
     *out_cd  = cd;
-    return row;
 }
 
-/* Centre a container's vertical mid-point on (AMOLED_CX, center_y).
- * Call after any text change so the row stays optically centred even
- * as the percentage glyph count changes ("1%" → "100%"). */
+/* Centre an object's mid-point on (AMOLED_CX, center_y).
+ * Uses LV_ALIGN_TOP_LEFT so the (x, y) offset is absolute relative
+ * to the screen — required because any prior align (e.g. TOP_MID)
+ * would otherwise stack on top of the offset and pull the object
+ * off-centre. Call after any text change so the object stays
+ * centred as its width changes ("1%" → "100%"). */
 static void recenter_at(lv_obj_t *obj, int center_y)
 {
     lv_obj_update_layout(obj);
     int w = lv_obj_get_width(obj);
     int h = lv_obj_get_height(obj);
-    lv_obj_set_pos(obj, AMOLED_CX - w / 2, center_y - h / 2);
+    lv_obj_align(obj, LV_ALIGN_TOP_LEFT,
+                 AMOLED_CX - w / 2, center_y - h / 2);
 }
 
 static void build_agent_screen(void)
@@ -370,15 +359,15 @@ static void build_agent_screen(void)
     lv_obj_align(s_core_icon, LV_ALIGN_TOP_LEFT,
                  AMOLED_CX - 35, AMOLED_CORE_ICON_Y - 35);
 
-    /* Primary stack: chip + (% + countdown) row. */
+    /* Primary stack: chip + percentage + countdown. */
     s_chip_primary = build_chip(scr, AMOLED_CORE_CHIP_PRIMARY_Y);
-    s_primary_row  = build_pct_row(scr, &lv_font_montserrat_48,
-                                   &s_core_primary, &s_core_primary_cd);
+    build_pct_pair(scr, &lv_font_montserrat_48,
+                   &s_core_primary, &s_core_primary_cd);
 
-    /* Secondary stack: chip + (% + countdown) row. */
+    /* Secondary stack: chip + percentage + countdown. */
     s_chip_secondary = build_chip(scr, AMOLED_CORE_CHIP_SECONDARY_Y);
-    s_secondary_row  = build_pct_row(scr, &lv_font_montserrat_36,
-                                     &s_core_secondary, &s_core_secondary_cd);
+    build_pct_pair(scr, &lv_font_montserrat_36,
+                   &s_core_secondary, &s_core_secondary_cd);
 
     /* Footer band — two centred lines stacked at the bottom of the
      * disc. M14 #5C5C5C, both full-width so centring is exact. */
@@ -431,18 +420,21 @@ static void render_footer_locked(const agent_snapshot_t *snap)
     lv_label_set_text(s_footer_updated, buf);
 }
 
-/* Render one (chip, pct_row, pct_label, countdown_label) stack from a
- * session_snapshot. Hides the whole stack if `visible` is false. */
+/* Render one (chip, %-label, countdown-label) stack from a
+ * session_snapshot. The chip and percentage are centred on the disc
+ * axis; the countdown floats to the right of the percentage and its
+ * baseline is aligned with the percentage's. Hides the whole stack
+ * if `visible` is false. */
 static void render_stack_locked(bool visible,
                                 lv_obj_t *chip, int chip_y,
-                                lv_obj_t *row, int row_y,
-                                lv_obj_t *pct_label,
+                                lv_obj_t *pct_label, int pct_y,
                                 lv_obj_t *cd_label,
                                 const session_snapshot_t *s,
                                 bool clock_synced, int64_t now)
 {
     show_obj(chip, visible);
-    show_obj(row,  visible);
+    show_obj(pct_label, visible);
+    show_obj(cd_label, visible);
     if (!visible) return;
 
     float pct = s->used_pct;
@@ -466,10 +458,21 @@ static void render_stack_locked(bool visible,
     lv_label_set_text(pct_label, pct_buf);
     lv_label_set_text(cd_label, cd_buf);
 
-    /* Re-centre the chip (label width depends on the type string) and
-     * the % row (% width depends on glyph count). */
+    /* Centre the chip and the percentage on the disc axis. */
     recenter_at(chip, chip_y);
-    recenter_at(row, row_y);
+    recenter_at(pct_label, pct_y);
+
+    /* Position the countdown to the right of the centred percentage,
+     * with its bottom edge aligned to the percentage's bottom edge so
+     * the baselines visually line up. */
+    lv_obj_update_layout(pct_label);
+    lv_obj_update_layout(cd_label);
+    int pct_w = lv_obj_get_width(pct_label);
+    int pct_h = lv_obj_get_height(pct_label);
+    int cd_h  = lv_obj_get_height(cd_label);
+    lv_obj_align(cd_label, LV_ALIGN_TOP_LEFT,
+                 AMOLED_CX + pct_w / 2 + AMOLED_CORE_COUNTDOWN_GAP,
+                 pct_y + pct_h / 2 - cd_h);
 }
 
 static void render_snapshot_locked(const agent_snapshot_t *snap)
@@ -510,14 +513,14 @@ static void render_snapshot_locked(const agent_snapshot_t *snap)
     /* Core stacks. The primary always shows (defensive against an
      * impossible session_count==0); the secondary follows session_count. */
     render_stack_locked(snap->session_count >= 1,
-                        s_chip_primary, AMOLED_CORE_CHIP_PRIMARY_Y,
-                        s_primary_row,  AMOLED_CORE_PRIMARY_Y,
-                        s_core_primary, s_core_primary_cd,
+                        s_chip_primary,   AMOLED_CORE_CHIP_PRIMARY_Y,
+                        s_core_primary,   AMOLED_CORE_PRIMARY_Y,
+                        s_core_primary_cd,
                         &snap->sessions[0], clock_synced, now);
     render_stack_locked(snap->session_count >= 2,
                         s_chip_secondary, AMOLED_CORE_CHIP_SECONDARY_Y,
-                        s_secondary_row,  AMOLED_CORE_SECONDARY_Y,
-                        s_core_secondary, s_core_secondary_cd,
+                        s_core_secondary, AMOLED_CORE_SECONDARY_Y,
+                        s_core_secondary_cd,
                         &snap->sessions[1], clock_synced, now);
 }
 

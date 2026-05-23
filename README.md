@@ -26,11 +26,11 @@ binds it on first push (TOFU) and rejects mismatches with `401`.
 
 ```
 ┌───────────────────────────────┐       POST /summary           ┌────────────────────┐
-│  Per-agent collectors         │ ────────────────────────────▶ │  ESP32 (CYD)       │
+│  Per-agent collectors         │ ────────────────────────────▶ │  ESP32 display     │
 │   - Claude statusline hook    │   AgentSnapshot JSON          │   - mDNS advert    │
 │   - Codex app-server daemon   │   + X-BurnScope-Client-Id     │   - HTTP server    │
 │  Shared: schema, discovery,   │                               │   - NVS pairing    │
-│  identity, pusher, host_cache │                               │   - TFT renderer   │
+│  identity, pusher, host_cache │                               │   - LVGL renderer  │
 └───────────────────────────────┘                               └────────────────────┘
 ```
 
@@ -71,10 +71,16 @@ Debugging tips and log-level controls live in [`client/README.md`](./client/READ
 
 ## Building & flashing the firmware
 
+Two display boards are supported; the target chip picks the default
+display profile automatically:
+
 ```bash
 . ~/.espressif/v6.0.1/esp-idf/export.sh
 cd firmware
-idf.py set-target esp32
+idf.py set-target esp32          # Cheap Yellow Display (CYD, ST7789 320×240)
+# or
+idf.py set-target esp32s3        # Waveshare 1.43" round AMOLED (SH8601/CO5300, 466×466)
+
 idf.py -p <PORT> flash monitor
 ```
 
@@ -106,7 +112,7 @@ burnscope/
 │       ├── claude_statusline.py  ← Claude Code statusline hook (per-fire)
 │       ├── codex_daemon.py       ← long-lived Codex daemon
 │       └── cli.py                ← install/uninstall/status/pair-reset
-└── firmware/                     ← ESP32 firmware (ESP-IDF, CYD)
+└── firmware/                     ← ESP32 firmware (ESP-IDF; CYD ST7789 + Waveshare 1.43" AMOLED)
 ```
 
 ## Adding a new agent

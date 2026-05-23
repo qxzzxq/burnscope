@@ -108,7 +108,7 @@ void app_main(void)
 #ifdef CONFIG_BURNSCOPE_AMOLED_DEMO
     /* Driver-verification build: bring up the panel, render a static
      * test pattern, and sleep forever. Skip NVS / Wi-Fi / HTTP / NTP
-     * entirely — the goal is to exercise only the CO5300 + LVGL path. */
+     * entirely — the goal is to exercise only the SH8601 + LVGL path. */
     ESP_LOGI(TAG, "BURNSCOPE_AMOLED_DEMO=y — running test pattern only");
     amoled_demo_run();
     while (1) {

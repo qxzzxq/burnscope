@@ -1,10 +1,11 @@
-# Design spec — `amoled_co5300` profile
+# Design spec — `amoled_sh8601` profile
 
 **Target board.** Waveshare ESP32-S3-Touch-AMOLED-1.43
 ([wiki](https://www.waveshare.com/wiki/ESP32-S3-Touch-AMOLED-1.43)).
-466×466 round AMOLED, CO5300 over QSPI, CST820 over I2C (touch
-**unused** in MVP), ESP32-S3 with 8 MB PSRAM + 8 MB flash. LVGL 9.x —
-same as the existing cyd2usb profile.
+466×466 round AMOLED, SH8601 *or* CO5300 over QSPI (Waveshare
+dual-sources the panel; both speak the same protocol), CST820 over I2C
+(touch **unused** in MVP), ESP32-S3 with 8 MB PSRAM + 8 MB flash.
+LVGL 9.x — same as the existing cyd2usb profile.
 
 **Design concept.** Concentric-arc dial. Each session row becomes one
 ring around a central core that carries the agent identity and the
@@ -14,7 +15,7 @@ headline percentage. Two agents (claude, codex) cycle via the existing
 This spec is the contract between design and firmware. Pixel values
 here are the *starting* defaults — they are expected to be locked in
 via `firmware/scripts/amoled-preview.html` before the constants are
-copied into `displays/amoled_co5300/ui.c`.
+copied into `displays/amoled_sh8601/ui.c`.
 
 ---
 

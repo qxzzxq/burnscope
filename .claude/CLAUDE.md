@@ -5,7 +5,10 @@ An always-on token & quota meter for your AI coding agents.
 This repo has two components:
 
 - `client/` — Python 3.11+ client. Two collectors with asymmetric lifecycles (see below).
-- `firmware/` — ESP32 firmware (ESP-IDF, Cheap Yellow Display).
+- `firmware/` — ESP32 firmware (ESP-IDF). Two display profiles ship in the
+  same tree: the Cheap Yellow Display (CYD, ESP32 + ST7789 320×240) and the
+  Waveshare ESP32-S3-Touch-AMOLED-1.43 (466×466 round AMOLED, SH8601/CO5300
+  silicon over QSPI). Profile selected by Kconfig at build time.
 
 The wire format (`docs/wire-format.md`) is the daemon ↔ firmware contract — agent-agnostic, hand-mirrored in both languages.
 
@@ -26,7 +29,20 @@ To add an agent: write a per-fire script (Claude-style) or a long-lived daemon m
 
 ## Firmware
 
-The MVP is currently being developed on a Cheap-Yellow-Display (CYD), the board is a `cyd2usb` variant (one USB-C and one micro-USB port) -- ST7789, 320×240 landscape.
+Two boards ship in the same image, distinguished by Kconfig profile:
+
+- **Cheap Yellow Display (CYD)** — `cyd2usb` variant (one USB-C and one
+  micro-USB port), ESP32, ST7789 320×240 landscape. Code under
+  `firmware/main/displays/cyd2usb_st7789/`.
+- **Waveshare ESP32-S3-Touch-AMOLED-1.43** — 466×466 round AMOLED panel.
+  Driven over QSPI via Espressif's `esp_lcd_sh8601` managed component;
+  Waveshare dual-sources the silicon between SH8601 and CO5300, both of
+  which speak the same protocol. Code under
+  `firmware/main/displays/amoled_sh8601/`.
+
+The `esp32` target defaults to CYD; the `esp32s3` target defaults to AMOLED
+(see `firmware/sdkconfig.defaults.<target>`). Override via
+`idf.py menuconfig → BurnScope display`.
 
 ## ESP-IDF
 

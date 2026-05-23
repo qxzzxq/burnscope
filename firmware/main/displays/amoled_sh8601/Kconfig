@@ -1,0 +1,20 @@
+config BURNSCOPE_DISPLAY_AMOLED_SH8601
+    bool "Waveshare ESP32-S3 1.43\" Round AMOLED (SH8601/CO5300 466x466)"
+    depends on IDF_TARGET_ESP32S3
+    help
+        The Waveshare 1.43" round AMOLED board ships with either an
+        SH8601 or a CO5300 driver IC — both speak the same QSPI
+        protocol, so the same panel driver works for either. Folder/
+        symbol naming follows the Espressif managed component
+        (`esp_lcd_sh8601`) we actually link against.
+
+config BURNSCOPE_AMOLED_DEMO
+    bool "AMOLED driver-verification demo (no Wi-Fi, static test pattern)"
+    default n
+    depends on BURNSCOPE_DISPLAY_AMOLED_SH8601
+    help
+        When enabled, app_main bypasses NVS / Wi-Fi / HTTP / NTP entirely
+        and just renders a static test pattern (color bars + corner
+        markers + centre crosshair) on the AMOLED. Use this to verify
+        the SH8601/CO5300 panel driver: SLPOUT/DISPON, RGB565 byte order,
+        and the CASET/RASET column/row offsets. Disable for normal builds.

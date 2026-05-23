@@ -22,8 +22,48 @@
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_sh8601.h"
 #include "esp_lvgl_port.h"
+#include "nvs.h"
+#include "read_lcd_id.h"
+
+/* RDID1 (0xDA) values observed on the Waveshare 1.43" dual-sourced
+ * panel. CO5300 doesn't implement RDID1, so the line floats high
+ * under the pull-up. */
+#define SH8601_RDID1  0x86
+
+/* NVS slot for the cached LCD ID. Profile-private namespace — kept out
+ * of nvs_store.h on purpose (that API is the audited typed-accessor
+ * surface for credentials / pairing). One byte, written once on first
+ * boot, read on every subsequent boot to skip the ~360 ms bit-bang. */
+#define NVS_NS_AMOLED   "amoled"
+#define NVS_KEY_LCD_ID  "lcd_id"
 
 static const char *TAG = "amoled_drv";
+
+/* Probe RDID1, prefer NVS cache. Falls back to a fresh bit-bang on
+ * cache miss and persists the result for next boot. */
+static uint8_t resolve_lcd_id(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_AMOLED, NVS_READONLY, &h) == ESP_OK) {
+        uint8_t cached = 0;
+        const esp_err_t err = nvs_get_u8(h, NVS_KEY_LCD_ID, &cached);
+        nvs_close(h);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "LCD ID from NVS cache: 0x%02x", cached);
+            return cached;
+        }
+    }
+
+    const uint8_t id = amoled_sh8601_read_lcd_id();
+    if (nvs_open(NVS_NS_AMOLED, NVS_READWRITE, &h) == ESP_OK) {
+        if (nvs_set_u8(h, NVS_KEY_LCD_ID, id) == ESP_OK) {
+            nvs_commit(h);
+            ESP_LOGI(TAG, "Cached LCD ID 0x%02x to NVS", id);
+        }
+        nvs_close(h);
+    }
+    return id;
+}
 
 #define LCD_HOST            SPI2_HOST
 #define PIN_NUM_LCD_SCLK    10   /* OLED_CLK  */
@@ -40,41 +80,51 @@ static const char *TAG = "amoled_drv";
 /* 80 MHz is the speed Arduino_GFX uses on this exact board. */
 #define LCD_PIXEL_CLOCK_HZ  (80 * 1000 * 1000)
 
-/* CO5300 init register sequence for the Waveshare 1.43 panel.
+/* Init register sequences mirrored from Waveshare's own ESP-IDF demo
+ * (`ESP-IDF/07_LVGL_Test/main/example_qspi_with_ram.c`). The board
+ * ships with either an SH8601 or a CO5300 driver IC; we pick the
+ * matching table at runtime after reading RDID1 (see read_lcd_id.c).
  *
- * Mirrored verbatim from Waveshare's own ESP-IDF demo
- * (`ESP-IDF/07_LVGL_Test/main/example_qspi_with_ram.c`, `co5300_lcd_init_cmds`).
- * Notable order vs. the Arduino_GFX version we started with:
- *   - SLPOUT first (wake the chip before vendor-register writes);
- *   - brightness ramp: 0x51=0x00 before DISPON, 0x51=0xFF after — keeps
- *     whatever junk is in the framebuffer from flashing at full
- *     brightness for one frame while LVGL is still booting.
+ * Both sequences include a brightness ramp (0x51=0x00 before DISPON,
+ * 0x51=0xFF after) to suppress the framebuffer-junk flash during
+ * LVGL's first frame.
  *
- * The commented entries are kept as breadcrumbs from the vendor demo:
- *   - 0x44/0x35 are TE (tearing-effect) setup, only needed if we wire
- *     the TE line to GPIO (we don't);
- *   - 0x36 is MADCTL (0x60 = the vendor's hardware-rotation hint). We
- *     do software rotation in LVGL instead, so leave MADCTL at default. */
-static const sh8601_lcd_init_cmd_t s_amoled_init_cmds[] = {
+ * TE registers (0x44 scanline target, 0x35 ON) and MADCTL (0x36) are
+ * omitted because we don't wire the TE line to GPIO and we do
+ * software rotation in LVGL instead of hardware rotation.
+ */
+static const sh8601_lcd_init_cmd_t s_sh8601_init_cmds[] = {
+    { 0x11, NULL, 0, 120 },                    /* SLPOUT, 120ms settle */
+    { 0x53, (uint8_t[]){ 0x20 }, 1, 10 },      /* WCTRLD1 */
+    { 0x51, (uint8_t[]){ 0x00 }, 1, 10 },      /* brightness 0 before DISPON */
+    { 0x29, NULL, 0, 10 },                     /* DISPON */
+    { 0x51, (uint8_t[]){ 0xFF }, 1, 0 },       /* brightness ramp to max */
+};
+
+static const sh8601_lcd_init_cmd_t s_co5300_init_cmds[] = {
     { 0x11, NULL, 0, 80 },                     /* SLPOUT, 80ms settle */
     { 0xC4, (uint8_t[]){ 0x80 }, 1, 0 },       /* SPIMODECTL: stay in QSPI */
-    /* { 0x44, (uint8_t[]){ 0x01, 0xD1 }, 2, 0 }, // TE scanline target */
-    /* { 0x35, (uint8_t[]){ 0x00 }, 1, 0 },       // TE ON */
     { 0x53, (uint8_t[]){ 0x20 }, 1, 1 },       /* WCTRLD1 */
     { 0x63, (uint8_t[]){ 0xFF }, 1, 1 },       /* HBM brightness max */
     { 0x51, (uint8_t[]){ 0x00 }, 1, 1 },       /* brightness 0 before DISPON */
     { 0x29, NULL, 0, 10 },                     /* DISPON */
     { 0x51, (uint8_t[]){ 0xFF }, 1, 0 },       /* brightness ramp to max */
-    /* { 0x36, (uint8_t[]){ 0x60 }, 1, 0 },       // MADCTL hint (we SW-rotate) */
 };
 
 static lv_display_t *s_display = NULL;
 
-lv_display_t *amoled_co5300_driver_init(void)
+lv_display_t *amoled_sh8601_driver_init(void)
 {
     if (s_display != NULL) {
         return s_display;
     }
+
+    /* Detect the silicon variant — NVS cache on subsequent boots,
+     * bit-banged RDID1 read on first boot. See read_lcd_id.c. */
+    const uint8_t lcd_id = resolve_lcd_id();
+    const bool is_sh8601 = (lcd_id == SH8601_RDID1);
+    ESP_LOGI(TAG, "Detected panel silicon: %s (RDID1=0x%02x)",
+             is_sh8601 ? "SH8601" : "CO5300", lcd_id);
 
     /* QSPI bus — single host carrying 4 data lines + SCLK + CS. data4-7
      * must be -1 (we're quad, not octal) or the SPI driver tries to claim
@@ -93,10 +143,13 @@ lv_display_t *amoled_co5300_driver_init(void)
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(
         (esp_lcd_spi_bus_handle_t)LCD_HOST, &io_config, &io_handle));
 
-    /* Panel — vendor_config carries the init register table + QSPI flag. */
+    /* Panel — vendor_config carries the init register table + QSPI flag.
+     * Pick the SH8601 or CO5300 sequence based on the RDID1 read. */
     const sh8601_vendor_config_t vendor_config = {
-        .init_cmds = s_amoled_init_cmds,
-        .init_cmds_size = sizeof(s_amoled_init_cmds) / sizeof(s_amoled_init_cmds[0]),
+        .init_cmds = is_sh8601 ? s_sh8601_init_cmds : s_co5300_init_cmds,
+        .init_cmds_size = is_sh8601
+            ? sizeof(s_sh8601_init_cmds) / sizeof(s_sh8601_init_cmds[0])
+            : sizeof(s_co5300_init_cmds) / sizeof(s_co5300_init_cmds[0]),
         .flags = {
             .use_qspi_interface = 1,
         },
@@ -112,6 +165,11 @@ lv_display_t *amoled_co5300_driver_init(void)
 
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
+    /* CO5300's visible column window starts at x=6; SH8601 starts at
+     * x=0. Without the correct gap, the 6 panel-native columns at the
+     * visible right edge are never written, which appears as a stale-
+     * pixel band at the top of the screen after our 270° rotation. */
+    ESP_ERROR_CHECK(esp_lcd_panel_set_gap(panel_handle, is_sh8601 ? 0 : 6, 0));
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
 
     /* LVGL port — 80-row stripe buffers, DMA-friendly, RGB565 with the

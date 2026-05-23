@@ -14,7 +14,7 @@
    * are pixel-accurate at every zoom level. Every value the firmware will
    * compile in is exposed as a slider in the sidebar; the snippet block at
    * the bottom emits a JSON blob + C `#define` table that gets pasted into
-   * `firmware/main/displays/amoled_co5300/ui.c` once the layout is locked.
+   * `firmware/main/displays/amoled_sh8601/ui.c` once the layout is locked.
    *
    * Mirrors the role of `font-preview.html` for the cyd2usb profile.
    */
@@ -446,7 +446,7 @@
   const SPLASH_VERSION   = "#808080";
   const BG_HEX           = "#000000";
 
-  // -------- defaults: the starting point in docs/ui/amoled_co5300.md --------
+  // -------- defaults: the starting point in docs/ui/amoled_sh8601.md --------
   const STATE = {
     cx: 233, cy: 233,
     safe_radius: 220,
@@ -821,7 +821,7 @@
   function configToJSON() {
     const { data, ...geometry } = STATE;  /* eslint-disable-line no-unused-vars */
     return {
-      schema: "burnscope.amoled_co5300.layout.v1",
+      schema: "burnscope.amoled_sh8601.layout.v1",
       saved_at: new Date().toISOString(),
       geometry,
       palette: {

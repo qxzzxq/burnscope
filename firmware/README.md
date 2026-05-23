@@ -1,8 +1,15 @@
 # BurnScope Firmware
 
-ESP-IDF firmware for the Cheap Yellow Display (CYD, cyd2usb variant).
-Phase 2 — captive-portal provisioning + snapshot rendering — corresponds
-to FSD § 3.2.
+ESP-IDF firmware for two display boards:
+
+- **Cheap Yellow Display** (CYD, `cyd2usb` variant, ESP32, ST7789 320×240) —
+  the original MVP target.
+- **Waveshare ESP32-S3-Touch-AMOLED-1.43** (round 466×466 AMOLED driven
+  by the dual-sourced SH8601/CO5300 controller over QSPI).
+
+The two profiles ship in the same image — pick one at build time via
+Kconfig (see *Display profiles* below). Phase 2 — captive-portal
+provisioning + snapshot rendering — corresponds to FSD § 3.2.
 
 ## Prerequisites
 
@@ -23,7 +30,7 @@ idf.py -p <PORT> flash monitor
 
 The target chip drives the default display profile via the
 `sdkconfig.defaults.<target>` overlay (esp32 → cyd2usb_st7789;
-esp32s3 → amoled_co5300). Switch profiles within a target via
+esp32s3 → amoled_sh8601). Switch profiles within a target via
 `idf.py menuconfig` → *BurnScope display*.
 
 No WiFi credentials are baked into the image — the device captures them
@@ -77,23 +84,23 @@ under `main/displays/<name>/`. The active profile is chosen via Kconfig
 | Kconfig symbol                            | Target chip | Profile path                       |
 |-------------------------------------------|-------------|------------------------------------|
 | `CONFIG_BURNSCOPE_DISPLAY_CYD2USB_ST7789` | esp32       | `main/displays/cyd2usb_st7789/`    |
-| `CONFIG_BURNSCOPE_DISPLAY_AMOLED_CO5300`  | esp32s3     | `main/displays/amoled_co5300/`     |
+| `CONFIG_BURNSCOPE_DISPLAY_AMOLED_SH8601`  | esp32s3     | `main/displays/amoled_sh8601/`     |
 
 The AMOLED profile targets the Waveshare ESP32-S3-Touch-AMOLED-1.43
-(466×466 round AMOLED via CO5300 QSPI; no touch wired in MVP). It
-shares the wire format and snapshot store with the CYD profile —
-only the rendering changes (concentric arcs vs. linear bars). The
-panel driver is **untested on hardware** as of this commit; the QSPI
-pinout and the CO5300 init sequence in `displays/amoled_co5300/`
-need to be verified against an actual device before flashing.
+(466×466 round AMOLED via QSPI; no touch wired in MVP). The board
+ships with either an SH8601 or a CO5300 driver IC — same QSPI
+protocol — and we link against Espressif's `esp_lcd_sh8601` managed
+component, hence the profile name. It shares the wire format and
+snapshot store with the CYD profile; only the rendering changes
+(concentric arcs vs. linear bars).
 
 The UI layout for the AMOLED profile is dialled in via the
 configurator at `firmware/scripts/amoled-preview.html` (open in any
 browser). It mirrors the role of `font-preview.html` for the CYD
 profile: live sliders for ring radii / arc angles / core geometry /
 header / footer / pills, with a copy-paste `#define` block at the
-bottom that gets pasted into `main/displays/amoled_co5300/ui.c`. The
-full design spec is at `docs/ui/amoled_co5300.md`.
+bottom that gets pasted into `main/displays/amoled_sh8601/ui.c`. The
+full design spec is at `docs/ui/amoled_sh8601.md`.
 
 Adding a new screen (e.g. an OLED or e-paper variant) is a
 directory-drop operation. In `main/displays/<name>/`, create four files:

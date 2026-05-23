@@ -1,5 +1,5 @@
 /*
- * AMOLED CO5300 driver-verification demo.
+ * AMOLED SH8601/CO5300 driver-verification demo.
  *
  * Compiled in when `CONFIG_BURNSCOPE_AMOLED_DEMO=y` and called early
  * from `app_main` before the Wi-Fi / HTTP / NVS stack starts. Renders
@@ -8,7 +8,7 @@
  *   1. Panel comes up at all (anything visible == SLPOUT/DISPON worked).
  *   2. Pixel format (RGB565 byte order) — the R / G / B color bars
  *      must be red, green, blue, not some permutation.
- *   3. Pixel addressing (CO5300_COL_OFFSET / row offset) — the corner
+ *   3. Pixel addressing (column / row offsets) — the corner
  *      markers must sit at the four corners of the visible disc, not
  *      shifted or wrapped.
  *   4. Center alignment — the yellow crosshair must land at (cx, cy).
@@ -52,8 +52,8 @@ static lv_obj_t *solid_rect(lv_obj_t *parent, int w, int h, uint32_t color)
 
 void amoled_demo_run(void)
 {
-    ESP_LOGI(TAG, "Initialising CO5300 panel for driver-verification demo");
-    lv_display_t *disp = amoled_co5300_driver_init();
+    ESP_LOGI(TAG, "Initialising SH8601/CO5300 panel for driver-verification demo");
+    lv_display_t *disp = amoled_sh8601_driver_init();
     if (disp == NULL) {
         ESP_LOGE(TAG, "Panel init returned NULL — driver bring-up failed.");
         return;
@@ -73,7 +73,7 @@ void amoled_demo_run(void)
     /* Title at the top — verifies font rendering + that the top of
      * the framebuffer is actually visible (not offset off-screen). */
     lv_obj_t *title = lv_label_create(scr);
-    lv_label_set_text(title, "AMOLED-1.43\nCO5300 test");
+    lv_label_set_text(title, "AMOLED-1.43\nSH8601 test");
     lv_obj_set_style_text_color(title, lv_color_hex(0xF9F2DF), 0);
     lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
     lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
@@ -103,7 +103,7 @@ void amoled_demo_run(void)
 
     /* Centre crosshair (yellow) — verifies that (cx,cy) maps to the
      * actual physical centre of the disc and that the column / row
-     * offsets in co5300.c (CO5300_COL_OFFSET) are correct. */
+     * offsets in the SH8601 component are correct. */
     lv_obj_t *vline = solid_rect(scr, 2, 40, 0xFFFF00);
     lv_obj_align(vline, LV_ALIGN_TOP_LEFT, CX - 1, CY - 20);
     lv_obj_t *hline = solid_rect(scr, 40, 2, 0xFFFF00);

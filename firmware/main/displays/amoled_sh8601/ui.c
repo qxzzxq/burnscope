@@ -1,5 +1,5 @@
 /*
- * amoled_co5300 LVGL UI — concentric-arc dial on a 466×466 round AMOLED.
+ * amoled_sh8601 LVGL UI — concentric-arc dial on a 466×466 round AMOLED.
  *
  * Two screens, matching the cyd2usb profile:
  *   - Splash: title + status line + version footer. Used during boot,
@@ -12,7 +12,7 @@
  *     sits inside the innermost ring.
  *
  * Layout constants below are the defaults from
- * `docs/ui/amoled_co5300.md`. The HTML tuner at
+ * `docs/ui/amoled_sh8601.md`. The HTML tuner at
  * `firmware/scripts/amoled-preview.html` lets you dial them in
  * pre-board and emits a #define block you paste here.
  *
@@ -566,7 +566,7 @@ static void tick_lvgl_cb(lv_timer_t *t)
 
 void display_profile_init(void)
 {
-    lv_display_t *disp = amoled_co5300_driver_init();
+    lv_display_t *disp = amoled_sh8601_driver_init();
 
     if (!lvgl_port_lock(0)) {
         ESP_LOGE(TAG, "lvgl_port_lock failed during init");

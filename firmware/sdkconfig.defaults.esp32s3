@@ -24,4 +24,4 @@ CONFIG_SPIRAM_SPEED_80M=y
 # Default to the AMOLED profile when the target is esp32s3. Override
 # in menuconfig if you have a different ESP32-S3 display board.
 CONFIG_BURNSCOPE_DISPLAY_CYD2USB_ST7789=
-CONFIG_BURNSCOPE_DISPLAY_AMOLED_CO5300=y
+CONFIG_BURNSCOPE_DISPLAY_AMOLED_SH8601=y

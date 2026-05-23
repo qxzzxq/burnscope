@@ -40,28 +40,32 @@ static const char *TAG = "amoled_drv";
 /* 80 MHz is the speed Arduino_GFX uses on this exact board. */
 #define LCD_PIXEL_CLOCK_HZ  (80 * 1000 * 1000)
 
-/* SH8601 / CO5300 init register sequence for the Waveshare 1.43 panel.
- * Mirrors Moon-Arduino_GFX's `co5300_init_operations`. The SH8601 driver
- * applies these on top of its own default sequence, so we deliberately
- * skip 0x3A (COLMOD) — the driver sets it from `bits_per_pixel` and
- * warns "command has been used and will be overwritten" if we do too. */
+/* CO5300 init register sequence for the Waveshare 1.43 panel.
+ *
+ * Mirrored verbatim from Waveshare's own ESP-IDF demo
+ * (`ESP-IDF/07_LVGL_Test/main/example_qspi_with_ram.c`, `co5300_lcd_init_cmds`).
+ * Notable order vs. the Arduino_GFX version we started with:
+ *   - SLPOUT first (wake the chip before vendor-register writes);
+ *   - brightness ramp: 0x51=0x00 before DISPON, 0x51=0xFF after — keeps
+ *     whatever junk is in the framebuffer from flashing at full
+ *     brightness for one frame while LVGL is still booting.
+ *
+ * The commented entries are kept as breadcrumbs from the vendor demo:
+ *   - 0x44/0x35 are TE (tearing-effect) setup, only needed if we wire
+ *     the TE line to GPIO (we don't);
+ *   - 0x36 is MADCTL (0x60 = the vendor's hardware-rotation hint). We
+ *     do software rotation in LVGL instead, so leave MADCTL at default. */
 static const sh8601_lcd_init_cmd_t s_amoled_init_cmds[] = {
-    /* Page select / vendor command unlock. */
-    { 0xFE, (uint8_t[]){ 0x00 }, 1, 0 },
-    /* SPI mode control — keep panel in QSPI for pixel data. */
-    { 0xC4, (uint8_t[]){ 0x80 }, 1, 0 },
-    /* Display control 1. */
-    { 0x53, (uint8_t[]){ 0x20 }, 1, 0 },
-    /* HBM-mode brightness (max). */
-    { 0x63, (uint8_t[]){ 0xFF }, 1, 0 },
-    /* Sleep-out, then 120 ms settle. */
-    { 0x11, NULL, 0, 120 },
-    /* Display on, 20 ms settle. */
-    { 0x29, NULL, 0, 20 },
-    /* Normal-mode brightness. */
-    { 0x51, (uint8_t[]){ 0xD0 }, 1, 0 },
-    /* Contrast enhancement off. */
-    { 0x58, (uint8_t[]){ 0x00 }, 1, 0 },
+    { 0x11, NULL, 0, 80 },                     /* SLPOUT, 80ms settle */
+    { 0xC4, (uint8_t[]){ 0x80 }, 1, 0 },       /* SPIMODECTL: stay in QSPI */
+    /* { 0x44, (uint8_t[]){ 0x01, 0xD1 }, 2, 0 }, // TE scanline target */
+    /* { 0x35, (uint8_t[]){ 0x00 }, 1, 0 },       // TE ON */
+    { 0x53, (uint8_t[]){ 0x20 }, 1, 1 },       /* WCTRLD1 */
+    { 0x63, (uint8_t[]){ 0xFF }, 1, 1 },       /* HBM brightness max */
+    { 0x51, (uint8_t[]){ 0x00 }, 1, 1 },       /* brightness 0 before DISPON */
+    { 0x29, NULL, 0, 10 },                     /* DISPON */
+    { 0x51, (uint8_t[]){ 0xFF }, 1, 0 },       /* brightness ramp to max */
+    /* { 0x36, (uint8_t[]){ 0x60 }, 1, 0 },       // MADCTL hint (we SW-rotate) */
 };
 
 static lv_display_t *s_display = NULL;
@@ -115,10 +119,15 @@ lv_display_t *amoled_co5300_driver_init(void)
     const lvgl_port_cfg_t lvgl_cfg = ESP_LVGL_PORT_INIT_CONFIG();
     ESP_ERROR_CHECK(lvgl_port_init(&lvgl_cfg));
 
+    /* 40-row stripe → 3 buffers × 466 × 40 × 2 B = ~109 KB in internal
+     * RAM. Waveshare's demo uses MALLOC_CAP_DMA (internal RAM) with two
+     * 116-row stripes; LVGL 9 + sw_rotate adds a third scratch buffer,
+     * so we shrink the stripe to keep all three in DRAM. PSRAM-backed
+     * buffers cause DMA TX underflows at the panel's QSPI clock. */
     const lvgl_port_display_cfg_t disp_cfg = {
         .io_handle = io_handle,
         .panel_handle = panel_handle,
-        .buffer_size = LCD_H_RES * 80,
+        .buffer_size = LCD_H_RES * 40,
         .double_buffer = true,
         .hres = LCD_H_RES,
         .vres = LCD_V_RES,
@@ -132,11 +141,24 @@ lv_display_t *amoled_co5300_driver_init(void)
         .flags = {
             .buff_dma = true,
             .swap_bytes = true,
+            /* SH8601 / CO5300 has no hardware swap_xy, so we rotate in
+             * LVGL. Matches Waveshare's own demo
+             * (`disp_drv.sw_rotate = 1; disp_drv.rotated = LV_DISP_ROT_270`). */
+            .sw_rotate = true,
         },
     };
     s_display = lvgl_port_add_disp(&disp_cfg);
     if (s_display == NULL) {
         ESP_LOGE(TAG, "lvgl_port_add_disp failed");
+        return NULL;
+    }
+
+    /* 270° rotation puts logical (0,0) at the panel's physical bottom-
+     * right when the USB-C connector is at the bottom of the board.
+     * Equivalent to LV_DISP_ROT_270 in the Waveshare LVGL-8 demo. */
+    if (lvgl_port_lock(0)) {
+        lv_display_set_rotation(s_display, LV_DISPLAY_ROTATION_270);
+        lvgl_port_unlock();
     }
     return s_display;
 }

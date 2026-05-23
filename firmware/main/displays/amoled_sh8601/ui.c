@@ -1,20 +1,19 @@
 /*
  * amoled_sh8601 LVGL UI — concentric-arc dial on a 466×466 round AMOLED.
  *
- * Two screens, matching the cyd2usb profile:
+ * Two screens:
  *   - Splash: title + status line + version footer. Used during boot,
  *     provisioning, and "waiting for daemon".
- *   - Agent:  three concentric rings (one per session, outer = row 0)
- *     orbiting a central core that carries the agent brand icon, the
- *     row-0 percentage in display-size type, and the row-0 type tag.
- *     R1/R2 type tags + countdowns sit as chip pills in the 90° gap
- *     at the top of the dial. Footer (client_id + relative timestamp)
- *     sits inside the innermost ring.
+ *   - Agent: two concentric rings (row 0 outer, row 1 inner) around a
+ *     central core that stacks the agent brand icon, the row-0 type
+ *     chip + percentage + reset countdown, and the row-1 type chip +
+ *     percentage + reset countdown. Footer at the bottom of the disc
+ *     is two stacked centred lines: "updated N ago" above the
+ *     client_id.
  *
- * Layout constants below are the defaults from
- * `docs/ui/amoled_sh8601.md`. The HTML tuner at
- * `firmware/scripts/amoled-preview.html` lets you dial them in
- * pre-board and emits a #define block you paste here.
+ * Layout constants below are pasted from the HTML tuner at
+ * `firmware/scripts/amoled-preview.html`. The HTML is the authoritative
+ * visual contract.
  *
  * All LVGL mutation goes through `lvgl_port_lock`. Like the cyd2usb
  * profile, this is the only translation unit that talks LVGL.
@@ -37,70 +36,68 @@
 #include "snapshot.h"
 #include "version.h"
 
-/* Per-agent brand icons. Reuses the 24×24 ARGB8888 assets that ship
- * with the cyd2usb profile — LVGL upscales them in-place on the
- * larger AMOLED. Regenerate at 48×48 for crisper rendering when
- * dropping the 24 px assets becomes acceptable (see design spec §7). */
-LV_IMAGE_DECLARE(icon_claude);
-LV_IMAGE_DECLARE(icon_codex);
+/* Per-agent brand icons. 70×70 ARGB8888 assets dedicated to the AMOLED
+ * profile; the 24×24 variants (`icon_claude`, `icon_codex`) remain in
+ * use by the cyd2usb profile. */
+LV_IMAGE_DECLARE(icon_claude_70);
+LV_IMAGE_DECLARE(icon_codex_70);
 
 static const char *TAG = "render";
 
 /* ===== Layout constants — paste from amoled-preview.html ============= */
-#define AMOLED_CX                233
-#define AMOLED_CY                233
-#define AMOLED_SAFE_RADIUS       220
+#define AMOLED_CX                      233
+#define AMOLED_CY                      233
+#define AMOLED_SAFE_RADIUS             220
 
-#define AMOLED_R0_OUTER          215
-#define AMOLED_R0_INNER          197
-#define AMOLED_R1_OUTER          192
-#define AMOLED_R1_INNER          178
-#define AMOLED_R2_OUTER          173
-#define AMOLED_R2_INNER          161
+#define AMOLED_R0_OUTER                215
+#define AMOLED_R0_INNER                197   /* stroke 18 */
+#define AMOLED_R1_OUTER                192
+#define AMOLED_R1_INNER                178   /* stroke 14 */
+/* R2 removed — preview is a 2-ring design. SNAPSHOT_MAX_SESSIONS in
+ * snapshot.h is unchanged; we simply ignore any third slot on AMOLED. */
 
-#define AMOLED_ARC_START_DEG     135
-#define AMOLED_ARC_SWEEP_DEG     270
-#define AMOLED_ARC_VALUE_RANGE   1000   /* matches cyd2usb bar resolution */
+#define AMOLED_ARC_START_DEG           135
+#define AMOLED_ARC_SWEEP_DEG           270
+#define AMOLED_ARC_VALUE_RANGE         1000
 
-#define AMOLED_CORE_ICON_SIZE    24     /* using existing 24px icons */
-#define AMOLED_CORE_ICON_Y       188
-#define AMOLED_CORE_PRIMARY_Y    248
-#define AMOLED_CORE_SECONDARY_Y  282
+#define AMOLED_CORE_ICON_Y             130   /* icon centre */
+#define AMOLED_CORE_CHIP_PRIMARY_Y     195   /* chip centre */
+#define AMOLED_CORE_PRIMARY_Y          235   /* primary % centre */
+#define AMOLED_CORE_CHIP_SECONDARY_Y   285
+#define AMOLED_CORE_SECONDARY_Y        315
+#define AMOLED_CORE_CHIP_RADIUS        4
+#define AMOLED_CORE_CHIP_PAD_H         5
+#define AMOLED_CORE_CHIP_PAD_V         3
+#define AMOLED_CORE_COUNTDOWN_GAP      10    /* gap between % and countdown */
 
-#define AMOLED_HEADER_Y          14
+#define AMOLED_FOOTER_UPDATED_Y        410   /* top footer line centre */
+#define AMOLED_FOOTER_EMAIL_Y          430   /* bottom footer line centre */
+#define AMOLED_FOOTER_WIDTH            420   /* ellipsis clamp width */
 
-#define AMOLED_FOOTER_Y          410
-#define AMOLED_FOOTER_LEFT_X     48
-#define AMOLED_FOOTER_RIGHT_X    418
-#define AMOLED_FOOTER_LEFT_WIDTH 180
-
-#define AMOLED_PILL_Y            36
-#define AMOLED_PILL_R1_X         170
-#define AMOLED_PILL_R2_X         296
-#define AMOLED_PILL_CHIP_RADIUS  6
-#define AMOLED_PILL_PAD_H        8
-#define AMOLED_PILL_PAD_V        2
-#define AMOLED_PILL_CD_OFFSET_X  60
+#define AMOLED_NUM_RINGS               2
 
 /* ===== Splash widgets =============================================== */
 static lv_obj_t *s_splash_screen = NULL;
 static lv_obj_t *s_status_label  = NULL;
 
 /* ===== Agent-screen widgets (built once, mutated per snapshot) ====== */
-static lv_obj_t *s_agent_screen     = NULL;
-static lv_obj_t *s_header_label     = NULL;  /* "Usage" */
-static lv_obj_t *s_core_icon        = NULL;  /* agent brand */
-static lv_obj_t *s_core_primary     = NULL;  /* row-0 percent, big */
-static lv_obj_t *s_core_secondary   = NULL;  /* row-0 type tag */
-static lv_obj_t *s_footer_left      = NULL;  /* client_id */
-static lv_obj_t *s_footer_right     = NULL;  /* "updated N min ago" */
+static lv_obj_t *s_agent_screen        = NULL;
+static lv_obj_t *s_core_icon           = NULL;
+static lv_obj_t *s_chip_primary        = NULL;  /* row-0 type pill   */
+static lv_obj_t *s_primary_row         = NULL;  /* % + countdown row */
+static lv_obj_t *s_core_primary        = NULL;  /* M48 percentage    */
+static lv_obj_t *s_core_primary_cd     = NULL;  /* M14 countdown     */
+static lv_obj_t *s_chip_secondary      = NULL;
+static lv_obj_t *s_secondary_row       = NULL;
+static lv_obj_t *s_core_secondary      = NULL;  /* M36 percentage    */
+static lv_obj_t *s_core_secondary_cd   = NULL;
+static lv_obj_t *s_footer_updated      = NULL;  /* "updated N ago"   */
+static lv_obj_t *s_footer_email        = NULL;  /* client_id         */
 
 typedef struct {
-    lv_obj_t *arc;              /* indicator + track */
-    lv_obj_t *pill_tag;         /* R1/R2 only — NULL for R0 (in-core) */
-    lv_obj_t *pill_countdown;   /* R1/R2 only — NULL for R0 */
+    lv_obj_t *arc;
 } ui_ring_t;
-static ui_ring_t s_rings[SNAPSHOT_MAX_SESSIONS];
+static ui_ring_t s_rings[AMOLED_NUM_RINGS];
 
 /* The agent we are currently rendering ("" when on splash). */
 static char s_visible_agent[SNAPSHOT_AGENT_MAX] = "";
@@ -139,16 +136,16 @@ static const char *footer_cid_for(const char *agent)
 #define CYCLE_INTERVAL_S 5
 static int s_cycle_ticks = 0;
 
-/* Per-agent ring palette (FR-4.7). Identical to the cyd2usb profile so
- * a multi-screen setup looks unified. */
+/* Per-agent ring palette (FR-4.7). Two rings only; track the cyd2usb
+ * palette so a multi-screen setup stays visually unified. */
 typedef struct {
     const char *agent;
-    uint32_t rows[SNAPSHOT_MAX_SESSIONS];
+    uint32_t rows[AMOLED_NUM_RINGS];
 } agent_palette_t;
 
 static const agent_palette_t AGENT_PALETTES[] = {
-    { "claude", { 0xDE7356, 0xA4A049, 0xB0BEC5 } },
-    { "codex",  { 0x81C3DD, 0xA4A049, 0xB0BEC5 } },
+    { "claude", { 0xDE7356, 0xA4A049 } },
+    { "codex",  { 0x81C3DD, 0xA4A049 } },
 };
 
 static const agent_palette_t *palette_for(const char *agent)
@@ -163,8 +160,8 @@ static const agent_palette_t *palette_for(const char *agent)
 
 static const lv_image_dsc_t *agent_icon(const char *agent)
 {
-    if (strcmp(agent, "codex") == 0) return &icon_codex;
-    return &icon_claude;
+    if (strcmp(agent, "codex") == 0) return &icon_codex_70;
+    return &icon_claude_70;
 }
 
 /* Identical countdown formatter to the cyd2usb profile — per FR-5
@@ -190,7 +187,8 @@ static void format_countdown(int64_t seconds, char *out, size_t n)
 
 /* Format the age of `captured_at` as a relative phrase. Identical
  * semantics to the cyd2usb profile (see comment there for the
- * timezone-free justification). */
+ * timezone-free justification). Writes "" if either timestamp is
+ * pre-unix-2023 so the unsynced state surfaces as an empty line. */
 static void format_updated_relative(int64_t captured_at, char *out, size_t n)
 {
     if (n == 0) return;
@@ -214,22 +212,6 @@ static void format_updated_relative(int64_t captured_at, char *out, size_t n)
     }
 }
 
-/* Place a widget at (x, y) on the panel by aligning to top-left and
- * offsetting. Centres the widget on (x, y) when `center` is true. */
-static void place_at(lv_obj_t *obj, int x, int y, bool center)
-{
-    if (center) {
-        /* For centring, defer to LVGL's content size + LV_ALIGN_CENTER. */
-        lv_obj_align(obj, LV_ALIGN_TOP_LEFT, 0, 0);
-        lv_obj_update_layout(obj);
-        const int w = lv_obj_get_width(obj);
-        const int h = lv_obj_get_height(obj);
-        lv_obj_align(obj, LV_ALIGN_TOP_LEFT, x - w / 2, y - h / 2);
-    } else {
-        lv_obj_align(obj, LV_ALIGN_TOP_LEFT, x, y);
-    }
-}
-
 /* ===== Splash ======================================================= */
 
 static void build_splash(lv_display_t *disp)
@@ -243,7 +225,7 @@ static void build_splash(lv_display_t *disp)
     lv_obj_t *title = lv_label_create(scr);
     lv_label_set_text(title, "BurnScope");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_28, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 180 - 14);  /* y=180 centred */
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 180 - 14);
 
     s_status_label = lv_label_create(scr);
     lv_label_set_long_mode(s_status_label, LV_LABEL_LONG_WRAP);
@@ -255,13 +237,10 @@ static void build_splash(lv_display_t *disp)
 
     lv_obj_t *version = lv_label_create(scr);
     lv_label_set_text(version, "v" BURNSCOPE_FW_VERSION);
-    lv_obj_set_style_text_font(version, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(version, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(version, lv_color_hex(0x808080), 0);
-    /* y=410 — same band as the agent-screen footer. Provisioning's
-     * three-line splash ("Setup mode / Join … / Open 192.168.4.1") at
-     * M24 overruns the spec'd y=300 slot, so we sink the version into
-     * the footer ring instead. */
-    lv_obj_align(version, LV_ALIGN_TOP_MID, 0, 410 - 8);
+    /* y=410 — same band as the agent-screen footer. */
+    lv_obj_align(version, LV_ALIGN_TOP_MID, 0, 410 - 7);
 
     s_splash_screen = scr;
     lv_screen_load(s_splash_screen);
@@ -270,12 +249,10 @@ static void build_splash(lv_display_t *disp)
 
 /* ===== Agent screen ================================================= */
 
-/* Build a single ring (LVGL arc widget). The arc widget is a square
- * sized to 2*outer_radius and centred on the disc; the stroke width
- * equals (outer - inner). LVGL handles drawing the arc within the
- * widget's bounding box. Indicator angles run start_deg → start_deg +
- * sweep_deg (clockwise); the indicator value (0..VALUE_RANGE) drives
- * how far the indicator fills toward the end angle. */
+/* Build a single ring (LVGL arc widget). Mirrors the cyd2usb pattern.
+ * The arc widget is a square sized to 2*outer_radius and centred on
+ * the disc; the stroke width equals (outer - inner). LVGL handles
+ * drawing the arc within the widget's bounding box. */
 static void build_ring(lv_obj_t *parent, int ring_idx, int outer_r, int inner_r)
 {
     ui_ring_t *r = &s_rings[ring_idx];
@@ -307,34 +284,71 @@ static void build_ring(lv_obj_t *parent, int ring_idx, int outer_r, int inner_r)
     lv_obj_remove_flag(arc, LV_OBJ_FLAG_CLICKABLE);
 
     r->arc = arc;
-    r->pill_tag = NULL;
-    r->pill_countdown = NULL;
 }
 
-/* Build a chip pill (R1/R2 type tag) + countdown label in the top gap. */
-static void build_pill(lv_obj_t *parent, int ring_idx, int x)
+/* Build a chip pill — a label with a dark rounded background, sized to
+ * its text content, centred horizontally at `center_y`. */
+static lv_obj_t *build_chip(lv_obj_t *parent, int center_y)
 {
-    ui_ring_t *r = &s_rings[ring_idx];
+    lv_obj_t *chip = lv_label_create(parent);
+    lv_label_set_text(chip, "");
+    lv_obj_set_style_text_font(chip, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(chip, lv_color_hex(0xF9F2DF), 0);
+    lv_obj_set_style_bg_color(chip, lv_color_hex(0x2E2E2E), 0);
+    lv_obj_set_style_bg_opa(chip, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(chip, AMOLED_CORE_CHIP_RADIUS, 0);
+    lv_obj_set_style_pad_hor(chip, AMOLED_CORE_CHIP_PAD_H, 0);
+    lv_obj_set_style_pad_ver(chip, AMOLED_CORE_CHIP_PAD_V, 0);
+    /* Initial align — will be re-centred each render against the
+     * label's current width. */
+    lv_obj_align(chip, LV_ALIGN_TOP_MID, 0, center_y);
+    return chip;
+}
 
-    lv_obj_t *pill = lv_label_create(parent);
-    lv_label_set_text(pill, "—");
-    lv_obj_set_style_text_font(pill, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(pill, lv_color_hex(0xF9F2DF), 0);
-    lv_obj_set_style_bg_color(pill, lv_color_hex(0x2E2E2E), 0);
-    lv_obj_set_style_bg_opa(pill, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(pill, AMOLED_PILL_CHIP_RADIUS, 0);
-    lv_obj_set_style_pad_hor(pill, AMOLED_PILL_PAD_H, 0);
-    lv_obj_set_style_pad_ver(pill, AMOLED_PILL_PAD_V, 0);
-    place_at(pill, x, AMOLED_PILL_Y, true);
+/* Build a "{percentage} {countdown}" row container. Children are
+ * bottom-aligned within the row (so the countdown baseline sits flush
+ * with the percentage bottom). Returns the container; %_label and
+ * cd_label are populated via out-pointers. */
+static lv_obj_t *build_pct_row(lv_obj_t *parent,
+                               const lv_font_t *pct_font,
+                               lv_obj_t **out_pct, lv_obj_t **out_cd)
+{
+    lv_obj_t *row = lv_obj_create(parent);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    /* main_place=start, cross_place=end (bottom-align children),
+     * track_place=end. Children sit at the bottom of the row's
+     * content box. */
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
+    lv_obj_set_style_pad_column(row, AMOLED_CORE_COUNTDOWN_GAP, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *cd = lv_label_create(parent);
-    lv_label_set_text(cd, "--");
-    lv_obj_set_style_text_font(cd, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(cd, lv_color_hex(0xB0ACA0), 0);
-    place_at(cd, x + AMOLED_PILL_CD_OFFSET_X, AMOLED_PILL_Y, true);
+    lv_obj_t *pct = lv_label_create(row);
+    lv_label_set_text(pct, "0%");
+    lv_obj_set_style_text_font(pct, pct_font, 0);
+    lv_obj_set_style_text_color(pct, lv_color_hex(0xF9F2DF), 0);
 
-    r->pill_tag = pill;
-    r->pill_countdown = cd;
+    lv_obj_t *cd = lv_label_create(row);
+    lv_label_set_text(cd, "");
+    lv_obj_set_style_text_font(cd, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(cd, lv_color_hex(0x5C5C5C), 0);
+
+    *out_pct = pct;
+    *out_cd  = cd;
+    return row;
+}
+
+/* Centre a container's vertical mid-point on (AMOLED_CX, center_y).
+ * Call after any text change so the row stays optically centred even
+ * as the percentage glyph count changes ("1%" → "100%"). */
+static void recenter_at(lv_obj_t *obj, int center_y)
+{
+    lv_obj_update_layout(obj);
+    int w = lv_obj_get_width(obj);
+    int h = lv_obj_get_height(obj);
+    lv_obj_set_pos(obj, AMOLED_CX - w / 2, center_y - h / 2);
 }
 
 static void build_agent_screen(void)
@@ -345,101 +359,123 @@ static void build_agent_screen(void)
     lv_obj_set_style_pad_all(scr, 0, 0);
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* Three rings, outer → inner. Row 0 is the headline (heaviest
-     * stroke), row 2 is the least-emphasised. */
+    /* Two rings, outer → inner. Row 0 is the headline (heaviest
+     * stroke), row 1 the secondary. */
     build_ring(scr, 0, AMOLED_R0_OUTER, AMOLED_R0_INNER);
     build_ring(scr, 1, AMOLED_R1_OUTER, AMOLED_R1_INNER);
-    build_ring(scr, 2, AMOLED_R2_OUTER, AMOLED_R2_INNER);
 
-    /* Header: flat "Usage" in the 90° top gap. */
-    s_header_label = lv_label_create(scr);
-    lv_label_set_text(s_header_label, "Usage");
-    lv_obj_set_style_text_font(s_header_label, &lv_font_montserrat_28, 0);
-    place_at(s_header_label, AMOLED_CX, AMOLED_HEADER_Y + 14, true);
-
-    /* Central core: brand icon + row-0 percent + row-0 type tag. */
+    /* Brand icon, 70×70, centred at (cx, icon_y). */
     s_core_icon = lv_image_create(scr);
-    lv_image_set_src(s_core_icon, &icon_claude);
-    place_at(s_core_icon, AMOLED_CX, AMOLED_CORE_ICON_Y, true);
+    lv_image_set_src(s_core_icon, &icon_claude_70);
+    lv_obj_align(s_core_icon, LV_ALIGN_TOP_LEFT,
+                 AMOLED_CX - 35, AMOLED_CORE_ICON_Y - 35);
 
-    s_core_primary = lv_label_create(scr);
-    lv_label_set_text(s_core_primary, "0%");
-    /* Montserrat 48 is not bundled by default — fall back to 28 until
-     * the font asset is added to the build. The HTML tuner previews
-     * 48 px; verify glyph asset is present before flipping this. */
-    lv_obj_set_style_text_font(s_core_primary, &lv_font_montserrat_28, 0);
-    lv_obj_set_style_text_color(s_core_primary, lv_color_hex(0xF9F2DF), 0);
-    place_at(s_core_primary, AMOLED_CX, AMOLED_CORE_PRIMARY_Y, true);
+    /* Primary stack: chip + (% + countdown) row. */
+    s_chip_primary = build_chip(scr, AMOLED_CORE_CHIP_PRIMARY_Y);
+    s_primary_row  = build_pct_row(scr, &lv_font_montserrat_48,
+                                   &s_core_primary, &s_core_primary_cd);
 
-    s_core_secondary = lv_label_create(scr);
-    lv_label_set_text(s_core_secondary, "");
-    lv_obj_set_style_text_font(s_core_secondary, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(s_core_secondary, lv_color_hex(0xB0ACA0), 0);
-    place_at(s_core_secondary, AMOLED_CX, AMOLED_CORE_SECONDARY_Y, true);
+    /* Secondary stack: chip + (% + countdown) row. */
+    s_chip_secondary = build_chip(scr, AMOLED_CORE_CHIP_SECONDARY_Y);
+    s_secondary_row  = build_pct_row(scr, &lv_font_montserrat_36,
+                                     &s_core_secondary, &s_core_secondary_cd);
 
-    /* Pills (R1 + R2) in the top gap. */
-    build_pill(scr, 1, AMOLED_PILL_R1_X);
-    build_pill(scr, 2, AMOLED_PILL_R2_X);
+    /* Footer band — two centred lines stacked at the bottom of the
+     * disc. M14 #5C5C5C, both full-width so centring is exact. */
+    s_footer_updated = lv_label_create(scr);
+    lv_label_set_text(s_footer_updated, "");
+    lv_obj_set_style_text_font(s_footer_updated, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_footer_updated, lv_color_hex(0x5C5C5C), 0);
+    lv_obj_set_style_text_align(s_footer_updated, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(s_footer_updated, AMOLED_FOOTER_WIDTH);
+    lv_label_set_long_mode(s_footer_updated, LV_LABEL_LONG_DOT);
+    lv_obj_align(s_footer_updated, LV_ALIGN_TOP_MID, 0,
+                 AMOLED_FOOTER_UPDATED_Y - 7);
 
-    /* Footer band — both labels at y=410, inside the safe disc. */
-    s_footer_left = lv_label_create(scr);
-    lv_obj_set_width(s_footer_left, AMOLED_FOOTER_LEFT_WIDTH);
-    lv_label_set_long_mode(s_footer_left, LV_LABEL_LONG_DOT);
-    lv_label_set_text(s_footer_left, "unpaired");
-    lv_obj_set_style_text_font(s_footer_left, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(s_footer_left, lv_color_hex(0x5C5C5C), 0);
-    lv_obj_align(s_footer_left, LV_ALIGN_TOP_LEFT,
-                 AMOLED_FOOTER_LEFT_X, AMOLED_FOOTER_Y - 8);
-
-    s_footer_right = lv_label_create(scr);
-    lv_label_set_text(s_footer_right, "");
-    lv_obj_set_style_text_font(s_footer_right, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(s_footer_right, lv_color_hex(0x5C5C5C), 0);
-    lv_obj_set_style_text_align(s_footer_right, LV_TEXT_ALIGN_RIGHT, 0);
-    /* Right-anchor: align to right side of footer, then shift left. */
-    lv_obj_align(s_footer_right, LV_ALIGN_TOP_LEFT,
-                 AMOLED_FOOTER_RIGHT_X - 160, AMOLED_FOOTER_Y - 8);
-    lv_obj_set_width(s_footer_right, 160);
+    s_footer_email = lv_label_create(scr);
+    lv_label_set_text(s_footer_email, "unpaired");
+    lv_obj_set_style_text_font(s_footer_email, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_footer_email, lv_color_hex(0x5C5C5C), 0);
+    lv_obj_set_style_text_align(s_footer_email, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(s_footer_email, AMOLED_FOOTER_WIDTH);
+    lv_label_set_long_mode(s_footer_email, LV_LABEL_LONG_DOT);
+    lv_obj_align(s_footer_email, LV_ALIGN_TOP_MID, 0,
+                 AMOLED_FOOTER_EMAIL_Y - 7);
 
     s_agent_screen = scr;
 }
 
-/* Hide a ring + its pill. */
-static void hide_ring(int idx)
+static void show_obj(lv_obj_t *o, bool visible)
 {
-    if (s_rings[idx].arc) lv_obj_add_flag(s_rings[idx].arc, LV_OBJ_FLAG_HIDDEN);
-    if (s_rings[idx].pill_tag) lv_obj_add_flag(s_rings[idx].pill_tag, LV_OBJ_FLAG_HIDDEN);
-    if (s_rings[idx].pill_countdown) lv_obj_add_flag(s_rings[idx].pill_countdown, LV_OBJ_FLAG_HIDDEN);
-}
-static void show_ring(int idx)
-{
-    if (s_rings[idx].arc) lv_obj_clear_flag(s_rings[idx].arc, LV_OBJ_FLAG_HIDDEN);
-    if (s_rings[idx].pill_tag) lv_obj_clear_flag(s_rings[idx].pill_tag, LV_OBJ_FLAG_HIDDEN);
-    if (s_rings[idx].pill_countdown) lv_obj_clear_flag(s_rings[idx].pill_countdown, LV_OBJ_FLAG_HIDDEN);
+    if (o == NULL) return;
+    if (visible) lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
+    else         lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void render_footer_locked(const agent_snapshot_t *snap)
 {
-    if (s_footer_left == NULL || s_footer_right == NULL) return;
+    if (s_footer_updated == NULL || s_footer_email == NULL) return;
     const char *cid = footer_cid_for(snap->agent);
     if (cid[0] == '\0') {
-        lv_label_set_text(s_footer_left, "unpaired");
-        lv_label_set_text(s_footer_right, "");
+        /* Unpaired: top empty, bottom = "unpaired". */
+        lv_label_set_text(s_footer_updated, "");
+        lv_label_set_text(s_footer_email, "unpaired");
         return;
     }
-    lv_label_set_text(s_footer_left, cid);
+    lv_label_set_text(s_footer_email, cid);
 
     char buf[32];
     format_updated_relative(snap->captured_at, buf, sizeof(buf));
-    lv_label_set_text(s_footer_right, buf);
+    /* format_updated_relative writes "" when the wall clock is unsynced —
+     * that already gives us the "top empty" state. */
+    lv_label_set_text(s_footer_updated, buf);
+}
+
+/* Render one (chip, pct_row, pct_label, countdown_label) stack from a
+ * session_snapshot. Hides the whole stack if `visible` is false. */
+static void render_stack_locked(bool visible,
+                                lv_obj_t *chip, int chip_y,
+                                lv_obj_t *row, int row_y,
+                                lv_obj_t *pct_label,
+                                lv_obj_t *cd_label,
+                                const session_snapshot_t *s,
+                                bool clock_synced, int64_t now)
+{
+    show_obj(chip, visible);
+    show_obj(row,  visible);
+    if (!visible) return;
+
+    float pct = s->used_pct;
+    if (pct < 0.0f) pct = 0.0f;
+    if (pct > 1.0f) pct = 1.0f;
+    if (clock_synced && now >= s->resets_at) {
+        pct = 0.0f;
+    }
+
+    char pct_buf[8];
+    snprintf(pct_buf, sizeof(pct_buf), "%d%%", (int)lroundf(pct * 100.0f));
+
+    char cd_buf[16];
+    if (clock_synced) {
+        format_countdown(s->resets_at - now, cd_buf, sizeof(cd_buf));
+    } else {
+        snprintf(cd_buf, sizeof(cd_buf), "syncing...");
+    }
+
+    lv_label_set_text(chip, s->type);
+    lv_label_set_text(pct_label, pct_buf);
+    lv_label_set_text(cd_label, cd_buf);
+
+    /* Re-centre the chip (label width depends on the type string) and
+     * the % row (% width depends on glyph count). */
+    recenter_at(chip, chip_y);
+    recenter_at(row, row_y);
 }
 
 static void render_snapshot_locked(const agent_snapshot_t *snap)
 {
-    /* Core icon + header. The header text is static "Usage" — agent
-     * identity is conveyed by the core icon and ring palette swap. */
+    /* Brand icon and palette swap. */
     lv_image_set_src(s_core_icon, agent_icon(snap->agent));
-    lv_label_set_text(s_header_label, "Usage");
 
     render_footer_locked(snap);
 
@@ -448,62 +484,41 @@ static void render_snapshot_locked(const agent_snapshot_t *snap)
     int64_t now = (int64_t)time(NULL);
     const bool clock_synced = now > 1700000000;
 
-    for (int i = 0; i < SNAPSHOT_MAX_SESSIONS; ++i) {
+    /* Per-ring arc update. */
+    for (int i = 0; i < AMOLED_NUM_RINGS; ++i) {
         ui_ring_t *r = &s_rings[i];
         if (r->arc == NULL) continue;
 
         if (i >= snap->session_count) {
-            hide_ring(i);
+            lv_obj_add_flag(r->arc, LV_OBJ_FLAG_HIDDEN);
             continue;
         }
-        show_ring(i);
+        lv_obj_clear_flag(r->arc, LV_OBJ_FLAG_HIDDEN);
 
         const session_snapshot_t *s = &snap->sessions[i];
         float pct = s->used_pct;
         if (pct < 0.0f) pct = 0.0f;
         if (pct > 1.0f) pct = 1.0f;
-        /* Post-reset auto-zero: once the wall clock crosses resets_at the
-         * old window is logically gone. Keep the arc at 0 until the next
-         * push delivers the new window's used_pct + resets_at. Mirrors
-         * the cyd2usb behaviour exactly. */
         if (clock_synced && now >= s->resets_at) {
             pct = 0.0f;
         }
-
-        /* Indicator value + colour. */
         lv_arc_set_value(r->arc, (int32_t)lroundf(pct * AMOLED_ARC_VALUE_RANGE));
         lv_obj_set_style_arc_color(r->arc, lv_color_hex(pal->rows[i]),
                                    LV_PART_INDICATOR);
-
-        char cd_buf[16];
-        if (clock_synced) {
-            format_countdown(s->resets_at - now, cd_buf, sizeof(cd_buf));
-        } else {
-            snprintf(cd_buf, sizeof(cd_buf), "syncing...");
-        }
-
-        if (i == 0) {
-            /* Row 0 → core: percent in the centre, type tag below. */
-            char pct_buf[8];
-            snprintf(pct_buf, sizeof(pct_buf), "%d%%", (int)lroundf(pct * 100.0f));
-            lv_label_set_text(s_core_primary, pct_buf);
-            lv_label_set_text(s_core_secondary, s->type);
-        } else {
-            /* Row 1 / 2 → top-gap pills with type + countdown. */
-            if (r->pill_tag) lv_label_set_text(r->pill_tag, s->type);
-            if (r->pill_countdown) lv_label_set_text(r->pill_countdown, cd_buf);
-        }
     }
 
-    /* If row 0 is the only visible row, clear the pills' text so a
-     * stale countdown doesn't linger. show_ring already clears
-     * hidden flags but does not touch text content. */
-    if (snap->session_count <= 1) {
-        if (s_rings[1].pill_tag) lv_label_set_text(s_rings[1].pill_tag, "");
-        if (s_rings[1].pill_countdown) lv_label_set_text(s_rings[1].pill_countdown, "");
-        if (s_rings[2].pill_tag) lv_label_set_text(s_rings[2].pill_tag, "");
-        if (s_rings[2].pill_countdown) lv_label_set_text(s_rings[2].pill_countdown, "");
-    }
+    /* Core stacks. The primary always shows (defensive against an
+     * impossible session_count==0); the secondary follows session_count. */
+    render_stack_locked(snap->session_count >= 1,
+                        s_chip_primary, AMOLED_CORE_CHIP_PRIMARY_Y,
+                        s_primary_row,  AMOLED_CORE_PRIMARY_Y,
+                        s_core_primary, s_core_primary_cd,
+                        &snap->sessions[0], clock_synced, now);
+    render_stack_locked(snap->session_count >= 2,
+                        s_chip_secondary, AMOLED_CORE_CHIP_SECONDARY_Y,
+                        s_secondary_row,  AMOLED_CORE_SECONDARY_Y,
+                        s_core_secondary, s_core_secondary_cd,
+                        &snap->sessions[1], clock_synced, now);
 }
 
 static void show_agent_locked(const agent_snapshot_t *snap)

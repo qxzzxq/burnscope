@@ -25,3 +25,10 @@ CONFIG_SPIRAM_SPEED_80M=y
 # in menuconfig if you have a different ESP32-S3 display board.
 CONFIG_BURNSCOPE_DISPLAY_CYD2USB_ST7789=
 CONFIG_BURNSCOPE_DISPLAY_AMOLED_SH8601=y
+
+# AMOLED ui.c renders the agent dial with a richer type ramp than CYD:
+# M48 for the primary % (display-size), M36 for the secondary %,
+# M14 for the footer + per-row countdowns. CYD keeps M10/M16/M24/M28.
+CONFIG_LV_FONT_MONTSERRAT_14=y
+CONFIG_LV_FONT_MONTSERRAT_36=y
+CONFIG_LV_FONT_MONTSERRAT_48=y

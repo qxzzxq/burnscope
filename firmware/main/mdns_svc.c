@@ -39,7 +39,16 @@ void mdns_svc_start(void)
     char hostname[32];
     snprintf(hostname, sizeof(hostname), "burnscope-%02x%02x", mac[4], mac[5]);
     ESP_ERROR_CHECK(mdns_hostname_set(hostname));
-    ESP_ERROR_CHECK(mdns_instance_name_set("BurnScope"));
+
+    /* Instance name carries the same MAC suffix so two devices on one LAN
+     * advertise as e.g. "BurnScope f64c" / "BurnScope 5730" instead of
+     * relying on Bonjour to auto-rename one to "BurnScope-2". The
+     * client's `device_id` keys off the hostname (which is unambiguous
+     * either way), but a human-readable, collision-free instance name
+     * makes `dns-sd -B` and other tooling much easier to read. */
+    char instance[40];
+    snprintf(instance, sizeof(instance), "BurnScope %02x%02x", mac[4], mac[5]);
+    ESP_ERROR_CHECK(mdns_instance_name_set(instance));
 
     mdns_txt_item_t txt[] = {
         { "version",       BURNSCOPE_FW_VERSION },

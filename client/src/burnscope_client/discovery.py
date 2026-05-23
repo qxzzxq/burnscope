@@ -111,7 +111,16 @@ async def _resolve(
     if not addresses or info.port is None:
         return
 
-    device_id = _instance_name(name, service_type)
+    # Prefer the mDNS hostname (`burnscope-<mac4>.local.`) as the device
+    # identifier — the firmware derives it from the WiFi MAC so it is
+    # genuinely unique per device. The mDNS *instance name* would be a
+    # poor choice: every BurnScope firmware sets it to the literal string
+    # "BurnScope", and Bonjour disambiguates collisions by appending
+    # "-2", "-3", … to whichever responder it heard from second. That
+    # ordering is unstable — the same physical device can appear as
+    # "BurnScope" one run and "BurnScope-2" the next — so anything we
+    # persisted under the instance name would silently re-key.
+    device_id = _device_id_from(info, name, service_type)
     if not device_id:
         return
 
@@ -126,6 +135,24 @@ async def _resolve(
     )
     sink[device_id] = device
     resolved_event.set()
+
+
+def _device_id_from(info: AsyncServiceInfo, name: str, service_type: str) -> str:
+    """Stable per-device identifier.
+
+    Preferred: the mDNS hostname (`info.server`), with the trailing
+    `.local.` stripped — uniquely derived from the device's MAC.
+    Fallback (only when the SRV record is somehow missing): the
+    instance-name portion of the mDNS name, which can collide.
+    """
+    server = info.server
+    if server:
+        host = server.rstrip(".")
+        if host.endswith(".local"):
+            host = host[: -len(".local")]
+        if host:
+            return host
+    return _instance_name(name, service_type)
 
 
 def _instance_name(name: str, service_type: str) -> str:

@@ -122,8 +122,8 @@ succeeds. Mismatches return `401 Unauthorized`.
 The firmware advertises one service on the LAN:
 
 - **Service type:** `_burnscope._tcp.local.`
-- **Instance name:** `BurnScope` (default mDNS instance)
-- **Hostname:** `burnscope-XXXX.local.` where `XXXX` is the last four hex digits of the device's Wi-Fi MAC
+- **Instance name:** `BurnScope XXXX` (where `XXXX` is the last four hex digits of the Wi-Fi MAC, lowercase) — unique per device so `dns-sd -B` shows the LAN cleanly without Bonjour's auto-disambiguation suffixes.
+- **Hostname:** `burnscope-XXXX.local.` (same MAC suffix as the instance name).
 - **Port:** `80`
 
 ### TXT records

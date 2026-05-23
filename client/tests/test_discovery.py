@@ -52,7 +52,15 @@ async def test_discover_returns_empty_on_timeout():
         assert d.device_id
 
 
-async def _register(zc: AsyncZeroconf, instance: str, port: int, *, paired_claude: bool, paired_codex: bool):
+async def _register(zc: AsyncZeroconf, hostname: str, port: int, *, paired_claude: bool, paired_codex: bool, instance: str = "BurnScope"):
+    """Register a fake BurnScope-like service.
+
+    `hostname` is what becomes the stable device_id on the client side
+    (the firmware derives it from the WiFi MAC). `instance` defaults to
+    "BurnScope" to mirror the real firmware, where every device sets the
+    same instance name and Bonjour disambiguates collisions by appending
+    -2/-3/... — making the instance name unstable.
+    """
     properties = {
         b"version": b"test",
         b"paired_claude": b"1" if paired_claude else b"0",
@@ -64,7 +72,7 @@ async def _register(zc: AsyncZeroconf, instance: str, port: int, *, paired_claud
         addresses=[socket.inet_aton("127.0.0.1")],
         port=port,
         properties=properties,
-        server=f"{instance}.local.",
+        server=f"{hostname}.local.",
     )
     await zc.async_register_service(info)
     return info
@@ -74,10 +82,12 @@ async def test_discover_all_returns_every_advertised_device():
     advertise_zc = AsyncZeroconf()
     browse_zc = AsyncZeroconf()
     info_a = await _register(
-        advertise_zc, "burnscope-a1a1", 4242, paired_claude=False, paired_codex=False
+        advertise_zc, "burnscope-a1a1", 4242,
+        paired_claude=False, paired_codex=False, instance="BurnScope-X",
     )
     info_b = await _register(
-        advertise_zc, "burnscope-b2b2", 4243, paired_claude=True, paired_codex=False
+        advertise_zc, "burnscope-b2b2", 4243,
+        paired_claude=True, paired_codex=False, instance="BurnScope-Y",
     )
     try:
         devices = await discover_all(timeout=2.5, zc=browse_zc)
@@ -99,10 +109,12 @@ async def test_discover_all_filters_by_agent():
     advertise_zc = AsyncZeroconf()
     browse_zc = AsyncZeroconf()
     info_free = await _register(
-        advertise_zc, "burnscope-free", 4244, paired_claude=False, paired_codex=False
+        advertise_zc, "burnscope-free", 4244,
+        paired_claude=False, paired_codex=False, instance="BurnScope-F",
     )
     info_taken = await _register(
-        advertise_zc, "burnscope-takn", 4245, paired_claude=True, paired_codex=False
+        advertise_zc, "burnscope-takn", 4245,
+        paired_claude=True, paired_codex=False, instance="BurnScope-T",
     )
     try:
         claude_devices = await discover_all(timeout=2.5, agent="claude", zc=browse_zc)
@@ -118,6 +130,54 @@ async def test_discover_all_filters_by_agent():
     # out of a claude-targeted browse — that's the whole point of the
     # multi-device redesign.
     assert "burnscope-takn" not in ids
+
+
+async def test_discover_all_uses_hostname_when_instance_name_collides():
+    """Two real BurnScopes ship with the same hardcoded instance name
+    "BurnScope"; Bonjour disambiguates by appending "-2" to whichever
+    responder it heard from second. That suffix assignment is
+    order-dependent, so the instance name is NOT a stable device_id.
+    The hostname (derived from the WiFi MAC) is. Verify discover_all
+    picks the hostname even when instance names collide."""
+    advertise_zc = AsyncZeroconf()
+    browse_zc = AsyncZeroconf()
+    # Both responders advertise the same instance name "BurnScope".
+    # zeroconf on the advertiser side will internally rename one of
+    # them; what we care about is that the CLIENT keys by hostname.
+    info_a = await _register(
+        advertise_zc, "burnscope-aaaa", 4250,
+        paired_claude=False, paired_codex=False, instance="BurnScope",
+    )
+    # allow_name_change mirrors real Bonjour: the second responder gets
+    # its instance renamed ("BurnScope" → "BurnScope-2") rather than
+    # rejected. That's exactly the collision we're hardening against.
+    info_b = ServiceInfo(
+        SERVICE_TYPE,
+        f"BurnScope.{SERVICE_TYPE}",
+        addresses=[socket.inet_aton("127.0.0.1")],
+        port=4251,
+        properties={
+            b"version": b"test",
+            b"paired_claude": b"0",
+            b"paired_codex": b"0",
+        },
+        server="burnscope-bbbb.local.",
+    )
+    await advertise_zc.async_register_service(info_b, allow_name_change=True)
+    try:
+        devices = await discover_all(timeout=2.5, zc=browse_zc)
+    finally:
+        await advertise_zc.async_unregister_service(info_a)
+        await advertise_zc.async_unregister_service(info_b)
+        await advertise_zc.async_close()
+        await browse_zc.async_close()
+
+    ids = {d.device_id for d in devices}
+    # Both unique hostnames must round-trip even though the instance
+    # names collided. A regression here means we'd silently re-key
+    # devices between discovery runs.
+    assert "burnscope-aaaa" in ids
+    assert "burnscope-bbbb" in ids
 
 
 async def test_discover_all_treats_legacy_firmware_as_paired():

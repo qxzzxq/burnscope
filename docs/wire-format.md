@@ -117,6 +117,41 @@ succeeds. Mismatches return `401 Unauthorized`.
 
 ---
 
+## mDNS advertisement
+
+The firmware advertises one service on the LAN:
+
+- **Service type:** `_burnscope._tcp.local.`
+- **Instance name:** `BurnScope` (default mDNS instance)
+- **Hostname:** `burnscope-XXXX.local.` where `XXXX` is the last four hex digits of the device's Wi-Fi MAC
+- **Port:** `80`
+
+### TXT records
+
+| Key             | Value         | Meaning |
+|-----------------|---------------|---------|
+| `version`       | string        | Firmware version (`BURNSCOPE_FW_VERSION`). |
+| `paired_claude` | `0` or `1`    | `1` iff the `claude` NVS pairing slot is non-empty. |
+| `paired_codex`  | `0` or `1`    | `1` iff the `codex` NVS pairing slot is non-empty. |
+
+The firmware updates the relevant `paired_<agent>` TXT item on every
+slot transition: from `0` to `1` when `authorize_summary` TOFU-binds
+a previously-empty slot, and from `1` to `0` when the factory-reset /
+re-provision path wipes the slots.
+
+`paired_<agent>` is an **advisory hint** for client filtering. The
+authoritative answer is still the HTTP response: a client may try to
+POST `/summary` against a device whose TXT advertised `paired_<agent>=0`
+and get `401 Unauthorized` if the TXT cache was stale (another client
+beat us to the claim). Conversely, a device showing `paired_<agent>=1`
+should be skipped — pushing against it will return `401` unless our
+client_id happens to match what's stored.
+
+Clients holding stale TXT data due to mDNS caching is normal; they
+fall back to the HTTP response (`204` claims, `401` skips).
+
+---
+
 ## Upstream → session mapping
 
 For collector implementers. The v2 client no longer scrapes

@@ -14,11 +14,23 @@ was removed; its history is preserved in git.
 
 ## Install
 
+This project uses [uv](https://docs.astral.sh/uv/); `uv.lock` pins the deps.
+
+For end-use (installs `burnscope` on PATH in an isolated venv):
+
 ```
-pip install -e .
+uv tool install .
 burnscope install claude    # patches ~/.claude/settings.json
 burnscope install codex     # macOS launchd or Linux systemd --user
 burnscope status            # confirm wiring
+```
+
+For development (creates `.venv/` here, installs dev deps from `[dependency-groups]`):
+
+```
+uv sync
+uv run burnscope status     # invoke via the project venv
+uv run pytest               # run the test suite
 ```
 
 ## Debugging

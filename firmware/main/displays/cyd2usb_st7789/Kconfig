@@ -1,0 +1,2 @@
+config BURNSCOPE_DISPLAY_CYD2USB_ST7789
+    bool "Cheap Yellow Display (cyd2usb, ST7789 320x240 landscape)"

@@ -11,9 +11,12 @@
  * and links its driver + ui translation units; main.c calls only the symbols
  * declared below and never sees `lv_display_t *` or panel internals.
  *
- * To add a new screen, drop in `displays/<name>/{driver.c,ui.c}`, expose a
- * `bool` Kconfig under the `BURNSCOPE_DISPLAY` choice, and gate the new
- * sources from `main/CMakeLists.txt`.
+ * To add a new screen, drop in `displays/<name>/` with four files —
+ * `driver.c`, `ui.c`, `Kconfig` (one `config BURNSCOPE_DISPLAY_<NAME>`
+ * line), and `sources.cmake` (Kconfig-guarded source/include append) —
+ * then add one `rsource "displays/<name>/Kconfig"` line to the
+ * `BURNSCOPE_DISPLAY` choice in `main/Kconfig.projbuild`. No other files
+ * in `main/` need to change.
  */
 
 /**

@@ -256,7 +256,11 @@ async def _resolve_paired_devices(
         return cached
 
     log.info("paired-devices.%s empty; running auto-pair discovery", AGENT_NAME)
-    discovered = await discover_all(timeout=DISCOVERY_TIMEOUT_S, agent=AGENT_NAME)
+    # Don't pre-filter by `paired_<agent>=0`: a device with the slot
+    # already TOFU-bound to *us* will return 204 and we want to recover
+    # it (migration from a wiped paired-devices.json). Devices owned by
+    # someone else return 401 and are silently skipped below.
+    discovered = await discover_all(timeout=DISCOVERY_TIMEOUT_S)
     if not discovered:
         log.info("auto-pair discovery found no claimable devices")
         return []

@@ -379,9 +379,10 @@ class CodexDaemon:
             return cached
         log.info("paired-devices.%s empty; running auto-pair discovery", AGENT_NAME)
         assert self._client_id is not None
-        discovered = await discover_all(
-            timeout=DISCOVERY_TIMEOUT_S, agent=AGENT_NAME
-        )
+        # Unfiltered so devices already TOFU-bound to us (paired_<agent>=1
+        # with our client_id) get re-claimed after a paired-devices.json
+        # wipe. Mismatches are silently skipped on 401 below.
+        discovered = await discover_all(timeout=DISCOVERY_TIMEOUT_S)
         claimed: list[PairedDevice] = []
         for device in discovered:
             candidate = PairedDevice(device_id=device.device_id, host=device.host)

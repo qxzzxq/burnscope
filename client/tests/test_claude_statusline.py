@@ -158,7 +158,6 @@ def test_push_auto_pairs_when_paired_list_empty(monkeypatch):
     from burnscope_client.discovery import DiscoveredDevice
 
     async def fake_discover_all(timeout=10.0, agent=None, zc=None):
-        assert agent == "claude"
         return [
             DiscoveredDevice("dev-free-1", "10.0.0.5:80", False, False),
             DiscoveredDevice("dev-free-2", "10.0.0.6:80", False, True),

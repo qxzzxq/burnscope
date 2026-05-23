@@ -10,10 +10,12 @@ Two modes, selected by `--push`:
   same module with `--push`.
 
 * **`--push` (detached child)** — reads the AgentSnapshot JSON from stdin,
-  resolves the host via the mDNS cache, derives the client_id from
-  `~/.claude.json` (`oauthAccount.organizationUuid`), POSTs to the ESP32,
-  and writes the outcome to `~/.burnscope/last-push.claude` for the next
-  foreground fire to render as the ✓/✗ indicator.
+  resolves the per-agent paired-device list (auto-pairing any unclaimed
+  display on the LAN when the list is empty), fans out `POST /summary` to
+  every paired device with the cached client_id, and writes the aggregate
+  outcome to `~/.burnscope/last-push.claude` (drives the next foreground
+  fire's ✓/✗ indicator) plus per-device outcomes for `burnscope status`.
+  Devices that 401 are silently dropped from the agent's paired list.
 
 See `docs/client-spec-v2.html` § 6 for the per-fire lifecycle.
 
@@ -48,9 +50,13 @@ import httpx  # noqa: E402
 
 from . import host_cache, identity  # noqa: E402
 from ._log import configure_logging  # noqa: E402
-from .discovery import discover_esp32  # noqa: E402
-from .pusher import PushAuthError, PushError, push  # noqa: E402
+from .discovery import discover_all  # noqa: E402
+from .host_cache import PairedDevice  # noqa: E402
+from .pusher import PushAuthError, PushError, push, push_to_all  # noqa: E402
 from .schema import AgentSnapshot, SessionSnapshot  # noqa: E402
+
+AGENT_NAME = "claude"
+DISCOVERY_TIMEOUT_S = 4.0
 
 log = logging.getLogger(__name__)
 
@@ -172,7 +178,9 @@ def _spawn_push_child(snapshot: AgentSnapshot) -> None:
 
 
 def _push_mode() -> int:
-    """Detached child: discover host, derive client_id, POST, write outcome."""
+    """Detached child: resolve devices, fan out POST, write outcomes."""
+    host_cache.migrate_legacy_host_file()
+
     try:
         raw = sys.stdin.read()
         snap_dict = json.loads(raw)
@@ -183,59 +191,94 @@ def _push_mode() -> int:
         )
     except (ValueError, KeyError, TypeError) as exc:
         log.error("invalid snapshot on stdin: %s", exc)
-        host_cache.write_push_state("claude", ok=False)
+        host_cache.write_push_state(AGENT_NAME, ok=False)
         return 1
 
-    client_id = host_cache.read_client_id("claude")
+    client_id = _resolve_client_id()
     if client_id is None:
-        log.debug("client_id cache miss; reading ~/.claude.json")
-        try:
-            client_id = identity.claude_user_identifier()
-        except identity.IdentityError as exc:
-            log.error("could not derive client_id: %s", exc)
-            host_cache.write_push_state("claude", ok=False)
-            return 1
-        host_cache.write_client_id("claude", client_id)
-        log.debug("client_id resolved and cached: %s", client_id)
-    else:
-        log.debug("client_id cache hit: %s", client_id)
-
-    try:
-        asyncio.run(_do_push(snapshot, client_id))
-    except PushAuthError as exc:
-        log.error("auth rejected by ESP32: %s", exc)
-        host_cache.write_push_state("claude", ok=False)
-        return 1
-    except PushError as exc:
-        log.warning("push failed, invalidating host cache: %s", exc)
-        host_cache.invalidate_host()
-        host_cache.write_push_state("claude", ok=False)
+        host_cache.write_push_state(AGENT_NAME, ok=False)
         return 1
 
-    host_cache.write_push_state("claude", ok=True)
-    return 0
+    return asyncio.run(_do_fanout(snapshot, client_id))
 
 
-async def _do_push(snapshot: AgentSnapshot, client_id: str) -> None:
-    host = await _resolve_host()
-    if host is None:
-        raise PushError("mDNS discovery found no BurnScope ESP32 on the LAN")
-    async with httpx.AsyncClient() as client:
-        await push(snapshot, host, client_id, client)
-
-
-async def _resolve_host() -> str | None:
-    """Use the cached host if present; otherwise rediscover and cache."""
-    cached = host_cache.load_host()
-    if cached:
-        log.debug("host cache hit: %s", cached)
+def _resolve_client_id() -> str | None:
+    """Return the cached client_id, deriving from ~/.claude.json on miss."""
+    cached = host_cache.read_client_id(AGENT_NAME)
+    if cached is not None:
+        log.debug("client_id cache hit: %s", cached)
         return cached
-    log.debug("host cache miss; running mDNS discovery")
-    found = await discover_esp32()
-    if found:
-        host_cache.store_host(found)
-        log.debug("host cached: %s", found)
-    return found
+    log.debug("client_id cache miss; reading ~/.claude.json")
+    try:
+        derived = identity.claude_user_identifier()
+    except identity.IdentityError as exc:
+        log.error("could not derive client_id: %s", exc)
+        return None
+    host_cache.write_client_id(AGENT_NAME, derived)
+    log.debug("client_id resolved and cached: %s", derived)
+    return derived
+
+
+async def _do_fanout(snapshot: AgentSnapshot, client_id: str) -> int:
+    async with httpx.AsyncClient() as client:
+        devices = await _resolve_paired_devices(snapshot, client_id, client)
+        if not devices:
+            log.warning("no paired devices and discovery found nothing claimable")
+            host_cache.write_push_state(AGENT_NAME, ok=False)
+            return 1
+
+        results = await push_to_all(snapshot, devices, client_id, client)
+
+    overall_ok = True
+    for device_id, result in results.items():
+        host_cache.write_push_state(
+            AGENT_NAME, ok=result.ok, device_id=device_id
+        )
+        if result.kind == "auth":
+            log.info("dropping %s from claude paired list (401)", device_id)
+            host_cache.remove_paired_device(AGENT_NAME, device_id)
+        if not result.ok:
+            overall_ok = False
+
+    host_cache.write_push_state(AGENT_NAME, ok=overall_ok)
+    return 0 if overall_ok else 1
+
+
+async def _resolve_paired_devices(
+    snapshot: AgentSnapshot,
+    client_id: str,
+    client: httpx.AsyncClient,
+) -> list[PairedDevice]:
+    """Steady-state: return the cached list. First run: discover + claim."""
+    cached = host_cache.load_paired_devices(AGENT_NAME)
+    if cached:
+        log.debug("paired-devices.%s hit (%d device(s))", AGENT_NAME, len(cached))
+        return cached
+
+    log.info("paired-devices.%s empty; running auto-pair discovery", AGENT_NAME)
+    discovered = await discover_all(timeout=DISCOVERY_TIMEOUT_S, agent=AGENT_NAME)
+    if not discovered:
+        log.info("auto-pair discovery found no claimable devices")
+        return []
+
+    claimed: list[PairedDevice] = []
+    for device in discovered:
+        candidate = PairedDevice(device_id=device.device_id, host=device.host)
+        try:
+            await push(snapshot, candidate.host, client_id, client)
+        except PushAuthError:
+            log.info("auto-pair skipped %s (401)", candidate.device_id)
+            continue
+        except PushError as exc:
+            log.info("auto-pair skipped %s (transport): %s", candidate.device_id, exc)
+            continue
+        log.info("auto-pair claimed %s at %s", candidate.device_id, candidate.host)
+        host_cache.add_paired_device(AGENT_NAME, candidate)
+        host_cache.write_push_state(
+            AGENT_NAME, ok=True, device_id=candidate.device_id
+        )
+        claimed.append(candidate)
+    return claimed
 
 
 if __name__ == "__main__":

@@ -16,6 +16,8 @@ from burnscope_client.codex_daemon import (
     _firmware_diverged,
     _snapshot_from_rate_limits,
 )
+from burnscope_client.host_cache import PairedDevice
+from burnscope_client.pusher import PushResult
 from burnscope_client.schema import AgentSnapshot, SessionSnapshot
 
 
@@ -387,48 +389,138 @@ async def test_dispatch_propagates_error_to_pending_request():
         await fut
 
 
-async def test_pusher_loop_writes_ok_on_success(monkeypatch):
-    daemon = CodexDaemon()
-    daemon._client_id = "y" * 64
-    host_cache.store_host("esp.local:80")
+async def _drain_one_push(daemon: CodexDaemon, *, predicate, max_iter=50):
+    """Run the pusher loop briefly, until `predicate()` is True."""
+    task = asyncio.create_task(daemon._pusher_loop())
+    try:
+        for _ in range(max_iter):
+            if predicate():
+                return
+            await asyncio.sleep(0.01)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
-    captured: list[Any] = []
+
+async def test_pusher_loop_fans_out_and_writes_per_device_state(monkeypatch):
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+    host_cache.add_paired_device("codex", PairedDevice("dev-a", "10.0.0.5:80"))
+    host_cache.add_paired_device("codex", PairedDevice("dev-b", "10.0.0.6:80"))
+
+    seen: list[tuple[str, ...]] = []
+
+    async def fake_push_to_all(snapshot, devices, client_id, client):
+        seen.append(tuple(d.device_id for d in devices))
+        return {d.device_id: PushResult(d.device_id, True, "ok") for d in devices}
+
+    monkeypatch.setattr(codex_daemon, "push_to_all", fake_push_to_all)
+
+    daemon._enqueue_snapshot(
+        AgentSnapshot(
+            agent="codex",
+            captured_at=1,
+            sessions=[SessionSnapshot("primary", 0.5, 1779066600)],
+        )
+    )
+    await _drain_one_push(
+        daemon,
+        predicate=lambda: host_cache.read_push_state("codex") is not None,
+    )
+
+    assert seen and set(seen[0]) == {"dev-a", "dev-b"}
+    assert host_cache.read_push_state("codex")["ok"] is True
+    assert host_cache.read_push_state("codex", device_id="dev-a")["ok"] is True
+    assert host_cache.read_push_state("codex", device_id="dev-b")["ok"] is True
+
+
+async def test_pusher_loop_silently_drops_device_on_401(monkeypatch):
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+    host_cache.add_paired_device("codex", PairedDevice("dev-keep", "10.0.0.5:80"))
+    host_cache.add_paired_device("codex", PairedDevice("dev-drop", "10.0.0.6:80"))
+
+    async def fake_push_to_all(snapshot, devices, client_id, client):
+        return {
+            "dev-keep": PushResult("dev-keep", True,  "ok"),
+            "dev-drop": PushResult("dev-drop", False, "auth"),
+        }
+
+    monkeypatch.setattr(codex_daemon, "push_to_all", fake_push_to_all)
+
+    daemon._enqueue_snapshot(
+        AgentSnapshot(
+            agent="codex",
+            captured_at=1,
+            sessions=[SessionSnapshot("primary", 0.5, 1779066600)],
+        )
+    )
+    await _drain_one_push(
+        daemon,
+        predicate=lambda: any(
+            d.device_id == "dev-drop"
+            for d in host_cache.load_paired_devices("codex")
+        ) is False,
+    )
+
+    remaining = {d.device_id for d in host_cache.load_paired_devices("codex")}
+    assert remaining == {"dev-keep"}
+
+
+async def test_pusher_loop_keeps_device_and_records_failure_on_transport(monkeypatch):
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+    host_cache.add_paired_device("codex", PairedDevice("dev-flaky", "10.0.0.5:80"))
+
+    async def fake_push_to_all(snapshot, devices, client_id, client):
+        return {"dev-flaky": PushResult("dev-flaky", False, "transport")}
+
+    monkeypatch.setattr(codex_daemon, "push_to_all", fake_push_to_all)
+
+    daemon._enqueue_snapshot(
+        AgentSnapshot(
+            agent="codex",
+            captured_at=1,
+            sessions=[SessionSnapshot("primary", 0.5, 1779066600)],
+        )
+    )
+    await _drain_one_push(
+        daemon,
+        predicate=lambda: host_cache.read_push_state("codex") is not None,
+    )
+
+    # Device stays in the paired list — transport failure isn't ownership.
+    assert {d.device_id for d in host_cache.load_paired_devices("codex")} == {
+        "dev-flaky"
+    }
+    assert host_cache.read_push_state("codex", device_id="dev-flaky")["ok"] is False
+    assert host_cache.read_push_state("codex")["ok"] is False
+
+
+async def test_pusher_loop_auto_pairs_when_empty(monkeypatch):
+    """Empty paired list triggers discover_all + per-device claim."""
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+
+    from burnscope_client.discovery import DiscoveredDevice
+
+    async def fake_discover_all(timeout=10.0, agent=None, zc=None):
+        return [DiscoveredDevice("dev-new", "10.0.0.5:80", False, False)]
+
+    monkeypatch.setattr(codex_daemon, "discover_all", fake_discover_all)
+
+    claimed = []
 
     async def fake_push(snap, host, client_id, client):
-        captured.append((snap, host, client_id))
+        claimed.append((host, client_id))
 
     monkeypatch.setattr(codex_daemon, "push", fake_push)
 
-    snap = AgentSnapshot(
-        agent="codex",
-        captured_at=1,
-        sessions=[SessionSnapshot("primary", 0.5, 1779066600)],
-    )
-    daemon._enqueue_snapshot(snap)
+    async def fake_push_to_all(snapshot, devices, client_id, client):
+        return {d.device_id: PushResult(d.device_id, True, "ok") for d in devices}
 
-    task = asyncio.create_task(daemon._pusher_loop())
-    # Let the pusher consume the single queued snapshot.
-    for _ in range(50):
-        if captured:
-            break
-        await asyncio.sleep(0.01)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    assert captured and captured[0][1] == "esp.local:80"
-    assert host_cache.read_push_state("codex")["ok"] is True
-
-
-async def test_pusher_loop_invalidates_host_on_push_error(monkeypatch):
-    daemon = CodexDaemon()
-    daemon._client_id = "y" * 64
-    host_cache.store_host("esp.local:80")
-
-    async def fake_push(*args, **kwargs):
-        raise codex_daemon.PushError("transport boom")
-
-    monkeypatch.setattr(codex_daemon, "push", fake_push)
+    monkeypatch.setattr(codex_daemon, "push_to_all", fake_push_to_all)
 
     daemon._enqueue_snapshot(
         AgentSnapshot(
@@ -437,50 +529,18 @@ async def test_pusher_loop_invalidates_host_on_push_error(monkeypatch):
             sessions=[SessionSnapshot("primary", 0.5, 1779066600)],
         )
     )
-
-    task = asyncio.create_task(daemon._pusher_loop())
-    for _ in range(50):
-        if host_cache.load_host() is None:
-            break
-        await asyncio.sleep(0.01)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    assert host_cache.load_host() is None
-    assert host_cache.read_push_state("codex")["ok"] is False
-
-
-async def test_pusher_loop_preserves_host_cache_on_auth_error(monkeypatch):
-    daemon = CodexDaemon()
-    daemon._client_id = "y" * 64
-    host_cache.store_host("esp.local:80")
-
-    async def fake_push(*args, **kwargs):
-        raise codex_daemon.PushAuthError("401")
-
-    monkeypatch.setattr(codex_daemon, "push", fake_push)
-
-    daemon._enqueue_snapshot(
-        AgentSnapshot(
-            agent="codex",
-            captured_at=1,
-            sessions=[SessionSnapshot("primary", 0.5, 1779066600)],
-        )
+    await _drain_one_push(
+        daemon,
+        predicate=lambda: any(
+            d.device_id == "dev-new"
+            for d in host_cache.load_paired_devices("codex")
+        ),
     )
 
-    task = asyncio.create_task(daemon._pusher_loop())
-    for _ in range(50):
-        state = host_cache.read_push_state("codex")
-        if state is not None:
-            break
-        await asyncio.sleep(0.01)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    assert host_cache.load_host() == "esp.local:80"  # not invalidated
-    assert host_cache.read_push_state("codex")["ok"] is False
+    assert claimed and claimed[0] == ("10.0.0.5:80", "u@example.com")
+    assert {d.device_id for d in host_cache.load_paired_devices("codex")} == {
+        "dev-new"
+    }
 
 
 def test_enqueue_bounded_caps_queue_and_keeps_newest():

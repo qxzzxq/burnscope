@@ -113,7 +113,7 @@ Centred in the disc, no rim usage.
 |--------------------|-------------|----------------------------|------------|
 | "BurnScope" title  | (233, 180)  | Montserrat 28              | `#F9F2DF` |
 | Status line        | (233, 233)  | Montserrat 24, max width 360 px, wrap | `#F9F2DF` |
-| `v<BURNSCOPE_FW_VERSION>` | (233, 300) | Montserrat 14         | `#808080` |
+| `v<BURNSCOPE_FW_VERSION>` | (233, 410) | Montserrat 14         | `#808080` |
 
 Background `#000000`. No splash logo — the agent icons only appear on
 the data screen.

@@ -257,7 +257,11 @@ static void build_splash(lv_display_t *disp)
     lv_label_set_text(version, "v" BURNSCOPE_FW_VERSION);
     lv_obj_set_style_text_font(version, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(version, lv_color_hex(0x808080), 0);
-    lv_obj_align(version, LV_ALIGN_TOP_MID, 0, 300 - 8);
+    /* y=410 — same band as the agent-screen footer. Provisioning's
+     * three-line splash ("Setup mode / Join … / Open 192.168.4.1") at
+     * M24 overruns the spec'd y=300 slot, so we sink the version into
+     * the footer ring instead. */
+    lv_obj_align(version, LV_ALIGN_TOP_MID, 0, 410 - 8);
 
     s_splash_screen = scr;
     lv_screen_load(s_splash_screen);

@@ -45,15 +45,22 @@ See:
 
 ## Installing the client
 
-The CLI entry point is `burnscope-client` (installer/status only, not a
-daemon entry).
+The CLI entry point is `burnscope` (installer/status only, not a daemon
+entry). Install it with [uv](https://docs.astral.sh/uv/) — `client/uv.lock`
+pins the deps.
 
 ```bash
-pip install -e ./client
-burnscope-client install claude   # writes Claude Code statusline hook
-burnscope-client install codex    # launchd (macOS) or systemd --user (Linux)
-burnscope-client status           # confirm wiring + last push outcomes
-burnscope-client pair-reset       # forget cached host + per-agent client_ids
+uv tool install ./client          # installs `burnscope` on PATH
+burnscope install claude          # writes Claude Code statusline hook
+burnscope install codex           # launchd (macOS) or systemd --user (Linux)
+burnscope status                  # confirm wiring + last push outcomes
+burnscope pair-reset              # forget cached host + per-agent client_ids
+```
+
+For an editable install (source changes picked up automatically):
+
+```bash
+uv tool install --editable ./client
 ```
 
 `install` is per-agent — install only the ones you use. The status command

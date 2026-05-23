@@ -451,11 +451,11 @@
     cx: 233, cy: 233,
     safe_radius: 220,
     /* Two concentric arcs only — primary (R0) + secondary (R1). The
-     * core stacks both percentages vertically; countdowns ride above
-     * each as small chips. */
+     * core stacks both percentages vertically; the session `type`
+     * (e.g. "current"/"weekly") rides above each as a small chip. */
     rings: [
-      { outer: 215, inner: 197 },
-      { outer: 192, inner: 178 },
+      { outer: 215, inner: 190 },
+      { outer: 184, inner: 164 },
     ],
     arc_start_deg: 135,
     arc_sweep_deg: 270,
@@ -463,26 +463,30 @@
     core: {
       icon_size: 70,
       icon_y: 130,
-      /* Countdown chip above the primary % (e.g., "5h"). */
+      /* Type chip above the primary % (e.g., "current"). */
       chip_primary_y: 195,
       /* Primary % (row 0). */
       primary_y: 235,
       primary_font: 60,
-      /* Countdown chip above the secondary % (e.g., "7d"). */
+      /* Type chip above the secondary % (e.g., "weekly"). */
       chip_secondary_y: 285,
       /* Secondary % (row 1) — replaces the old type-tag slot. */
       secondary_y: 315,
       secondary_font: 35,
-      /* Shared chip styling for both countdown chips. */
+      /* Shared chip styling for both type chips. */
       chip_font: 15,
       chip_radius: 4,
       chip_pad_h: 5,
       chip_pad_v: 3,
+      /* Countdown ("5h 32m") rides to the right of each percentage,
+       * baseline-aligned, with this horizontal gap from the % glyphs. */
+      countdown_gap: 10,
+      countdown_font: 14,
     },
     /* Footer is two centred lines stacked at the bottom of the disc:
      * `updated_y` carries the relative timestamp ("updated 3 min ago");
      * `email_y` carries the user identifier underneath it. */
-    footer: { updated_y: 410, email_y: 430, font: 14 },
+    footer: { updated_y: 410, email_y: 430, font: 16 },
     data: {
       agent: "claude",
       session_count: 2,
@@ -490,8 +494,8 @@
        * show the same chip text. "current" = the rolling window, "weekly"
        * = the weekly quota — these are the wire-format `type` values. */
       sessions: [
-        { type: "current", pct: 0.78, countdown: "5h" },
-        { type: "weekly",  pct: 0.40, countdown: "7d" },
+        { type: "current", pct: 0.78, countdown: "5h 32m" },
+        { type: "weekly",  pct: 0.40, countdown: "2d 14h" },
       ],
       client_id: "user@example.com",
       updated_phrase: "updated 3 min ago",
@@ -580,24 +584,56 @@
     s += `<div class="core-icon" style="left:${S.cx}px; top:${C.icon_y}px; width:${C.icon_size}px; height:${C.icon_size}px;">${ICON[D.agent]}</div>`;
 
     // Both percentages live in the core, stacked vertically. Each has
-    // a small countdown chip riding directly above it.
+    // a small chip riding above (session `type`) and a countdown
+    // ("reset time") floating to the right of the % glyphs.
     const chipStyle =
       `font-size:${C.chip_font}px;` +
       `border-radius:${C.chip_radius}px;` +
       `padding:${C.chip_pad_v}px ${C.chip_pad_h}px;`;
 
+    /* renderPctRow — emit a centred percentage with a countdown that
+     * hangs off the right edge of the % glyphs. The countdown is an
+     * absolutely-positioned child of the % `<span>`, anchored to the
+     * span's right edge (`left:100%`) and bottom (`bottom:0`) so its
+     * baseline aligns with the % baseline. The wrapper is full-width
+     * + text-align:center, which keeps the % centred regardless of
+     * the countdown's width — mirroring `recenter_at(pct_label)` +
+     * countdown-right-of-pct in `ui.c`. */
+    function renderPctRow(klass, pctY, pctFont, color, session) {
+      const pctText = `${Math.round(session.pct * 100)}%`;
+      const cdText  = session.countdown || "";
+      const wrapStyle =
+        `position:absolute; left:0; right:0; top:${pctY}px;` +
+        `text-align:center; transform:translateY(-50%);` +
+        `font-family:'Montserrat', sans-serif; line-height:1;` +
+        `color:${color};`;
+      const pctSpanStyle =
+        `position:relative; display:inline-block;` +
+        `font-size:${pctFont}px; font-weight:${klass === "primary" ? 500 : 400};`;
+      const cdSpanStyle =
+        `position:absolute; left:100%; bottom:0;` +
+        `margin-left:${C.countdown_gap}px;` +
+        `font-size:${C.countdown_font}px; color:#5C5C5C;` +
+        `line-height:1; white-space:nowrap;`;
+      return (
+        `<div class="core-pct-row core-${klass}" style="${wrapStyle}">` +
+          `<span style="${pctSpanStyle}">${escapeHTML(pctText)}` +
+            (cdText ? `<span style="${cdSpanStyle}">${escapeHTML(cdText)}</span>` : "") +
+          `</span>` +
+        `</div>`
+      );
+    }
+
     /* Chip text = session `type` (e.g., "current"/"weekly") — matches
      * CYD's font-preview chip labels. The wire-format type field drives
      * this; the firmware renders it verbatim. */
     if (D.session_count >= 1) {
-      const primaryText = `${Math.round(D.sessions[0].pct * 100)}%`;
       s += `<div class="pill core-chip" style="left:${S.cx}px; top:${C.chip_primary_y}px; ${chipStyle}">${escapeHTML(D.sessions[0].type)}</div>`;
-      s += `<div class="core-primary" style="top:${C.primary_y}px; font-size:${C.primary_font}px;">${primaryText}</div>`;
+      s += renderPctRow("primary", C.primary_y, C.primary_font, "#F9F2DF", D.sessions[0]);
     }
     if (D.session_count >= 2) {
-      const secondaryText = `${Math.round(D.sessions[1].pct * 100)}%`;
       s += `<div class="pill core-chip" style="left:${S.cx}px; top:${C.chip_secondary_y}px; ${chipStyle}">${escapeHTML(D.sessions[1].type)}</div>`;
-      s += `<div class="core-secondary" style="top:${C.secondary_y}px; font-size:${C.secondary_font}px; color:#F9F2DF;">${secondaryText}</div>`;
+      s += renderPctRow("secondary", C.secondary_y, C.secondary_font, "#F9F2DF", D.sessions[1]);
     }
 
     // Footer.
@@ -643,6 +679,8 @@
     lines.push(`#define AMOLED_CORE_CHIP_RADIUS    ${C.chip_radius}`);
     lines.push(`#define AMOLED_CORE_CHIP_PAD_H     ${C.chip_pad_h}`);
     lines.push(`#define AMOLED_CORE_CHIP_PAD_V     ${C.chip_pad_v}`);
+    lines.push(`#define AMOLED_CORE_COUNTDOWN_GAP  ${C.countdown_gap}`);
+    lines.push(`#define AMOLED_CORE_COUNTDOWN_FONT ${C.countdown_font}`);
     lines.push(`#define AMOLED_FOOTER_UPDATED_Y    ${S.footer.updated_y}`);
     lines.push(`#define AMOLED_FOOTER_EMAIL_Y      ${S.footer.email_y}`);
     lines.push(`#define AMOLED_FOOTER_FONT         ${S.footer.font}`);

@@ -47,9 +47,12 @@ _MAX_CLIENT_ID_LEN = 254  # RFC 5321 email cap; leaves headroom for userIDs.
 class PairedDevice:
     """One ESP32 display claimed by this laptop for a given agent.
 
-    `device_id` is the mDNS instance name (e.g. `burnscope-a1b2`),
-    stable across IP changes. `host` is the current `host:port` the
-    device was last seen at.
+    `device_id` matches `DiscoveredDevice.device_id` — derived from
+    the mDNS hostname (`info.server`, e.g. `burnscope-a1b2`), which
+    the firmware seeds from the WiFi MAC. It is stable across IP
+    changes and unique per unit, so it's safe as the dictionary key
+    on disk. `host` is the current `host:port` the device was last
+    seen at.
     """
 
     device_id: str

@@ -202,11 +202,29 @@ def _push_mode() -> int:
     return asyncio.run(_do_fanout(snapshot, client_id))
 
 
+def _redact_client_id(client_id: str) -> str:
+    """Return a debug-safe form of a client_id (typically an email).
+
+    Logs from the statusline child get written to whatever path the user
+    sets in `BURNSCOPE_LOG_FILE`; the file may end up shared (a Gist, a
+    bug report). Show enough to confirm "the right id is in use" without
+    spilling the full address.
+    """
+    if not client_id:
+        return "<empty>"
+    if "@" in client_id:
+        local, _, domain = client_id.partition("@")
+        head = local[:2] if len(local) > 2 else local[:1]
+        return f"{head}***@{domain}"
+    head = client_id[:2] if len(client_id) > 2 else client_id[:1]
+    return f"{head}*** ({len(client_id)} chars)"
+
+
 def _resolve_client_id() -> str | None:
     """Return the cached client_id, deriving from ~/.claude.json on miss."""
     cached = host_cache.read_client_id(AGENT_NAME)
     if cached is not None:
-        log.debug("client_id cache hit: %s", cached)
+        log.debug("client_id cache hit: %s", _redact_client_id(cached))
         return cached
     log.debug("client_id cache miss; reading ~/.claude.json")
     try:
@@ -215,7 +233,7 @@ def _resolve_client_id() -> str | None:
         log.error("could not derive client_id: %s", exc)
         return None
     host_cache.write_client_id(AGENT_NAME, derived)
-    log.debug("client_id resolved and cached: %s", derived)
+    log.debug("client_id resolved and cached: %s", _redact_client_id(derived))
     return derived
 
 

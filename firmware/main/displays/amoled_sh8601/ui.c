@@ -50,9 +50,9 @@ static const char *TAG = "render";
 #define AMOLED_SAFE_RADIUS             220
 
 #define AMOLED_R0_OUTER                215
-#define AMOLED_R0_INNER                197   /* stroke 18 */
-#define AMOLED_R1_OUTER                192
-#define AMOLED_R1_INNER                178   /* stroke 14 */
+#define AMOLED_R0_INNER                190   /* stroke 25 */
+#define AMOLED_R1_OUTER                184
+#define AMOLED_R1_INNER                164   /* stroke 20 */
 /* R2 removed — preview is a 2-ring design. SNAPSHOT_MAX_SESSIONS in
  * snapshot.h is unchanged; we simply ignore any third slot on AMOLED. */
 
@@ -235,10 +235,10 @@ static void build_splash(lv_display_t *disp)
 
     lv_obj_t *version = lv_label_create(scr);
     lv_label_set_text(version, "v" BURNSCOPE_FW_VERSION);
-    lv_obj_set_style_text_font(version, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(version, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(version, lv_color_hex(0x808080), 0);
     /* y=410 — same band as the agent-screen footer. */
-    lv_obj_align(version, LV_ALIGN_TOP_MID, 0, 410 - 7);
+    lv_obj_align(version, LV_ALIGN_TOP_MID, 0, 410 - 8);
 
     s_splash_screen = scr;
     lv_screen_load(s_splash_screen);
@@ -373,23 +373,23 @@ static void build_agent_screen(void)
      * disc. M14 #5C5C5C, both full-width so centring is exact. */
     s_footer_updated = lv_label_create(scr);
     lv_label_set_text(s_footer_updated, "");
-    lv_obj_set_style_text_font(s_footer_updated, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(s_footer_updated, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(s_footer_updated, lv_color_hex(0x5C5C5C), 0);
     lv_obj_set_style_text_align(s_footer_updated, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_width(s_footer_updated, AMOLED_FOOTER_WIDTH);
     lv_label_set_long_mode(s_footer_updated, LV_LABEL_LONG_DOT);
     lv_obj_align(s_footer_updated, LV_ALIGN_TOP_MID, 0,
-                 AMOLED_FOOTER_UPDATED_Y - 7);
+                 AMOLED_FOOTER_UPDATED_Y - 8);
 
     s_footer_email = lv_label_create(scr);
     lv_label_set_text(s_footer_email, "unpaired");
-    lv_obj_set_style_text_font(s_footer_email, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(s_footer_email, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(s_footer_email, lv_color_hex(0x5C5C5C), 0);
     lv_obj_set_style_text_align(s_footer_email, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_width(s_footer_email, AMOLED_FOOTER_WIDTH);
     lv_label_set_long_mode(s_footer_email, LV_LABEL_LONG_DOT);
     lv_obj_align(s_footer_email, LV_ALIGN_TOP_MID, 0,
-                 AMOLED_FOOTER_EMAIL_Y - 7);
+                 AMOLED_FOOTER_EMAIL_Y - 8);
 
     s_agent_screen = scr;
 }

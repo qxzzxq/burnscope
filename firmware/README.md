@@ -70,13 +70,26 @@ under `main/displays/<name>/`. The active profile is chosen via Kconfig
 |-------------------------------------------|------------------------------------|
 | `CONFIG_BURNSCOPE_DISPLAY_CYD2USB_ST7789` | `main/displays/cyd2usb_st7789/`    |
 
-Adding a new screen (e.g. an OLED or e-paper variant): drop
-`main/displays/<name>/{driver.c,ui.c}` implementing
-`display_profile_init`/`show_status`/`show_agent`, add a `bool` Kconfig
-option under the `BURNSCOPE_DISPLAY` choice in
-`main/Kconfig.projbuild`, and gate the source list in
-`main/CMakeLists.txt`. UI layout belongs in the profile because layout
-choices are geometry-bound (FR-5 in the FSD).
+Adding a new screen (e.g. an OLED or e-paper variant) is a
+directory-drop operation. In `main/displays/<name>/`, create four files:
+
+- `driver.c` — panel/SPI bring-up + LVGL port setup, exposing a
+  profile-private init helper to `ui.c`.
+- `ui.c` — LVGL layout implementing
+  `display_profile_init`/`show_status`/`show_agent`.
+- `Kconfig` — one line: `config BURNSCOPE_DISPLAY_<NAME>` declaring the
+  `bool` prompt (it is rsource'd into the enclosing `choice`).
+- `sources.cmake` — `if(CONFIG_BURNSCOPE_DISPLAY_<NAME>)` guarded
+  `list(APPEND srcs ...)` + `list(APPEND inc ...)` for this profile's
+  files; auto-discovered by the top-level `file(GLOB)` loop.
+
+Then append one `rsource "displays/<name>/Kconfig"` line to the
+`BURNSCOPE_DISPLAY` choice in `main/Kconfig.projbuild` (Kconfig has no
+glob, so this is the only edit outside the profile directory). Run
+`idf.py reconfigure` (or `menuconfig`) to pick up the new fragment.
+
+UI layout belongs in the profile because layout choices are
+geometry-bound (FR-5 in the FSD).
 
 ## Verifying Phase 2
 

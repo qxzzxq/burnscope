@@ -16,15 +16,19 @@ set(srcs
 
 set(inc ".")
 
-# Build-time-selected display profile. Each profile bundles its panel
-# driver and its LVGL layout because UI design is geometry-bound.
-if(CONFIG_BURNSCOPE_DISPLAY_CYD2USB_ST7789)
-    list(APPEND srcs
-        "displays/cyd2usb_st7789/driver.c"
-        "displays/cyd2usb_st7789/ui.c"
-    )
-    list(APPEND inc "displays/cyd2usb_st7789")
-endif()
+# Build-time-selected display profile. Each profile under displays/<name>/
+# owns its own sources.cmake fragment (and Kconfig fragment, rsource'd from
+# Kconfig.projbuild) so adding a new screen is a directory drop plus one
+# rsource line — no edits to this file. Note: CONFIGURE_DEPENDS is omitted
+# because ESP-IDF re-runs this CMakeLists in script mode during requirements
+# extraction, where CONFIGURE_DEPENDS is invalid. After dropping in a new
+# profile, run `idf.py reconfigure` (menuconfig also triggers this).
+file(GLOB display_profile_fragments
+     LIST_DIRECTORIES false
+     "${CMAKE_CURRENT_SOURCE_DIR}/displays/*/sources.cmake")
+foreach(fragment IN LISTS display_profile_fragments)
+    include(${fragment})
+endforeach()
 
 idf_component_register(
     SRCS ${srcs}

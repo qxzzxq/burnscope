@@ -1,0 +1,9 @@
+# Name,   Type, SubType,  Offset,   Size,     Flags
+# 8 MB layout for the Waveshare AMOLED-1.43 board. App slots are
+# doubled vs. the 4 MB CYD layout because the AMOLED profile bundles
+# larger font assets (Montserrat 48 + 14) and the 466×466 LVGL buffers.
+nvs,      data, nvs,      0x9000,   0x6000,
+otadata,  data, ota,      0xf000,   0x2000,
+phy_init, data, phy,      0x11000,  0x1000,
+ota_0,    app,  ota_0,    0x20000,  0x3C0000,
+ota_1,    app,  ota_1,    0x3E0000, 0x3C0000,

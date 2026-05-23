@@ -1,0 +1,3 @@
+config BURNSCOPE_DISPLAY_AMOLED_CO5300
+    bool "Waveshare ESP32-S3 1.43\" Round AMOLED (CO5300 466x466)"
+    depends on IDF_TARGET_ESP32S3

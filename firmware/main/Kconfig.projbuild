@@ -11,6 +11,7 @@ choice BURNSCOPE_DISPLAY
         and append one rsource line below.
 
     rsource "displays/cyd2usb_st7789/Kconfig"
+    rsource "displays/amoled_co5300/Kconfig"
 
 endchoice
 

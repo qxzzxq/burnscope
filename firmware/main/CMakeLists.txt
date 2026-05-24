@@ -7,6 +7,7 @@ set(srcs
     "watchdog.c"
     "nvs_store.c"
     "snapshot.c"
+    "burn_protection/burn_idle.c"
     "factory_reset.c"
     "provisioning.c"
     "captive_dns.c"

@@ -57,6 +57,22 @@ def claude_user_identifier() -> str:
     )
 
 
+def redact_client_id(client_id: str) -> str:
+    """Return a debug-safe form of a client_id (typically an email).
+
+    Used by both the Claude statusline and the Codex daemon when logging
+    so the operator's email/userID isn't leaked verbatim to log sinks.
+    """
+    if not client_id:
+        return "<empty>"
+    if "@" in client_id:
+        local, _, domain = client_id.partition("@")
+        head = local[:2] if len(local) > 2 else local[:1]
+        return f"{head}***@{domain}"
+    head = client_id[:2] if len(client_id) > 2 else client_id[:1]
+    return f"{head}*** ({len(client_id)} chars)"
+
+
 def _read_settings() -> dict:
     try:
         raw = CLAUDE_SETTINGS_FILE.read_text(encoding="utf-8")

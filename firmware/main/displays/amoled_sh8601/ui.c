@@ -569,6 +569,21 @@ static void tick_lvgl_cb(lv_timer_t *t)
     if (snapshot_store_get(s_visible_agent, &cur)) {
         render_snapshot_locked(&cur);
     }
+    /* Periodically re-read the footer CID from NVS so a factory-reset
+     * (which wipes NVS behind our back) is reflected within 10 seconds
+     * instead of persisting the previous owner's email indefinitely. */
+    {
+        static int footer_refresh_ticks = 0;
+        footer_refresh_ticks++;
+        if (footer_refresh_ticks >= 10) {
+            footer_refresh_ticks = 0;
+            for (size_t i = 0; i < FOOTER_AGENT_COUNT; ++i) {
+                s_footer_cid[i][0] = '\0';
+                (void)nvs_store_load_client_id(
+                    FOOTER_AGENTS[i], s_footer_cid[i], sizeof(s_footer_cid[i]));
+            }
+        }
+    }
     if (snapshot_store_count() >= 2) {
         s_cycle_ticks++;
         if (s_cycle_ticks >= CYCLE_INTERVAL_S) {

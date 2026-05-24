@@ -252,6 +252,20 @@ def test_clear_push_state_does_not_touch_other_agent(_state_dir):
     assert host_cache.read_push_state("codex") is not None
 
 
+def test_write_push_state_drops_unsafe_device_id_silently(_state_dir):
+    # A malicious mDNS responder must not be able to crash the long-lived
+    # codex daemon or the statusline child by emitting a device_id that
+    # contains path separators.
+    host_cache.write_push_state("claude", ok=True, device_id="../../etc/passwd")
+    # No per-device file was written under the safe-id allowlist.
+    matches = list(_state_dir.glob("last-push.claude.*"))
+    assert matches == []
+
+
+def test_read_push_state_returns_none_for_unsafe_device_id(_state_dir):
+    assert host_cache.read_push_state("claude", device_id="../evil") is None
+
+
 # ---------------------------------------------------- v1→v2 upgrade hint (#17)
 
 def test_migrate_legacy_upgrade_hint(_state_dir):

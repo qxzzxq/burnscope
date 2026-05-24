@@ -26,7 +26,6 @@ overridable via `BURNSCOPE_STATE_DIR` for tests.
 from __future__ import annotations
 
 import fcntl
-import hashlib
 import json
 import logging
 import os
@@ -259,13 +258,27 @@ def _last_push_path(agent: str, device_id: str | None) -> Path:
 
 
 def write_push_state(agent: str, ok: bool, *, device_id: str | None = None) -> None:
-    """Write the aggregate (`device_id=None`) or per-device push outcome."""
+    """Write the aggregate (`device_id=None`) or per-device push outcome.
+
+    Per-device writes for an unsafe `device_id` (malicious mDNS
+    responder on the LAN) are silently dropped so the long-lived codex
+    daemon and the claude statusline child stay resilient.
+    """
+    if device_id is not None and _safe_device_id(device_id) is None:
+        log.warning("write_push_state: skipping unsafe device_id %r", device_id)
+        return
     payload = json.dumps({"ok": bool(ok), "at": int(time.time())})
     _atomic_write(_last_push_path(agent, device_id), payload)
 
 
 def read_push_state(agent: str, *, device_id: str | None = None) -> dict | None:
-    """Return the parsed last-push state, or None if missing/malformed."""
+    """Return the parsed last-push state, or None if missing/malformed.
+
+    Unsafe `device_id` values yield None rather than raising, matching
+    the resilient policy in `write_push_state`.
+    """
+    if device_id is not None and _safe_device_id(device_id) is None:
+        return None
     path = _last_push_path(agent, device_id)
     try:
         raw = path.read_text(encoding="utf-8")

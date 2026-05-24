@@ -7,6 +7,7 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "mdns.h"
+#include "nvs.h"
 
 #include "nvs_store.h"
 #include "version.h"

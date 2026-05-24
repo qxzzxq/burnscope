@@ -509,6 +509,12 @@ async def test_pusher_loop_keeps_device_and_records_failure_on_transport(monkeyp
         return {"dev-flaky": PushResult("dev-flaky", False, "transport")}
 
     monkeypatch.setattr(codex_daemon, "push_to_all", fake_push_to_all)
+    # mDNS finds nothing → no refresh/retry, original transport failure stands.
+    from burnscope_client import pusher
+
+    async def fake_discover_all(timeout=4.0, agent=None, zc=None):
+        return []
+    monkeypatch.setattr(pusher, "discover_all", fake_discover_all)
 
     daemon._enqueue_snapshot(
         AgentSnapshot(
@@ -528,6 +534,64 @@ async def test_pusher_loop_keeps_device_and_records_failure_on_transport(monkeyp
     }
     assert host_cache.read_push_state("codex", device_id="dev-flaky")["ok"] is False
     assert host_cache.read_push_state("codex")["ok"] is False
+
+
+async def test_pusher_loop_recovers_when_device_ip_changed(monkeypatch):
+    """Stale cached host → push transport-fails → mDNS rediscovers device
+    at new host → cache updated and retry pushes to the new host.
+    """
+    from burnscope_client import pusher
+    from burnscope_client.discovery import DiscoveredDevice
+
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+    host_cache.add_paired_device("codex", PairedDevice("dev-moved", "10.0.0.5:80"))
+
+    seen_hosts: list[str] = []
+
+    async def fake_push_to_all(snapshot, devices, client_id, client):
+        # First call sees the stale host and reports transport failure.
+        # The refresh helper then calls back into pusher.push_to_all
+        # directly (not this monkeypatched alias), so we need to stub
+        # the symbol used inside pusher.py too — see below.
+        seen_hosts.extend(d.host for d in devices)
+        return {d.device_id: PushResult(d.device_id, False, "transport") for d in devices}
+
+    monkeypatch.setattr(codex_daemon, "push_to_all", fake_push_to_all)
+
+    async def pusher_push_to_all(snapshot, devices, client_id, client):
+        # The retry inside the helper goes through pusher.push_to_all.
+        # New host succeeds.
+        seen_hosts.extend(d.host for d in devices)
+        return {d.device_id: PushResult(d.device_id, True, "ok") for d in devices}
+
+    monkeypatch.setattr(pusher, "push_to_all", pusher_push_to_all)
+
+    async def fake_discover_all(timeout=4.0, agent=None, zc=None):
+        return [DiscoveredDevice("dev-moved", "10.0.0.9:80", True, False)]
+    monkeypatch.setattr(pusher, "discover_all", fake_discover_all)
+
+    daemon._enqueue_snapshot(
+        AgentSnapshot(
+            agent="codex",
+            captured_at=1,
+            sessions=[SessionSnapshot("primary", 0.5, 1779066600)],
+        )
+    )
+    await _drain_one_push(
+        daemon,
+        predicate=lambda: host_cache.read_push_state("codex") is not None
+        and host_cache.read_push_state("codex")["ok"] is True,
+    )
+
+    assert "10.0.0.5:80" in seen_hosts  # initial fan-out hit the stale host
+    assert "10.0.0.9:80" in seen_hosts  # retry hit the refreshed host
+    assert host_cache.load_paired_devices("codex") == [
+        PairedDevice("dev-moved", "10.0.0.9:80")
+    ]
+    assert host_cache.read_push_state("codex")["ok"] is True
+    # Transport-failure counter must NOT advance — the failure was healed.
+    assert daemon._transport_failures.get("dev-moved", 0) == 0
 
 
 async def test_pusher_loop_auto_pairs_when_empty(monkeypatch):

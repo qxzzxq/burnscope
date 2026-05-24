@@ -77,10 +77,9 @@ def test_concurrent_add_does_not_corrupt(_state_dir):
     ]
     for t in threads: t.start()
     for t in threads: t.join()
-    # File must remain parseable. We don't assert on count — concurrent
-    # read-modify-write means writers can clobber each other; the
-    # invariant is that the file is well-formed and contains a subset.
+    # flock serializes read-modify-write, so all 20 devices survive.
     devices = host_cache.load_paired_devices("claude")
+    assert len(devices) == 20
     assert all(d.device_id.startswith("dev-") for d in devices)
 
 
@@ -188,3 +187,101 @@ def test_state_dir_creates_directory_with_0700(monkeypatch, tmp_path):
     host_cache.write_client_id("claude", "you@example.com")
     assert target.is_dir()
     assert (target.stat().st_mode & 0o777) == 0o700
+
+
+# ------------------------------------------------------- device_id sanitization
+
+def test_add_paired_device_rejects_unsafe_device_id(_state_dir):
+    host_cache.add_paired_device("claude", PairedDevice("../../etc/passwd", "10.0.0.5:80"))
+    assert host_cache.load_paired_devices("claude") == []
+
+
+def test_load_paired_devices_skips_unsafe_device_id(_state_dir):
+    (_state_dir / "paired-devices.claude.json").write_text(
+        json.dumps([
+            {"device_id": "burnscope-12ab", "host": "10.0.0.5:80"},
+            {"device_id": "../../etc/passwd", "host": "10.0.0.6:80"},
+        ]),
+        encoding="utf-8",
+    )
+    devices = host_cache.load_paired_devices("claude")
+    assert len(devices) == 1
+    assert devices[0].device_id == "burnscope-12ab"
+
+
+def test_add_paired_device_rejects_empty_device_id(_state_dir):
+    host_cache.add_paired_device("claude", PairedDevice("", "10.0.0.5:80"))
+    assert host_cache.load_paired_devices("claude") == []
+
+
+# -------------------------------------------------- push-state cleanup (#22)
+
+def test_unlink_push_state_removes_per_device_file(_state_dir):
+    host_cache.write_push_state("claude", ok=False, device_id="burnscope-cafe")
+    assert host_cache.read_push_state("claude", device_id="burnscope-cafe") is not None
+    host_cache.unlink_push_state("claude", "burnscope-cafe")
+    assert host_cache.read_push_state("claude", device_id="burnscope-cafe") is None
+
+
+def test_unlink_push_state_is_idempotent(_state_dir):
+    host_cache.unlink_push_state("claude", "nonexistent")
+
+
+def test_remove_paired_device_cleans_up_push_state(_state_dir):
+    host_cache.add_paired_device("claude", PairedDevice("dev-1", "10.0.0.5:80"))
+    host_cache.write_push_state("claude", ok=True, device_id="dev-1")
+    host_cache.remove_paired_device("claude", "dev-1")
+    assert host_cache.read_push_state("claude", device_id="dev-1") is None
+
+
+def test_clear_push_state_removes_all(_state_dir):
+    host_cache.write_push_state("claude", ok=True)
+    host_cache.write_push_state("claude", ok=False, device_id="dev-1")
+    host_cache.write_push_state("claude", ok=True, device_id="dev-2")
+    host_cache.clear_push_state("claude")
+    assert host_cache.read_push_state("claude") is None
+    assert host_cache.read_push_state("claude", device_id="dev-1") is None
+    assert host_cache.read_push_state("claude", device_id="dev-2") is None
+
+
+def test_clear_push_state_does_not_touch_other_agent(_state_dir):
+    host_cache.write_push_state("claude", ok=True)
+    host_cache.write_push_state("codex", ok=False)
+    host_cache.clear_push_state("claude")
+    assert host_cache.read_push_state("claude") is None
+    assert host_cache.read_push_state("codex") is not None
+
+
+# ---------------------------------------------------- v1→v2 upgrade hint (#17)
+
+def test_migrate_legacy_upgrade_hint(_state_dir):
+    legacy = _state_dir / "host"
+    legacy.write_text("10.0.0.5:80\n")
+    host_cache.migrate_legacy_host_file()
+    assert host_cache.read_upgrade_hint() is not None
+    assert "v1" in host_cache.read_upgrade_hint()
+
+
+def test_clear_upgrade_hint(_state_dir):
+    (_state_dir / "v1-upgrade-hint").write_text("test hint")
+    host_cache.clear_upgrade_hint()
+    assert host_cache.read_upgrade_hint() is None
+
+
+def test_read_upgrade_hint_returns_none_when_missing(_state_dir):
+    assert host_cache.read_upgrade_hint() is None
+
+
+# -------------------------------------------------------- encoding (#29)
+
+def test_atomic_write_survives_non_ascii_client_id(_state_dir):
+    host_cache.write_client_id("claude", "jürgen@example.com")
+    assert host_cache.read_client_id("claude") == "jürgen@example.com"
+
+
+def test_paired_devices_round_trip_with_non_ascii_host(_state_dir):
+    # host field can contain non-ASCII if mDNS instance name leaks through
+    devices = [PairedDevice("burnscope-12ab", "10.0.0.5:80")]
+    host_cache.save_paired_devices("claude", devices)
+    loaded = host_cache.load_paired_devices("claude")
+    assert loaded == devices

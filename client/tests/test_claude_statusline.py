@@ -233,7 +233,8 @@ def test_push_silently_drops_device_on_401(monkeypatch):
 
     remaining = {d.device_id for d in host_cache.load_paired_devices("claude")}
     assert remaining == {"dev-keep"}
-    assert host_cache.read_push_state("claude", device_id="dev-drop")["ok"] is False
+    # Per-device push state is cleaned up together with the device removal (#22).
+    assert host_cache.read_push_state("claude", device_id="dev-drop") is None
     assert host_cache.read_push_state("claude", device_id="dev-keep")["ok"] is True
 
 

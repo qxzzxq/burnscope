@@ -130,8 +130,9 @@ def main(argv: list[str] | None = None) -> int:
         host_cache.migrate_legacy_host_file()
         for agent in ("claude", "codex"):
             host_cache.clear_paired_devices(agent)
+            host_cache.clear_push_state(agent)
             host_cache.invalidate_client_id(agent)
-        print("Forgot paired devices and per-agent client_ids.")
+        print("Forgot paired devices, push state, and per-agent client_ids.")
         return 0
     return 1
 
@@ -381,6 +382,10 @@ def _install_codex_manual() -> int:
 def _status() -> int:
     print(f"State directory: {host_cache.state_dir()}")
 
+    hint = host_cache.read_upgrade_hint()
+    if hint:
+        print(f"⚠  {hint}")
+
     for agent in ("claude", "codex"):
         state = host_cache.read_push_state(agent)
         cid = host_cache.read_client_id(agent)
@@ -450,7 +455,7 @@ def _uninstall(agent: str) -> int:
 
 def _read_json(path: Path) -> dict | None:
     try:
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
 
@@ -458,7 +463,7 @@ def _read_json(path: Path) -> dict | None:
 def _write_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     tmp.replace(path)
 
 

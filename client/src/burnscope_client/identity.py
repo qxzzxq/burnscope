@@ -59,7 +59,7 @@ def claude_user_identifier() -> str:
 
 def _read_settings() -> dict:
     try:
-        raw = CLAUDE_SETTINGS_FILE.read_text()
+        raw = CLAUDE_SETTINGS_FILE.read_text(encoding="utf-8")
     except OSError as exc:
         raise IdentityError(
             f"Could not read {CLAUDE_SETTINGS_FILE}: {exc}"

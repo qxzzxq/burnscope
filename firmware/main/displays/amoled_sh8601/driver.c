@@ -27,23 +27,47 @@
 
 /* RDID1 (0xDA) values observed on the Waveshare 1.43" dual-sourced
  * panel. CO5300 doesn't implement RDID1, so the line floats high
- * under the pull-up. */
-#define SH8601_RDID1  0x86
+ * under the pull-up — we treat 0xFF as the CO5300 signature. */
+#define SH8601_RDID1   0x86
+#define CO5300_RDID1   0xFF
 
 static const char *TAG = "amoled_drv";
 
+/* Valid RDID1 values for the dual-sourced Waveshare 1.43" AMOLED panel.
+ * SH8601 responds 0x86; CO5300 floats high (0xFF). Anything else is a
+ * glitched read or unknown silicon and must not be persisted.
+ *
+ * Named without a leading underscore: file-scope identifiers starting
+ * with an underscore are reserved by C11 §7.1.3.
+ */
+static bool lcd_id_is_valid(uint8_t id)
+{
+    return id == SH8601_RDID1 || id == CO5300_RDID1;
+}
+
 /* Probe RDID1, prefer NVS cache. Falls back to a fresh bit-bang on
  * cache miss and persists the result via the typed nvs_store wrapper
- * (every persisted byte routes through nvs_store for auditability). */
+ * (every persisted byte routes through nvs_store for auditability).
+ *
+ * Only recognised values (0x86 / 0xFF) are cached; a glitched read
+ * that returns any other byte is logged and discarded — the next boot
+ * re-reads the panel rather than trusting a corrupt NVS entry forever. */
 static uint8_t resolve_lcd_id(void)
 {
     uint8_t cached = 0;
     if (nvs_store_load_lcd_id(&cached) == ESP_OK) {
-        ESP_LOGI(TAG, "LCD ID from NVS cache: 0x%02x", cached);
-        return cached;
+        if (lcd_id_is_valid(cached)) {
+            ESP_LOGI(TAG, "LCD ID from NVS cache: 0x%02x", cached);
+            return cached;
+        }
+        ESP_LOGW(TAG, "NVS-cached LCD ID 0x%02x is unrecognised; re-reading", cached);
     }
     const uint8_t id = amoled_sh8601_read_lcd_id();
-    (void)nvs_store_save_lcd_id(id);
+    if (lcd_id_is_valid(id)) {
+        (void)nvs_store_save_lcd_id(id);
+    } else {
+        ESP_LOGW(TAG, "LCD RDID1 0x%02x is unrecognised; not caching", id);
+    }
     return id;
 }
 

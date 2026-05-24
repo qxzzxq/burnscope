@@ -303,6 +303,9 @@ def read_client_id(agent: str) -> str | None:
         raw = path.read_text(encoding="utf-8").strip()
     except OSError:
         return None
+    except UnicodeError:
+        log.warning("client-id.%s contained non-UTF-8 data; ignoring", agent)
+        return None
     if not raw or len(raw) > _MAX_CLIENT_ID_LEN or any(ord(c) < 0x20 for c in raw):
         log.warning("client-id.%s contained malformed identifier; ignoring", agent)
         return None

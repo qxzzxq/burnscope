@@ -282,7 +282,7 @@ def read_push_state(agent: str, *, device_id: str | None = None) -> dict | None:
     path = _last_push_path(agent, device_id)
     try:
         raw = path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeError):
         return None
     try:
         parsed = json.loads(raw)

@@ -60,6 +60,19 @@ from .schema import AgentSnapshot, SessionSnapshot  # noqa: E402
 
 log = logging.getLogger(__name__)
 
+
+def _redact_client_id(client_id: str) -> str:
+    """Return a debug-safe form of a client_id (typically an email)."""
+    if not client_id:
+        return "<empty>"
+    if "@" in client_id:
+        local, _, domain = client_id.partition("@")
+        head = local[:2] if len(local) > 2 else local[:1]
+        return f"{head}***@{domain}"
+    head = client_id[:2] if len(client_id) > 2 else client_id[:1]
+    return f"{head}*** ({len(client_id)} chars)"
+
+
 AGENT_NAME = "codex"
 APP_SERVER_CMD = ("codex", "app-server")
 CLIENT_NAME = "burnscope"
@@ -75,6 +88,7 @@ REQUEST_TIMEOUT_S = 30.0
 # bounded + drop-oldest is the right shape: a stale snapshot has zero
 # value once a newer one arrives.
 SNAPSHOT_QUEUE_MAX = 8
+MAX_TRANSPORT_FAILURES = 5
 
 
 class CodexProtocolError(RuntimeError):
@@ -105,6 +119,7 @@ class CodexDaemon:
         self._client_id: str | None = None
         self._last_snapshot: AgentSnapshot | None = None
         self._proc: asyncio.subprocess.Process | None = None
+        self._transport_failures: dict[str, int] = {}
 
     # ------------------------------------------------------------------ run
 
@@ -195,7 +210,7 @@ class CodexDaemon:
         if cached != email:
             host_cache.write_client_id(AGENT_NAME, email)
         self._client_id = email
-        log.info("codex identifier resolved: %s", email)
+        log.debug("codex identifier resolved: %s", _redact_client_id(email))
 
         rl = await self._request("account/rateLimits/read", {})
         snapshot = _snapshot_from_rate_limits(rl.get("rateLimits"))
@@ -334,6 +349,21 @@ class CodexDaemon:
             if result.kind == "auth":
                 log.info("dropping %s from codex paired list (401)", device_id)
                 host_cache.remove_paired_device(AGENT_NAME, device_id)
+                self._transport_failures.pop(device_id, None)
+                continue
+            if result.kind == "transport":
+                failures = self._transport_failures.get(device_id, 0) + 1
+                self._transport_failures[device_id] = failures
+                if failures >= MAX_TRANSPORT_FAILURES:
+                    log.warning(
+                        "dropping %s after %d transport failures",
+                        device_id, MAX_TRANSPORT_FAILURES,
+                    )
+                    host_cache.remove_paired_device(AGENT_NAME, device_id)
+                    self._transport_failures.pop(device_id, None)
+                    continue
+            else:
+                self._transport_failures.pop(device_id, None)
             if not result.ok:
                 overall_ok = False
         host_cache.write_push_state(AGENT_NAME, ok=overall_ok)
@@ -350,17 +380,33 @@ class CodexDaemon:
                 if not devices:
                     continue
                 diverged_any = False
+                all_unreachable = True
                 for device in devices:
                     body = await fetch_health(device.host, self._client_id, client)
                     if body is None:
                         host_cache.write_push_state(
                             AGENT_NAME, ok=False, device_id=device.device_id
                         )
+                        failures = (
+                            self._transport_failures.get(device.device_id, 0) + 1
+                        )
+                        self._transport_failures[device.device_id] = failures
+                        if failures >= MAX_TRANSPORT_FAILURES:
+                            log.warning(
+                                "dropping %s after %d health failures",
+                                device.device_id, MAX_TRANSPORT_FAILURES,
+                            )
+                            host_cache.remove_paired_device(AGENT_NAME, device.device_id)
+                            self._transport_failures.pop(device.device_id, None)
                         continue
+                    all_unreachable = False
+                    self._transport_failures.pop(device.device_id, None)
                     if self._last_snapshot is not None and _firmware_diverged(
                         body, self._last_snapshot
                     ):
                         diverged_any = True
+                if all_unreachable:
+                    host_cache.write_push_state(AGENT_NAME, ok=False)
                 if diverged_any and self._last_snapshot is not None:
                     log.info(
                         "firmware diverged on >=1 device; re-enqueuing last snapshot"

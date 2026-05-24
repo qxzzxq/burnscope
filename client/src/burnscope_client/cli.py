@@ -175,14 +175,19 @@ def _pair(agent_filter: str | None) -> int:
 
 
 def _pair_one_agent(agent: str) -> list[PairedDevice] | None:
-    """Discover free devices for `agent` and dedupe-merge them into the file.
+    """Discover devices and dedupe-merge them into the paired list.
+
+    Uses unfiltered discovery (no `agent=` argument) so devices already
+    TOFU-bound to us (paired_<agent>=1 in TXT) can be recovered after a
+    pair-reset or accidental paired-devices.json wipe. Devices owned by
+    someone else will 401 on the next real push and be silently dropped.
 
     Returns the list of newly-added PairedDevices, an empty list when
     discovery succeeded but found nothing claimable, or None on a
     discovery error.
     """
     try:
-        discovered = asyncio.run(discover_all(agent=agent))
+        discovered = asyncio.run(discover_all())
     except Exception as exc:
         print(f"[{agent}] mDNS discovery failed: {exc}")
         return None

@@ -20,14 +20,27 @@ def _stub_discover(monkeypatch, results):
     """Replace `discover_all` with a coroutine that returns `results`.
 
     `results` may be a list (used regardless of `agent` arg) or a dict
-    keyed by agent name for per-agent control.
+    keyed by agent name for per-agent control. When agent=None (unfiltered
+    call from `_pair_one_agent`), dict results are merged from all agents.
     """
+
     async def fake_discover_all(timeout=10.0, agent=None, zc=None):
         if isinstance(results, dict):
+            if agent is None:
+                seen: set[str] = set()
+                merged: list[DiscoveredDevice] = []
+                for devices in results.values():
+                    for d in devices:
+                        if d.device_id not in seen:
+                            seen.add(d.device_id)
+                            merged.append(d)
+                return merged
             return [
                 d for d in results.get(agent, [])
                 if not d.paired_for(agent)
             ]
+        if agent is None:
+            return list(results)
         return [d for d in results if not d.paired_for(agent)]
 
     monkeypatch.setattr(cli, "discover_all", fake_discover_all)
@@ -68,8 +81,9 @@ def test_pair_adds_discovered_free_devices(monkeypatch, capsys):
     assert rc == 0
     paired_claude = {d.device_id for d in host_cache.load_paired_devices("claude")}
     paired_codex  = {d.device_id for d in host_cache.load_paired_devices("codex")}
+    # Unfiltered discovery returns all devices for both agents (#18).
     assert paired_claude == {"dev-x", "dev-y"}
-    assert paired_codex  == {"dev-x"}
+    assert paired_codex  == {"dev-x", "dev-y"}
 
 
 def test_pair_with_agent_filter_only_runs_one_agent(monkeypatch):
@@ -105,12 +119,14 @@ def test_pair_is_idempotent_for_already_paired_devices(monkeypatch, capsys):
 
     cli.main(["pair"])
     out = capsys.readouterr().out
-    # No new devices added on either agent.
+    # Claude already has dev-x — no new devices.
     assert "[claude] no claimable devices" in out
-    assert "[codex] no claimable devices" in out
-    # Original entry still there, exactly once.
+    # Codex discovers dev-x via unfiltered discovery (#18).
+    assert "[codex] added 1 device" in out
+    # Original entry still there, exactly once per agent.
     devices = host_cache.load_paired_devices("claude")
     assert len(devices) == 1
+    assert len(host_cache.load_paired_devices("codex")) == 1
 
 
 # ============================================================ pair-reset

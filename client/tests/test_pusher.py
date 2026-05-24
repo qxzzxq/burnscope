@@ -4,6 +4,8 @@ import httpx
 import pytest
 import respx
 
+from burnscope_client import host_cache, pusher
+from burnscope_client.discovery import DiscoveredDevice
 from burnscope_client.host_cache import PairedDevice
 from burnscope_client.pusher import (
     CLIENT_ID_HEADER,
@@ -13,8 +15,15 @@ from burnscope_client.pusher import (
     fetch_health,
     push,
     push_to_all,
+    refresh_and_retry_transport_failures,
 )
 from burnscope_client.schema import AgentSnapshot, SessionSnapshot
+
+
+@pytest.fixture(autouse=True)
+def _isolate_state(monkeypatch, tmp_path):
+    monkeypatch.setenv("BURNSCOPE_STATE_DIR", str(tmp_path))
+    return tmp_path
 
 
 CLIENT_ID = "a" * 64
@@ -164,3 +173,109 @@ async def test_push_to_all_sends_client_id_header_per_device():
         )
     assert route_a.calls[0].request.headers[CLIENT_ID_HEADER] == CLIENT_ID
     assert route_b.calls[0].request.headers[CLIENT_ID_HEADER] == CLIENT_ID
+
+
+# -------------------------------------------- refresh_and_retry_transport_failures
+
+
+def _stub_discover(monkeypatch, devices):
+    async def fake(timeout=4.0, agent=None, zc=None):
+        return list(devices)
+    monkeypatch.setattr(pusher, "discover_all", fake)
+
+
+async def test_refresh_and_retry_noop_when_no_transport_failures(monkeypatch):
+    """No transport failures → no mDNS browse, results returned as-is."""
+    def boom(*a, **kw):
+        raise AssertionError("discover_all must not run without transport failures")
+    monkeypatch.setattr(pusher, "discover_all", boom)
+
+    results = {
+        "dev-a": PushResult("dev-a", True,  "ok"),
+        "dev-b": PushResult("dev-b", False, "auth"),
+    }
+    async with httpx.AsyncClient() as client:
+        out = await refresh_and_retry_transport_failures(
+            _snapshot(),
+            [PairedDevice("dev-a", "10.0.0.5:80"), PairedDevice("dev-b", "10.0.0.6:80")],
+            results, CLIENT_ID, client, "claude",
+        )
+    assert out == results
+
+
+@respx.mock
+async def test_refresh_and_retry_updates_cache_and_retries_on_new_host(monkeypatch):
+    """The headline bug: device's IP changed → discover new host, update cache, retry."""
+    host_cache.add_paired_device("claude", PairedDevice("dev-moved", "10.0.0.5:80"))
+    _stub_discover(monkeypatch, [
+        DiscoveredDevice("dev-moved", "10.0.0.9:80", True, False),
+    ])
+    new_route = respx.post("http://10.0.0.9:80/summary").mock(
+        return_value=httpx.Response(204)
+    )
+    results = {"dev-moved": PushResult("dev-moved", False, "transport")}
+    devices = [PairedDevice("dev-moved", "10.0.0.5:80")]
+
+    async with httpx.AsyncClient() as client:
+        out = await refresh_and_retry_transport_failures(
+            _snapshot(), devices, results, CLIENT_ID, client, "claude",
+        )
+
+    assert out["dev-moved"] == PushResult("dev-moved", True, "ok")
+    assert new_route.called
+    cached = host_cache.load_paired_devices("claude")
+    assert cached == [PairedDevice("dev-moved", "10.0.0.9:80")]
+
+
+async def test_refresh_and_retry_skips_when_host_unchanged(monkeypatch):
+    """mDNS confirms same host → no retry (the failure was truly transient)."""
+    _stub_discover(monkeypatch, [
+        DiscoveredDevice("dev-same", "10.0.0.5:80", True, False),
+    ])
+    results = {"dev-same": PushResult("dev-same", False, "transport")}
+    devices = [PairedDevice("dev-same", "10.0.0.5:80")]
+
+    async with httpx.AsyncClient() as client:
+        out = await refresh_and_retry_transport_failures(
+            _snapshot(), devices, results, CLIENT_ID, client, "claude",
+        )
+    assert out == results
+
+
+async def test_refresh_and_retry_keeps_failure_when_device_not_discovered(monkeypatch):
+    """mDNS didn't see the device → keep original transport failure, don't retry."""
+    _stub_discover(monkeypatch, [])
+    results = {"dev-gone": PushResult("dev-gone", False, "transport")}
+    devices = [PairedDevice("dev-gone", "10.0.0.5:80")]
+
+    async with httpx.AsyncClient() as client:
+        out = await refresh_and_retry_transport_failures(
+            _snapshot(), devices, results, CLIENT_ID, client, "claude",
+        )
+    assert out == results
+
+
+@respx.mock
+async def test_refresh_and_retry_leaves_other_devices_untouched(monkeypatch):
+    """Only the transport-failed device is mDNS-refreshed; others pass through."""
+    host_cache.add_paired_device("claude", PairedDevice("dev-moved", "10.0.0.5:80"))
+    _stub_discover(monkeypatch, [
+        DiscoveredDevice("dev-moved", "10.0.0.9:80", True, False),
+        DiscoveredDevice("dev-ok",    "10.0.0.6:80", True, False),
+    ])
+    respx.post("http://10.0.0.9:80/summary").mock(return_value=httpx.Response(204))
+    results = {
+        "dev-ok":    PushResult("dev-ok",    True,  "ok"),
+        "dev-moved": PushResult("dev-moved", False, "transport"),
+    }
+    devices = [
+        PairedDevice("dev-ok",    "10.0.0.6:80"),
+        PairedDevice("dev-moved", "10.0.0.5:80"),
+    ]
+
+    async with httpx.AsyncClient() as client:
+        out = await refresh_and_retry_transport_failures(
+            _snapshot(), devices, results, CLIENT_ID, client, "claude",
+        )
+    assert out["dev-ok"] == PushResult("dev-ok", True, "ok")
+    assert out["dev-moved"] == PushResult("dev-moved", True, "ok")

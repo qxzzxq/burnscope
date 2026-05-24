@@ -19,6 +19,8 @@ from typing import Literal
 
 import httpx
 
+from . import host_cache
+from .discovery import discover_all
 from .host_cache import PairedDevice
 from .schema import AgentSnapshot
 
@@ -124,6 +126,65 @@ async def push_to_all(
 
     results = await asyncio.gather(*(_one(d) for d in devices))
     return {r.device_id: r for r in results}
+
+
+async def refresh_and_retry_transport_failures(
+    snapshot: AgentSnapshot,
+    devices: list[PairedDevice],
+    results: dict[str, PushResult],
+    client_id: str,
+    client: httpx.AsyncClient,
+    agent: str,
+    *,
+    discovery_timeout: float = 4.0,
+) -> dict[str, PushResult]:
+    """Re-resolve transport-failed devices via mDNS and retry once.
+
+    A device's cached `host` can go stale after a DHCP renewal. The
+    `device_id` (mDNS hostname, MAC-derived) is stable across IP
+    changes, so a "transport failure" that's really just a moved IP can
+    be healed by browsing for the device by id and retrying the push at
+    its new host.
+
+    For each entry in `results` with `kind="transport"`:
+      - Browse `_burnscope._tcp.local`.
+      - If the device shows up at a *different* host: update the
+        paired-devices cache for `agent` and re-push to the new host.
+      - If the device shows up at the same host (or doesn't show up at
+        all): leave the result unchanged. Retrying immediately against
+        the same host can't recover from a moved IP, and the only thing
+        that would heal a same-host failure (the device coming back) is
+        already covered by the next fire.
+
+    Returns a fresh dict; entries for retried devices are replaced with
+    the retry outcome.
+    """
+    transport_failed = [
+        did for did, r in results.items() if r.kind == "transport"
+    ]
+    if not transport_failed:
+        return results
+
+    discovered = await discover_all(timeout=discovery_timeout)
+    by_id = {d.device_id: d for d in discovered}
+    old_hosts = {d.device_id: d.host for d in devices}
+
+    updated = dict(results)
+    for device_id in transport_failed:
+        found = by_id.get(device_id)
+        if found is None:
+            continue
+        if found.host == old_hosts.get(device_id):
+            continue
+        log.info(
+            "host changed for %s (%s -> %s); refreshing cache and retrying push",
+            device_id, old_hosts.get(device_id), found.host,
+        )
+        refreshed = PairedDevice(device_id=device_id, host=found.host)
+        host_cache.add_paired_device(agent, refreshed)
+        retry = await push_to_all(snapshot, [refreshed], client_id, client)
+        updated[device_id] = retry[device_id]
+    return updated
 
 
 async def fetch_health(

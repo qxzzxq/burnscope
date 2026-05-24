@@ -52,7 +52,13 @@ from . import host_cache, identity  # noqa: E402
 from ._log import configure_logging  # noqa: E402
 from .discovery import discover_all  # noqa: E402
 from .host_cache import PairedDevice  # noqa: E402
-from .pusher import PushAuthError, PushError, push, push_to_all  # noqa: E402
+from .pusher import (  # noqa: E402
+    PushAuthError,
+    PushError,
+    push,
+    push_to_all,
+    refresh_and_retry_transport_failures,
+)
 from .schema import AgentSnapshot, SessionSnapshot  # noqa: E402
 
 AGENT_NAME = "claude"
@@ -228,6 +234,10 @@ async def _do_fanout(snapshot: AgentSnapshot, client_id: str) -> int:
             return 1
 
         results = await push_to_all(snapshot, devices, client_id, client)
+        results = await refresh_and_retry_transport_failures(
+            snapshot, devices, results, client_id, client, AGENT_NAME,
+            discovery_timeout=DISCOVERY_TIMEOUT_S,
+        )
 
     overall_ok = True
     for device_id, result in results.items():

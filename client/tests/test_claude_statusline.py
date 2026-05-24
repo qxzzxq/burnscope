@@ -2,9 +2,12 @@ import io
 import json
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
+import respx
 
-from burnscope_client import claude_statusline, host_cache
+from burnscope_client import claude_statusline, host_cache, pusher
+from burnscope_client.discovery import DiscoveredDevice
 from burnscope_client.host_cache import PairedDevice
 from burnscope_client.pusher import PushResult
 
@@ -243,6 +246,7 @@ def test_push_silently_drops_device_on_401(monkeypatch):
 def test_push_keeps_device_on_transport_error(monkeypatch):
     _stub_stdin(monkeypatch)
     _stub_identity(monkeypatch)
+    _stub_discover_none(monkeypatch)
     host_cache.add_paired_device("claude", PairedDevice("dev-flaky", "10.0.0.5:80"))
 
     _stub_push_to_all(
@@ -262,6 +266,7 @@ def test_push_keeps_device_on_transport_error(monkeypatch):
 def test_push_writes_aggregate_ok_only_when_every_device_succeeds(monkeypatch):
     _stub_stdin(monkeypatch)
     _stub_identity(monkeypatch)
+    _stub_discover_none(monkeypatch)
     host_cache.add_paired_device("claude", PairedDevice("dev-a", "10.0.0.5:80"))
     host_cache.add_paired_device("claude", PairedDevice("dev-b", "10.0.0.6:80"))
 
@@ -275,6 +280,37 @@ def test_push_writes_aggregate_ok_only_when_every_device_succeeds(monkeypatch):
 
     claude_statusline.main(["--push"])
     assert host_cache.read_push_state("claude")["ok"] is False
+
+
+@respx.mock
+def test_push_recovers_when_device_ip_changed(monkeypatch):
+    """Cached host is stale (DHCP renewed); mDNS rediscovers the device
+    at its new IP, cache is updated, retry succeeds.
+    """
+    _stub_stdin(monkeypatch)
+    _stub_identity(monkeypatch)
+    host_cache.add_paired_device("claude", PairedDevice("dev-moved", "10.0.0.5:80"))
+
+    # Old host: transport failure. New host: 204.
+    respx.post("http://10.0.0.5:80/summary").mock(
+        side_effect=httpx.ConnectError("stale ip")
+    )
+    new_route = respx.post("http://10.0.0.9:80/summary").mock(
+        return_value=httpx.Response(204)
+    )
+
+    async def fake_discover_all(timeout=4.0, agent=None, zc=None):
+        return [DiscoveredDevice("dev-moved", "10.0.0.9:80", True, False)]
+    monkeypatch.setattr(pusher, "discover_all", fake_discover_all)
+
+    rc = claude_statusline.main(["--push"])
+    assert rc == 0
+    assert new_route.called
+    assert host_cache.load_paired_devices("claude") == [
+        PairedDevice("dev-moved", "10.0.0.9:80")
+    ]
+    assert host_cache.read_push_state("claude")["ok"] is True
+    assert host_cache.read_push_state("claude", device_id="dev-moved")["ok"] is True
 
 
 def test_push_uses_cached_client_id_without_re_reading_claude_json(monkeypatch):

@@ -56,6 +56,7 @@ from .pusher import (  # noqa: E402
     fetch_health,
     push,
     push_to_all,
+    refresh_and_retry_transport_failures,
 )
 from .schema import AgentSnapshot, SessionSnapshot  # noqa: E402
 
@@ -330,6 +331,10 @@ class CodexDaemon:
             return
 
         results = await push_to_all(snapshot, devices, self._client_id, client)
+        results = await refresh_and_retry_transport_failures(
+            snapshot, devices, results, self._client_id, client, AGENT_NAME,
+            discovery_timeout=DISCOVERY_TIMEOUT_S,
+        )
         overall_ok = True
         kept = 0
         for device_id, result in results.items():

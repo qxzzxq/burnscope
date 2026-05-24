@@ -237,6 +237,7 @@ async def _do_fanout(snapshot: AgentSnapshot, client_id: str) -> int:
         if result.kind == "auth":
             log.info("dropping %s from claude paired list (401)", device_id)
             host_cache.remove_paired_device(AGENT_NAME, device_id)
+            continue
         if not result.ok:
             overall_ok = False
 

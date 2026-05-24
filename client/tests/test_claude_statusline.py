@@ -236,6 +236,8 @@ def test_push_silently_drops_device_on_401(monkeypatch):
     # Per-device push state is cleaned up together with the device removal (#22).
     assert host_cache.read_push_state("claude", device_id="dev-drop") is None
     assert host_cache.read_push_state("claude", device_id="dev-keep")["ok"] is True
+    # Aggregate must reflect only still-paired devices (#23).
+    assert host_cache.read_push_state("claude")["ok"] is True
 
 
 def test_push_keeps_device_on_transport_error(monkeypatch):

@@ -165,9 +165,11 @@ def _txt_paired(properties: dict, key: bytes) -> bool:
     """Read a `paired_<agent>` TXT entry.
 
     zeroconf delivers TXT properties as a `dict[bytes, bytes | None]`.
-    Anything other than the literal byte `0` (or string `"0"`) is treated
-    as paired — including a missing key, since we don't know what an older
-    firmware's slot state is and shouldn't try to claim it.
+    Strict interpretation: only the literal bytes `b'1'` mean paired, only
+    `b'0'` mean free. Malformed values (empty, `b'2'`, `b'true'`, etc.) are
+    logged and conservatively treated as paired so we never auto-claim a
+    device whose firmware is emitting garbage. Missing key → paired (legacy
+    firmware default).
     """
     if key not in properties:
         return _LEGACY_PAIRED_DEFAULT
@@ -175,9 +177,23 @@ def _txt_paired(properties: dict, key: bytes) -> bool:
     if raw is None:
         return _LEGACY_PAIRED_DEFAULT
     if isinstance(raw, bytes):
-        return raw != b"0"
+        if raw == b"0":
+            return False
+        if raw == b"1":
+            return True
+        log.warning(
+            "mDNS TXT %s has unrecognised value %r; treating as paired", key, raw
+        )
+        return _LEGACY_PAIRED_DEFAULT
     if isinstance(raw, str):
-        return raw != "0"
+        if raw == "0":
+            return False
+        if raw == "1":
+            return True
+        log.warning(
+            "mDNS TXT %s has unrecognised value %r; treating as paired", key, raw
+        )
+        return _LEGACY_PAIRED_DEFAULT
     return _LEGACY_PAIRED_DEFAULT
 
 

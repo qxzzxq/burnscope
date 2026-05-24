@@ -27,9 +27,11 @@
 #include <string.h>
 #include <time.h>
 
+#include "esp_err.h"
 #include "esp_log.h"
 #include "esp_lvgl_port.h"
 #include "lvgl.h"
+#include "nvs.h"
 
 #include "driver.h"
 #include "nvs_store.h"
@@ -100,9 +102,16 @@ static ui_ring_t s_rings[AMOLED_NUM_RINGS];
 /* The agent we are currently rendering ("" when on splash). */
 static char s_visible_agent[SNAPSHOT_AGENT_MAX] = "";
 
-/* Cached client-id per known agent — same NVS-on-swap-boundary
- * pattern as the cyd2usb profile so we never touch NVS from the
- * 1 Hz tick. */
+/* Cached client-id per known agent. Two refresh boundaries:
+ *  (a) on agent swap (show_agent_locked → refresh_footer_cid), and
+ *  (b) every 10 s from the 1 Hz tick — covers the factory-reset path
+ *      in factory_reset.c that wipes NVS but does not reboot (the
+ *      narrow cred-erase-fails-but-pair-erase-succeeds branch). The
+ *      cyd2usb profile is structurally identical to (a) only; this
+ *      AMOLED variant deliberately adds (b) because the on-display
+ *      email persisting after a factory-reset is more visually
+ *      jarring on the 466×466 panel.
+ */
 static const char *const FOOTER_AGENTS[] = { "claude", "codex" };
 #define FOOTER_AGENT_COUNT (sizeof(FOOTER_AGENTS) / sizeof(FOOTER_AGENTS[0]))
 static char s_footer_cid[FOOTER_AGENT_COUNT][BURNSCOPE_CLIENT_ID_MAX];
@@ -119,8 +128,20 @@ static void refresh_footer_cid(const char *agent)
 {
     int idx = footer_agent_idx(agent);
     if (idx < 0) return;
-    s_footer_cid[idx][0] = '\0';
-    (void)nvs_store_load_client_id(agent, s_footer_cid[idx], sizeof(s_footer_cid[idx]));
+    char buf[BURNSCOPE_CLIENT_ID_MAX];
+    esp_err_t err = nvs_store_load_client_id(agent, buf, sizeof(buf));
+    if (err == ESP_OK) {
+        memcpy(s_footer_cid[idx], buf, sizeof(s_footer_cid[idx]));
+        return;
+    }
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        /* Slot empty (factory-reset or never bound). */
+        s_footer_cid[idx][0] = '\0';
+        return;
+    }
+    /* Real NVS error (corruption, invalid args, …) — keep whatever
+     * value we already cached rather than blanking, so a transient
+     * read failure doesn't wipe a valid on-screen email. */
 }
 
 static const char *footer_cid_for(const char *agent)
@@ -571,16 +592,15 @@ static void tick_lvgl_cb(lv_timer_t *t)
     }
     /* Periodically re-read the footer CID from NVS so a factory-reset
      * (which wipes NVS behind our back) is reflected within 10 seconds
-     * instead of persisting the previous owner's email indefinitely. */
+     * instead of persisting the previous owner's email indefinitely.
+     * Delegates to refresh_footer_cid so the return-code handling lives
+     * in one place — see its definition near the cache declaration. */
     {
         static int footer_refresh_ticks = 0;
-        footer_refresh_ticks++;
-        if (footer_refresh_ticks >= 10) {
+        if (++footer_refresh_ticks >= 10) {
             footer_refresh_ticks = 0;
             for (size_t i = 0; i < FOOTER_AGENT_COUNT; ++i) {
-                s_footer_cid[i][0] = '\0';
-                (void)nvs_store_load_client_id(
-                    FOOTER_AGENTS[i], s_footer_cid[i], sizeof(s_footer_cid[i]));
+                refresh_footer_cid(FOOTER_AGENTS[i]);
             }
         }
     }

@@ -1,3 +1,4 @@
+import logging
 import socket
 
 import pytest
@@ -7,6 +8,7 @@ from zeroconf.asyncio import AsyncZeroconf
 from burnscope_client.discovery import (
     SERVICE_TYPE,
     DiscoveredDevice,
+    _txt_paired,
     discover_all,
     parse_host_override,
 )
@@ -18,6 +20,49 @@ def test_parse_host_override_adds_default_port():
 
 def test_parse_host_override_preserves_explicit_port():
     assert parse_host_override("esp.local:8080") == "esp.local:8080"
+
+
+# --------------------------------------------------------- _txt_paired
+
+def test_txt_paired_recognises_literal_zero_and_one():
+    assert _txt_paired({b"paired_claude": b"0"}, b"paired_claude") is False
+    assert _txt_paired({b"paired_claude": b"1"}, b"paired_claude") is True
+
+
+def test_txt_paired_missing_key_defaults_to_paired():
+    # Legacy firmware without `paired_*` TXT items must be treated as
+    # paired so we never auto-claim a device that can't surface its
+    # slot state.
+    assert _txt_paired({}, b"paired_claude") is True
+
+
+def test_txt_paired_none_value_defaults_to_paired():
+    assert _txt_paired({b"paired_claude": None}, b"paired_claude") is True
+
+
+@pytest.mark.parametrize("raw", [b"", b"2", b"true", b"yes", b"01"])
+def test_txt_paired_unknown_bytes_value_logs_and_treats_as_paired(raw, caplog):
+    caplog.set_level(logging.WARNING, logger="burnscope_client.discovery")
+    assert _txt_paired({b"paired_claude": raw}, b"paired_claude") is True
+    assert any(
+        "unrecognised value" in record.message and "paired_claude" in record.message
+        for record in caplog.records
+    ), caplog.records
+
+
+@pytest.mark.parametrize("raw", ["", "2", "true"])
+def test_txt_paired_unknown_str_value_logs_and_treats_as_paired(raw, caplog):
+    caplog.set_level(logging.WARNING, logger="burnscope_client.discovery")
+    assert _txt_paired({b"paired_claude": raw}, b"paired_claude") is True
+    assert any(
+        "unrecognised value" in record.message and "paired_claude" in record.message
+        for record in caplog.records
+    ), caplog.records
+
+
+def test_txt_paired_str_zero_and_one_match():
+    assert _txt_paired({b"paired_claude": "0"}, b"paired_claude") is False
+    assert _txt_paired({b"paired_claude": "1"}, b"paired_claude") is True
 
 
 def test_paired_for_dispatch_per_agent():

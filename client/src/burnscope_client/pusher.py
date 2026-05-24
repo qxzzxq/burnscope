@@ -163,7 +163,7 @@ async def refresh_and_retry_transport_failures(
         did for did, r in results.items() if r.kind == "transport"
     ]
     if not transport_failed:
-        return results
+        return dict(results)
 
     discovered = await discover_all(timeout=discovery_timeout)
     by_id = {d.device_id: d for d in discovered}

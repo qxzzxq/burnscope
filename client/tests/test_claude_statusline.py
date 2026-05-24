@@ -122,9 +122,18 @@ def _stub_push_to_all(monkeypatch, results):
 
 
 def _stub_discover_none(monkeypatch):
+    """Stub mDNS discovery in *both* call sites.
+
+    `claude_statusline.discover_all` is used by `_resolve_paired_devices`
+    (auto-pair on empty cache). `pusher.discover_all` is used by
+    `refresh_and_retry_transport_failures` (heal a stale host after a
+    transport failure). A test that only stubs the first would still
+    perform a real 4 s mDNS browse on any transport-failure path.
+    """
     async def fake_discover_all(timeout=10.0, agent=None, zc=None):
         return []
     monkeypatch.setattr(claude_statusline, "discover_all", fake_discover_all)
+    monkeypatch.setattr(pusher, "discover_all", fake_discover_all)
 
 
 def test_push_uses_cached_paired_list_without_discovery(monkeypatch):

@@ -16,19 +16,25 @@ def _isolate_state(monkeypatch, tmp_path):
     monkeypatch.setenv("BURNSCOPE_STATE_DIR", str(tmp_path))
 
 
-def _stub_discover(monkeypatch, results):
-    """Replace `discover_all` with a coroutine that returns `results`.
+def _stub_discover(monkeypatch, results, *, call_counter=None):
+    """Replace `discover_all` with a coroutine returning `results` verbatim.
 
-    `results` may be a list (used regardless of `agent` arg) or a dict
-    keyed by agent name for per-agent control.
+    Mirrors production `discover_all()` (without `agent=`): one
+    `DiscoveredDevice` per unique device, with both `paired_claude` and
+    `paired_codex` already populated. The CLI only invokes the unfiltered
+    form now, so per-agent dict stubs would no longer reflect production.
+    Pass `call_counter` (a one-element list) to assert the CLI doesn't
+    re-browse mDNS per agent.
     """
+
     async def fake_discover_all(timeout=10.0, agent=None, zc=None):
-        if isinstance(results, dict):
-            return [
-                d for d in results.get(agent, [])
-                if not d.paired_for(agent)
-            ]
-        return [d for d in results if not d.paired_for(agent)]
+        if call_counter is not None:
+            call_counter[0] += 1
+        assert agent is None, (
+            "cli._pair must use unfiltered discovery — per-agent re-browse "
+            "would double the mDNS wait. See PR #34 review."
+        )
+        return list(results)
 
     monkeypatch.setattr(cli, "discover_all", fake_discover_all)
 
@@ -53,23 +59,38 @@ def test_pair_adds_discovered_free_devices(monkeypatch, capsys):
     host_cache.write_client_id("codex",  "me@example.com")
     _stub_discover(
         monkeypatch,
-        {
-            "claude": [
-                DiscoveredDevice("dev-x", "10.0.0.5:80", False, False),
-                DiscoveredDevice("dev-y", "10.0.0.6:80", False, True),
-            ],
-            "codex":  [
-                DiscoveredDevice("dev-x", "10.0.0.5:80", False, False),
-            ],
-        },
+        [
+            DiscoveredDevice("dev-x", "10.0.0.5:80", False, False),
+            DiscoveredDevice("dev-y", "10.0.0.6:80", False, True),
+        ],
     )
 
     rc = cli.main(["pair"])
     assert rc == 0
     paired_claude = {d.device_id for d in host_cache.load_paired_devices("claude")}
     paired_codex  = {d.device_id for d in host_cache.load_paired_devices("codex")}
+    # Unfiltered discovery returns all devices for both agents (#18).
     assert paired_claude == {"dev-x", "dev-y"}
-    assert paired_codex  == {"dev-x"}
+    assert paired_codex  == {"dev-x", "dev-y"}
+
+
+def test_pair_browses_mdns_at_most_once_across_agents(monkeypatch):
+    # discover_all() blocks for the full timeout, so re-running it per
+    # agent doubles the user-visible wait. Pin the single-browse contract.
+    host_cache.write_client_id("claude", "me@example.com")
+    host_cache.write_client_id("codex",  "me@example.com")
+    call_counter = [0]
+    _stub_discover(
+        monkeypatch,
+        [DiscoveredDevice("dev-x", "10.0.0.5:80", False, False)],
+        call_counter=call_counter,
+    )
+
+    cli.main(["pair"])
+    assert call_counter[0] == 1, (
+        f"discover_all() was called {call_counter[0]} times; pair must reuse "
+        "one browse across both agents"
+    )
 
 
 def test_pair_with_agent_filter_only_runs_one_agent(monkeypatch):
@@ -77,10 +98,7 @@ def test_pair_with_agent_filter_only_runs_one_agent(monkeypatch):
     host_cache.write_client_id("codex",  "me@example.com")
     _stub_discover(
         monkeypatch,
-        {
-            "claude": [DiscoveredDevice("dev-x", "10.0.0.5:80", False, False)],
-            "codex":  [DiscoveredDevice("dev-x", "10.0.0.5:80", False, False)],
-        },
+        [DiscoveredDevice("dev-x", "10.0.0.5:80", False, False)],
     )
 
     rc = cli.main(["pair", "--agent", "claude"])
@@ -97,20 +115,19 @@ def test_pair_is_idempotent_for_already_paired_devices(monkeypatch, capsys):
     # discover returns the same device — it's already in the list.
     _stub_discover(
         monkeypatch,
-        {
-            "claude": [DiscoveredDevice("dev-x", "10.0.0.5:80", False, False)],
-            "codex":  [],
-        },
+        [DiscoveredDevice("dev-x", "10.0.0.5:80", False, False)],
     )
 
     cli.main(["pair"])
     out = capsys.readouterr().out
-    # No new devices added on either agent.
+    # Claude already has dev-x — no new devices.
     assert "[claude] no claimable devices" in out
-    assert "[codex] no claimable devices" in out
-    # Original entry still there, exactly once.
+    # Codex discovers dev-x via unfiltered discovery (#18).
+    assert "[codex] added 1 device" in out
+    # Original entry still there, exactly once per agent.
     devices = host_cache.load_paired_devices("claude")
     assert len(devices) == 1
+    assert len(host_cache.load_paired_devices("codex")) == 1
 
 
 # ============================================================ pair-reset

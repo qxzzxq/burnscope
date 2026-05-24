@@ -25,7 +25,7 @@ import sys
 from pathlib import Path
 
 from . import host_cache
-from .discovery import discover_all
+from .discovery import DiscoveredDevice, discover_all
 from .host_cache import PairedDevice
 
 CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
@@ -150,20 +150,23 @@ def _pair(agent_filter: str | None) -> int:
     host_cache.migrate_legacy_host_file()
     agents = ("claude", "codex") if agent_filter is None else (agent_filter,)
 
-    exit_code = 0
-    for agent in agents:
-        if host_cache.read_client_id(agent) is None:
-            print(
-                f"[{agent}] no cached client_id "
-                f"(~/.burnscope/client-id.{agent} missing) — skipping. "
-                f"Run the {agent} collector at least once to populate it."
-            )
-            exit_code = 1
-            continue
-        added = _pair_one_agent(agent)
-        if added is None:
-            exit_code = 1
-            continue
+    eligible = [a for a in agents if _has_client_id_or_warn(a)]
+    if not eligible:
+        # Every requested agent was missing its cached client_id.
+        return 1
+
+    # One unfiltered mDNS browse, reused across both agents. Each browse
+    # blocks for the full timeout (default 10s), so re-running it per
+    # agent would double the user-visible wait.
+    try:
+        discovered = asyncio.run(discover_all())
+    except Exception as exc:
+        print(f"mDNS discovery failed: {exc}")
+        return 1
+
+    exit_code = 0 if len(eligible) == len(agents) else 1
+    for agent in eligible:
+        added = _pair_one_agent(agent, discovered)
         if not added:
             print(f"[{agent}] no claimable devices on the LAN.")
             continue
@@ -175,19 +178,31 @@ def _pair(agent_filter: str | None) -> int:
     return exit_code
 
 
-def _pair_one_agent(agent: str) -> list[PairedDevice] | None:
-    """Discover free devices for `agent` and dedupe-merge them into the file.
+def _has_client_id_or_warn(agent: str) -> bool:
+    if host_cache.read_client_id(agent) is not None:
+        return True
+    print(
+        f"[{agent}] no cached client_id "
+        f"(~/.burnscope/client-id.{agent} missing) — skipping. "
+        f"Run the {agent} collector at least once to populate it."
+    )
+    return False
 
-    Returns the list of newly-added PairedDevices, an empty list when
-    discovery succeeded but found nothing claimable, or None on a
-    discovery error.
+
+def _pair_one_agent(
+    agent: str, discovered: list[DiscoveredDevice]
+) -> list[PairedDevice]:
+    """Dedupe-merge `discovered` into `agent`'s paired list.
+
+    `discovered` is the shared, unfiltered output of one `discover_all()`
+    browse (no `agent=` argument). Devices already TOFU-bound to us
+    (paired_<agent>=1 in TXT) are kept in the list so a pair-reset or
+    accidental paired-devices.json wipe can recover them. Devices owned
+    by someone else will 401 on the next real push and be silently
+    dropped.
+
+    Returns the list of newly-added PairedDevices.
     """
-    try:
-        discovered = asyncio.run(discover_all(agent=agent))
-    except Exception as exc:
-        print(f"[{agent}] mDNS discovery failed: {exc}")
-        return None
-
     known = {d.device_id for d in host_cache.load_paired_devices(agent)}
     added: list[PairedDevice] = []
     for device in discovered:

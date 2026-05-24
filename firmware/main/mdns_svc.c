@@ -15,14 +15,39 @@ static const char *TAG = "mdns";
 
 static bool s_started = false;
 
-/* Returns "1" iff the NVS pairing slot for `agent` holds a non-empty
- * client id, "0" otherwise (including any error reading NVS — be
- * conservative and advertise "free", at worst the client tries to claim
- * and the firmware's authorize_summary returns 401). */
+/* Per-agent cached TXT value, held across NVS read errors so a transient
+ * NVS glitch doesn't flip the advertisement from "1" to "0"
+ * permanently. Initialised to "0" (free) at boot. */
+static const char *s_paired_cache[] = { "0", "0" };
+
+static size_t _agent_cache_idx(const char *agent)
+{
+    if (strcmp(agent, "claude") == 0) return 0;
+    return 1;
+}
+
+/* Returns "1" when the NVS slot is populated, "0" when it is empty
+ * (ESP_ERR_NVS_NOT_FOUND). On any other NVS error, returns the previous
+ * cached value and logs a warning — matching the HTTP-side fail-closed
+ * behaviour so a transient NVS error does not permanently advertise the
+ * slot as free. */
 static const char *paired_value(const char *agent)
 {
     char buf[BURNSCOPE_CLIENT_ID_MAX];
-    return nvs_store_load_client_id(agent, buf, sizeof(buf)) == ESP_OK ? "1" : "0";
+    esp_err_t err = nvs_store_load_client_id(agent, buf, sizeof(buf));
+    size_t idx = _agent_cache_idx(agent);
+
+    if (err == ESP_OK) {
+        s_paired_cache[idx] = "1";
+        return "1";
+    }
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        s_paired_cache[idx] = "0";
+        return "0";
+    }
+    ESP_LOGW(TAG, "NVS read error for paired_%s: %s; keeping previous value (%s)",
+             agent, esp_err_to_name(err), s_paired_cache[idx]);
+    return s_paired_cache[idx];
 }
 
 void mdns_svc_start(void)

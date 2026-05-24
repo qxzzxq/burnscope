@@ -468,6 +468,38 @@ async def test_pusher_loop_silently_drops_device_on_401(monkeypatch):
     assert remaining == {"dev-keep"}
 
 
+async def test_pusher_loop_aggregate_false_when_all_devices_dropped(monkeypatch):
+    # If every paired device returns 401 (or otherwise gets dropped), the
+    # post-push state mirrors "no paired devices" — and `_push_one` writes
+    # ok=False for that case at line ~340. The fan-out branch must agree.
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+    host_cache.add_paired_device("codex", PairedDevice("dev-a", "10.0.0.5:80"))
+    host_cache.add_paired_device("codex", PairedDevice("dev-b", "10.0.0.6:80"))
+
+    async def fake_push_to_all(snapshot, devices, client_id, client):
+        return {d.device_id: PushResult(d.device_id, False, "auth") for d in devices}
+
+    monkeypatch.setattr(codex_daemon, "push_to_all", fake_push_to_all)
+
+    daemon._enqueue_snapshot(
+        AgentSnapshot(
+            agent="codex",
+            captured_at=1,
+            sessions=[SessionSnapshot("primary", 0.5, 1779066600)],
+        )
+    )
+    await _drain_one_push(
+        daemon,
+        predicate=lambda: host_cache.read_push_state("codex") is not None
+        and not host_cache.load_paired_devices("codex"),
+    )
+
+    assert host_cache.load_paired_devices("codex") == []
+    aggregate = host_cache.read_push_state("codex")
+    assert aggregate is not None and aggregate["ok"] is False
+
+
 async def test_pusher_loop_keeps_device_and_records_failure_on_transport(monkeypatch):
     daemon = CodexDaemon()
     daemon._client_id = "u@example.com"

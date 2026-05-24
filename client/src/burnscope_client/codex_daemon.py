@@ -49,6 +49,7 @@ from . import host_cache  # noqa: E402
 from ._log import configure_logging  # noqa: E402
 from .discovery import discover_all  # noqa: E402
 from .host_cache import PairedDevice  # noqa: E402
+from .identity import redact_client_id  # noqa: E402
 from .pusher import (  # noqa: E402
     PushAuthError,
     PushError,
@@ -59,18 +60,6 @@ from .pusher import (  # noqa: E402
 from .schema import AgentSnapshot, SessionSnapshot  # noqa: E402
 
 log = logging.getLogger(__name__)
-
-
-def _redact_client_id(client_id: str) -> str:
-    """Return a debug-safe form of a client_id (typically an email)."""
-    if not client_id:
-        return "<empty>"
-    if "@" in client_id:
-        local, _, domain = client_id.partition("@")
-        head = local[:2] if len(local) > 2 else local[:1]
-        return f"{head}***@{domain}"
-    head = client_id[:2] if len(client_id) > 2 else client_id[:1]
-    return f"{head}*** ({len(client_id)} chars)"
 
 
 AGENT_NAME = "codex"
@@ -210,7 +199,7 @@ class CodexDaemon:
         if cached != email:
             host_cache.write_client_id(AGENT_NAME, email)
         self._client_id = email
-        log.debug("codex identifier resolved: %s", _redact_client_id(email))
+        log.debug("codex identifier resolved: %s", redact_client_id(email))
 
         rl = await self._request("account/rateLimits/read", {})
         snapshot = _snapshot_from_rate_limits(rl.get("rateLimits"))
@@ -342,6 +331,7 @@ class CodexDaemon:
 
         results = await push_to_all(snapshot, devices, self._client_id, client)
         overall_ok = True
+        kept = 0
         for device_id, result in results.items():
             host_cache.write_push_state(
                 AGENT_NAME, ok=result.ok, device_id=device_id
@@ -364,8 +354,14 @@ class CodexDaemon:
                     continue
             else:
                 self._transport_failures.pop(device_id, None)
+            kept += 1
             if not result.ok:
                 overall_ok = False
+        # If every device was dropped during this push, mirror the "no
+        # paired devices" branch above and surface ok=False so `burnscope
+        # status` doesn't report a misleading healthy aggregate.
+        if kept == 0:
+            overall_ok = False
         host_cache.write_push_state(AGENT_NAME, ok=overall_ok)
 
     # --------------------------------------------------------------- health

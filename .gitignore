@@ -56,3 +56,4 @@ firmware/.gcc-flags.json
 local.toml
 local.yaml
 *.code-workspace
+*Demo

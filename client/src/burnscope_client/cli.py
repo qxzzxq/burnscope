@@ -24,6 +24,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import httpx
+
 from . import host_cache
 from .discovery import DiscoveredDevice, discover_all
 from .host_cache import PairedDevice
@@ -127,6 +129,20 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("pair-reset", help="Forget paired devices and cached client_ids")
 
+    p_ota = sub.add_parser(
+        "ota",
+        help="Push a firmware image to a paired device",
+    )
+    p_ota.add_argument(
+        "image",
+        help="Path to the firmware .bin (e.g. firmware/build-s3/burnscope.bin)",
+    )
+    p_ota.add_argument(
+        "--device",
+        required=True,
+        help="Target device_id (mDNS hostname, e.g. burnscope-5730)",
+    )
+
     args = parser.parse_args(argv)
 
     if args.cmd == "install":
@@ -163,7 +179,92 @@ def main(argv: list[str] | None = None) -> int:
             print()
             print("   (On Linux: systemctl --user restart burnscope-codex.)")
         return 0
+    if args.cmd == "ota":
+        return _ota(args.image, args.device)
     return 1
+
+
+# ======================================================================= ota
+
+
+def _ota(image_path_str: str, device_id: str) -> int:
+    """Push a firmware .bin to one paired device's /ota endpoint.
+
+    Workflow:
+      1. Validate the local image (path exists, file non-empty).
+      2. Scan both agents' paired-device lists for `device_id` and use
+         whichever agent has it bound — that agent's cached client_id
+         is what the firmware will accept. If both have it, we prefer
+         claude (arbitrary, deterministic).
+      3. Stream the image via `ota_pusher.push_ota`. Exit 0 on 202,
+         non-zero on auth/transport/image failure so a scripted
+         reflash doesn't pretend success on a 401.
+    """
+    from .ota_pusher import push_ota
+
+    image_path = Path(image_path_str)
+    if not image_path.is_file():
+        print(f"image not found: {image_path}")
+        return 1
+    image = image_path.read_bytes()
+    if not image:
+        print(f"image is empty: {image_path}")
+        return 1
+
+    chosen_agent: str | None = None
+    chosen_host: str | None = None
+    for agent in ("claude", "codex"):
+        for d in host_cache.load_paired_devices(agent):
+            if d.device_id == device_id:
+                chosen_agent = agent
+                chosen_host = d.host
+                break
+        if chosen_agent is not None:
+            break
+    if chosen_agent is None or chosen_host is None:
+        print(
+            f"{device_id} is not paired with any agent. "
+            f"Run `burnscope pair` (or `burnscope status`) first."
+        )
+        return 1
+
+    client_id = host_cache.read_client_id(chosen_agent)
+    if client_id is None:
+        print(
+            f"no cached client_id for agent {chosen_agent}; "
+            f"run the {chosen_agent} collector at least once."
+        )
+        return 1
+
+    print(
+        f"pushing {len(image)} bytes to {device_id} @ {chosen_host} "
+        f"(auth: {chosen_agent}/{client_id})..."
+    )
+
+    # Local import keeps the no-pairing-check path off the httpx
+    # cold-load path; the network-error vocabulary lives in
+    # pusher / ota_pusher.
+    from .pusher import PushAuthError, PushError
+
+    async def _go() -> dict:
+        async with httpx.AsyncClient() as client:
+            return await push_ota(image, chosen_host, client_id, client)
+
+    try:
+        result = asyncio.run(_go())
+    except PushAuthError as exc:
+        print(f"401 — auth rejected: {exc}")
+        return 1
+    except PushError as exc:
+        print(f"OTA failed: {exc}")
+        return 1
+
+    next_boot = result.get("next_boot") if isinstance(result, dict) else None
+    if next_boot:
+        print(f"OK — {device_id} will boot {next_boot} after ~1 s reboot")
+    else:
+        print(f"OK — {device_id} accepted the image and is rebooting")
+    return 0
 
 
 # ====================================================================== pair

@@ -46,9 +46,15 @@ Five concrete problems, each addressed by one of the five mitigations:
 2. **Long lit periods with no user looking** — full brightness 24/7
    even when the user is asleep or at lunch. Solved by **A2** idle
    dim + screen-off.
-3. **Codex daemon pushes once a minute regardless of user activity** —
-   would defeat A2 if treated as a wake signal. Solved by client-side
-   push **dedupe** so pushes correlate with semantic change.
+3. **Codex daemon's long-lived `app-server` cache is stale and
+   un-notified** — it doesn't observe rate-limit changes that
+   originate in other `codex` CLI processes on the same machine, so
+   left to the `rateLimits/updated` notification stream alone it
+   would push exactly once at bootstrap and never again. Solved by
+   client-side **active poll + dedupe**: read every minute, push
+   only when the snapshot differs from the last successfully pushed
+   one. This both keeps the firmware fresh *and* preserves the
+   silent-when-idle property A2 needs.
 4. **100 % brightness wears the panel super-linearly** — solved by
    **A3** default-brightness cap at 70 %.
 5. **Pure white and saturated blue ghost worst** — solved by **A4**
@@ -62,9 +68,11 @@ Five concrete problems, each addressed by one of the five mitigations:
 - **End user (developer):** never interacts with the mitigations
   directly. Notices: the screen dims when ignored, wakes when picked
   up, rotates with the device, and looks visually softer.
-- **Codex daemon (`codex_daemon.py`):** owns push dedupe. Must
-  produce a push only on semantic change so the firmware's idle
-  state machine can sleep.
+- **Codex daemon (`codex_daemon.py`):** owns active polling +
+  dedupe. Polls `account/rateLimits/read` once a minute and
+  produces a push only when the result differs from the last
+  successfully pushed snapshot, so the firmware's idle state
+  machine can sleep when nothing is changing.
 - **Firmware integrator** swapping panels: reuses the pure-logic
   idle state machine on a new display profile by writing a new
   adapter; SM is unchanged.
@@ -78,9 +86,9 @@ Five concrete problems, each addressed by one of the five mitigations:
 - The idle state machine is implemented as a pure-logic module with
   zero ESP-IDF dependencies, host-testable, reusable across display
   profiles (FR-2.x).
-- Codex daemon pushes only when an `AgentSnapshot` differs from the
-  last successfully pushed snapshot, under a small numeric tolerance
-  (FR-4.x).
+- Codex daemon polls `account/rateLimits/read` every minute and
+  pushes only when the freshly-read `AgentSnapshot` differs from
+  the last successfully pushed one (FR-4.x).
 - The AMOLED profile dims at 5 min idle and turns off at 30 min idle
   (defaults; both Kconfig-configurable). Any of accelerometer
   motion, touch, button, or qualifying `POST /summary` wakes the
@@ -130,7 +138,11 @@ HTTP POST /sum   ─►───────┤                     EV_PUSH│ �
                           └────────────────────────────────────────────────┘
 
                           ┌──────────────── client side (laptop) ─────────┐
-Codex app-server ─►──── account/rateLimits/updated ─►── AgentSnapshot ──► │
+1-min poll ─►──── account/rateLimits/read ─►── AgentSnapshot ─────────► │
+                          │  (notifications also handled if they fire,    │
+                          │   but cross-process emission is unreliable —  │
+                          │   see § 5.2 A-4. Poll is the authoritative    │
+                          │   trigger.)                                   │
                           │                                                │
                           │  semantically_equal(new, _last_pushed)?        │
                           │      yes ──► drop (log debug)                  │
@@ -152,7 +164,7 @@ client:
 | **Idle state machine**         | `firmware/main/burn_protection/burn_idle.{h,c}` | Pure-logic SM. Inputs: events + monotonic time. Outputs: `{state, brightness_pct, panel_on, changed}`. Zero ESP-IDF deps. |
 | **AMOLED idle adapter**        | `firmware/main/displays/amoled_sh8601/burn_idle_adapter.c` | Wires IMU sampling, touch IRQ, button IRQ, `POST /summary` callback, and a 1 Hz `esp_timer` into the SM; applies SM outputs to the SH8601 driver. |
 | **Orientation detector**       | `firmware/main/displays/amoled_sh8601/orientation.c` | Reads accelerometer gravity vector, picks quadrant with hysteresis + debounce, drives `lv_disp_set_rotation`. |
-| **Codex snapshot dedupe**      | `client/src/burnscope_client/codex_daemon.py` (modified) + `client/src/burnscope_client/schema.py` (helper) | `AgentSnapshot.semantically_equal(other)` and a new `_last_pushed_snapshot` field gating `_enqueue_snapshot`. |
+| **Codex active poll + dedupe** | `client/src/burnscope_client/codex_daemon.py` (modified) + `client/src/burnscope_client/schema.py` (helper) | `AgentSnapshot.semantically_equal(other)` plus a new `_poll_loop` that calls `account/rateLimits/read` every `POLL_INTERVAL_S` and only enqueues when the result differs from `_last_pushed_snapshot`. |
 | **Palette validator**          | `firmware/main/displays/amoled_sh8601/palette_check.c` (or CMake-time script) | Static check that all colour tokens used by the AMOLED UI satisfy A4. |
 
 ### 2.2 Hardware / Platform Architecture
@@ -224,12 +236,13 @@ flapping/debounce-of-tick, config edge cases.
 
 **Dependencies.** None.
 
-### 3.2 Phase 2 — AMOLED Adapter + Codex Dedupe (paired)
+### 3.2 Phase 2 — AMOLED Adapter (firmware-side)
 
-**Scope.** The end-to-end idle behaviour on the AMOLED hardware,
-together with the upstream change that makes it actually reachable.
-These two land together because neither is end-to-end-verifiable on
-its own.
+**Scope.** The end-to-end idle behaviour on the AMOLED hardware.
+The previously-paired client-side dedupe work shipped independently
+ahead of this phase (see "Codex poll + dedupe (shipped)" below);
+the adapter can now rely on `POST /summary` arrivals being
+genuinely meaningful when they do happen.
 
 **Deliverables.**
 
@@ -237,18 +250,29 @@ its own.
   touch IRQ binding, button IRQ binding, 1 Hz `esp_timer` for
   `EV_TIME`, snapshot listener hooked to `EV_PUSH`, brightness +
   panel sleep/wake actions on SM output.
-- `schema.py`: `AgentSnapshot.semantically_equal(other, *,
-  usage_percent_tolerance=0.5)` (or a free function — see § 6.3).
-- `codex_daemon.py`: new `_last_pushed_snapshot` member; dedupe in
-  `_enqueue_snapshot` (or just before `_push_one` enqueues);
-  `_last_pushed_snapshot` updated only after a successful push;
-  always push on first run; debug log on dedupe drop.
 
-**Exit criteria.** All Phase 2 tests in § 8.2 pass on hardware:
-manual dim/off timing, all four wake sources, push-with-no-change
-does not wake, push-with-change does wake.
+**Exit criteria.** Phase 2 hardware tests in § 8.2 pass: manual
+dim/off timing, all four wake sources, push-with-no-change does
+not wake (relies on the client-side dedupe already shipped),
+push-with-change does wake.
 
-**Dependencies.** Phase 1.
+**Dependencies.** Phase 1. Implicit dependency on the shipped
+Codex poll + dedupe to satisfy the WAKE-005 ("non-qualifying push
+does not wake") test.
+
+#### Phase 2a (already shipped) — Codex poll + dedupe
+
+Landed as a `fix/` branch ahead of the firmware adapter because
+the daemon's notification path was found to be broken in practice
+(see § 5.2 A-4). Delivers:
+
+- `schema.py`: `AgentSnapshot.semantically_equal(other)` — no
+  tolerance kwarg.
+- `codex_daemon.py`: `POLL_INTERVAL_S = 60`,
+  `_last_pushed_snapshot`, `_poll_loop` coroutine gathered
+  alongside `_pusher_loop` and `_health_loop`,
+  `_last_pushed_snapshot` advanced only on successful push.
+- `tests/test_schema.py` + extensions to `tests/test_codex_daemon.py`.
 
 ### 3.3 Phase 3 — Orientation Rotation
 
@@ -389,38 +413,50 @@ no-push rate when usage is unchanged.
   exposed as Kconfig options under `BurnScope display → AMOLED
   burn-in`.
 
-**FR-4 Codex Daemon Push Dedupe**
+**FR-4 Codex Daemon Active Poll + Push Dedupe**
 
 - **FR-4.1** [Must]: `codex_daemon.py` shall maintain a
   `_last_pushed_snapshot` attribute, initialised to `None`.
-- **FR-4.2** [Must]: Before enqueuing a freshly-derived
-  `AgentSnapshot` for push, the daemon shall compare it against
-  `_last_pushed_snapshot` using a semantic-equality predicate
-  (FR-4.4 / FR-4.5).
-- **FR-4.3** [Must]: If the predicate reports equal, the snapshot
-  shall not be enqueued and shall not be pushed; the event shall be
-  logged at debug level. If unequal (or if
-  `_last_pushed_snapshot is None`), the snapshot shall be enqueued
-  for the existing `_pusher_loop`.
+- **FR-4.2** [Must]: The daemon shall run a `_poll_loop` coroutine
+  alongside `_pusher_loop` and `_health_loop`. Every
+  `POLL_INTERVAL_S` seconds (default: 60), the loop shall send an
+  `account/rateLimits/read` JSON-RPC request to its own
+  `codex app-server` subprocess and convert the response into an
+  `AgentSnapshot` via the existing `_snapshot_from_rate_limits`
+  helper.
+- **FR-4.3** [Must]: The freshly-built snapshot shall be compared
+  against `_last_pushed_snapshot` using a semantic-equality
+  predicate (FR-4.4 / FR-4.5). If the predicate reports equal, the
+  snapshot shall not be enqueued; the event shall be logged at
+  debug level. If unequal (or if `_last_pushed_snapshot is None`),
+  the snapshot shall be enqueued for the existing `_pusher_loop`.
 - **FR-4.4** [Must]: The semantic-equality predicate shall be
-  insensitive to `resets_at` ticking forward, and shall consider
-  `used_pct` equal when `|new - old| < USAGE_PERCENT_TOLERANCE`,
-  where `USAGE_PERCENT_TOLERANCE = 0.005` (0.5 percentage points
-  expressed in the 0.0–1.0 range used by `SessionSnapshot`).
+  insensitive to `captured_at` (which bumps on every read) and
+  shall compare `used_pct` byte-exact. No numeric tolerance: the
+  Codex wire format returns `usedPercent` as an integer (cast to
+  fraction client-side), so there is no sub-unit jitter to absorb.
 - **FR-4.5** [Must]: For non-numeric fields (`agent`,
   `sessions[*].type`, and the set of `(type)` keys present), the
-  predicate shall require byte-exact equality. A change in the set
-  of session types is by definition a state transition.
+  predicate shall also require byte-exact equality. Session order
+  shall not be significant (sorted before comparison). A change in
+  the set of session types is by definition a state transition.
 - **FR-4.6** [Must]: `_last_pushed_snapshot` shall be updated only
-  after a push completes with `result.ok == True`. A transport
-  failure or auth drop shall leave the previous value untouched so
-  the next opportunity re-pushes the same content.
-- **FR-4.7** [Should]: The tolerance and the field list shall be
-  named constants in `schema.py` so they are testable and tunable
-  in isolation.
-- **FR-4.8** [May]: The dedupe predicate may also be reused by a
-  future Claude-statusline dedupe path; the helper shall not depend
-  on Codex-specific state.
+  after a push completes with `overall_ok == True` (at least one
+  device accepted the push). A transport failure, auth drop, or
+  wholesale failure shall leave the previous value untouched so
+  the next poll iteration re-pushes the same content.
+- **FR-4.7** [Should]: The poll interval shall live in a named
+  module-level constant (`POLL_INTERVAL_S`) so tests can patch it
+  to a sub-second cadence without changing daemon logic.
+- **FR-4.8** [Should]: The existing `_dispatch` handler for
+  `account/rateLimits/updated` notifications shall be preserved
+  unchanged. Cross-process emission of these notifications is
+  unreliable today (see § 5.2 A-4), but the path costs nothing and
+  is a free win if a future codex release fixes it.
+- **FR-4.9** [May]: The `semantically_equal` predicate lives on
+  `AgentSnapshot` and shall not depend on Codex-specific state, so
+  a future Claude-statusline dedupe path can reuse it without
+  modification.
 
 **FR-5 Palette Acceptance Check**
 
@@ -464,12 +500,15 @@ no-push rate when usage is unchanged.
   noticeable but not abrupt; the SH8601 brightness register write
   is the only required action (no fade ramp). If a smoother visual
   is required later, it shall be added in the adapter, not the SM.
-- **NFR-3.1** [Must]: The Codex daemon's dedupe path shall add
-  ≤ 5 ms to the per-snapshot processing time, measured on
-  reference hardware (Apple Silicon laptop, Python 3.11).
-- **NFR-3.2** [Should]: In steady-state operation where upstream
+- **NFR-3.1** [Must]: In steady-state operation where upstream
   rate-limit values are unchanged, the daemon shall produce zero
-  pushes per minute (modulo the first-run push).
+  `POST /summary` pushes (modulo the first-run push at bootstrap).
+  This is the load-bearing property that lets the firmware's idle
+  SM reach Dimmed and Off.
+- **NFR-3.2** [Should]: A single `_poll_loop` iteration (read +
+  semantic-equality check) shall complete in ≤ 50 ms on reference
+  hardware (Apple Silicon laptop, Python 3.14, codex-cli 0.133+),
+  excluding the 60 s sleep between iterations.
 - **NFR-4.1** [Must]: `burn_idle.c` shall compile cleanly with a
   host C99 compiler in a target without any ESP-IDF environment;
   the host test suite shall be runnable on macOS and Linux CI.
@@ -506,7 +545,7 @@ no-push rate when usage is unchanged.
 | QMI8658 accel sampling at 21 Hz produces too much jitter at the motion threshold (false `EV_MOTION` storms) | Medium | High — would keep the panel pinned awake | Filter via per-axis low-pass before delta computation; expose threshold as Kconfig (FR-3.8) |
 | `lv_disp_set_rotation` is not honoured by the SH8601 driver path | Medium | Medium | Fall back to manual orientation transform in the LVGL flush callback; gated by Kconfig FR-1.6 |
 | Touch IRQ does not fire while panel is in sleep (C-2) | Medium | Low — motion / push still wake | Disable touch as a wake source; document the deviation |
-| Codex `account/rateLimits/updated` semantics jitter `used_pct` by > 0.5 pp in steady state | Low | Medium — would defeat dedupe | Tighten or widen `USAGE_PERCENT_TOLERANCE`; constant lives in `schema.py` (FR-4.7) |
+| Codex CLI changes the on-disk rate-limit storage format, or `rateLimits/read` against a long-lived app-server stops re-reading from disk | Low | Medium — poll would return stale values forever | Verify in CI / on bring-up against each `codex-cli` upgrade. Fallback design: periodically `_terminate()` the app-server subprocess so the next `_run_once` iteration's bootstrap re-reads from disk. |
 | Existing colour tokens already violate FR-5 | Medium | Low | Phase 4 acceptance includes a one-time palette audit; treat violations as bugs and fix |
 
 ### 5.2 Assumptions
@@ -522,13 +561,27 @@ no-push rate when usage is unchanged.
   for factory reset in `factory_reset.c`), the adapter shall share
   it — a press is unambiguously a user interaction regardless of
   intent.
-- **A-4** The Codex app-server emits `account/rateLimits/updated`
-  with frequency on the order of one per minute when the daemon
-  is connected. (Source: `codex_daemon.py` operational notes.)
-- **A-5** The wire-format `used_pct` field has been normalised to
-  the 0.0–1.0 range (per `docs/wire-format.md`), so the 0.5 pp
-  tolerance expressed as 0.005 in that range is correct.
-- **A-6** LVGL 9.x is in use; `LV_DRAW_SW_COMPLEX` and the
+- **A-4** Cross-process emission of `account/rateLimits/updated`
+  notifications is **unreliable** — verified via `lsof` against the
+  long-lived `codex app-server` subprocess: zero file watchers on
+  any `~/.codex/state_*.sqlite` path, only an empty kqueue. Rate
+  limit changes that originate in other `codex` CLI processes
+  therefore do not reach the daemon's app-server, and no
+  `rateLimits/updated` notification is emitted. The daemon must
+  poll (FR-4.2) and cannot rely on this notification stream.
+- **A-5** `account/rateLimits/read` against a long-lived
+  `codex app-server` instance re-reads the underlying disk cache on
+  each call — verified empirically with codex-cli 0.133.0: held one
+  app-server for 120 s, did two `read` calls bracketing real CLI
+  activity, observed `primary.usedPercent` advance from 15 → 17
+  inside the same process. If this property regresses in a future
+  codex-cli release, the fallback in § 5.1 (recycle the subprocess
+  via the existing reconnect machinery) applies.
+- **A-6** The wire-format `used_pct` field is normalised to the
+  0.0–1.0 range (per `docs/wire-format.md`), but the Codex upstream
+  `usedPercent` is integer in the 0–100 range, so semantic equality
+  comparisons are byte-exact with no jitter to absorb.
+- **A-7** LVGL 9.x is in use; `LV_DRAW_SW_COMPLEX` and the
   anti-aliased font path are available.
 
 ### 5.3 External Dependencies
@@ -552,6 +605,14 @@ no-push rate when usage is unchanged.
 - **G-3** No telemetry yet on how often the idle SM enters Dimmed
   vs. Off vs. how often pushes wake the panel. Worth adding to
   `GET /health` once the feature is shipping (separate task).
+- **G-4** Multi-machine staleness: the daemon's poll reads PC A's
+  *local* Codex cache. Rate-limit activity that happens on PC B is
+  invisible to PC A's daemon — its panel will keep showing PC A's
+  last-observed value even if the global account quota has moved.
+  Possible mitigations are all out of scope (forced refresh prompts
+  cost real tokens; direct OpenAI calls bypass `app-server` and
+  break the no-tokens-consumed property; shared state across PCs
+  needs cloud sync). Document the limitation and accept it for v1.
 
 ---
 
@@ -642,23 +703,20 @@ an `EV_PUSH` event into the adapter's event queue. The existing
 ```python
 class AgentSnapshot:
     ...
-    def semantically_equal(
-        self,
-        other: "AgentSnapshot | None",
-        *,
-        usage_percent_tolerance: float = USAGE_PERCENT_TOLERANCE,
-    ) -> bool:
+    def semantically_equal(self, other: "AgentSnapshot | None") -> bool:
         """Return True iff `other` represents the same user-visible state.
 
-        Compares `agent`, the set of session `type` keys, and per-type
-        `used_pct` within `usage_percent_tolerance` (default 0.005,
-        i.e. 0.5 percentage points). Ignores `captured_at` and
-        `resets_at`. Returns False if `other` is None.
+        Compares `agent` and the per-session `(type, used_pct, resets_at)`
+        tuples, sorted by `type` so session order is not significant.
+        Ignores `captured_at` — that timestamp bumps every time the daemon
+        re-reads, but does not reflect a user-visible change. Returns
+        False if `other is None`.
         """
 ```
 
-`USAGE_PERCENT_TOLERANCE = 0.005` lives at module scope in
-`schema.py`.
+Byte-exact on numerics — no tolerance kwarg. The Codex upstream
+returns `usedPercent` as integer (cast to a fraction client-side),
+so there is no sub-percent jitter to absorb.
 
 ### 6.3 Data Models / Schemas
 
@@ -691,8 +749,9 @@ Unchanged. The idle SM starts in `BURN_IDLE_ACTIVE` at boot.
 - Idle SM ticks at 1 Hz; transitions to Dimmed at 5 min, Off at
   30 min (defaults).
 - Any of motion, touch, button, or qualifying push wakes the panel.
-- Codex daemon dedupes pushes — when nothing changes upstream,
-  nothing reaches the panel, and the panel can sleep.
+- Codex daemon polls `account/rateLimits/read` every 60 s and
+  pushes only when the result differs from `_last_pushed_snapshot`.
+  Steady state with no token usage = zero pushes, panel can sleep.
 - The UI rotates to match the device's orientation as detected by
   the accelerometer.
 
@@ -700,20 +759,30 @@ Unchanged. The idle SM starts in `BURN_IDLE_ACTIVE` at boot.
 
 - **Tuning idle thresholds:** edit Kconfig under
   `BurnScope display → AMOLED burn-in` and rebuild.
-- **Tuning Codex dedupe sensitivity:** edit
-  `USAGE_PERCENT_TOLERANCE` in `schema.py`.
+- **Tuning Codex poll cadence:** edit `POLL_INTERVAL_S` in
+  `codex_daemon.py`. Lower = fresher panel at the cost of more
+  `app-server` traffic; higher = more staleness.
 - **Force a wake from the daemon side** (useful for testing):
-  any code path that bumps `used_pct` by ≥ 0.5 pp (e.g. a
-  scratched test fixture) will push and wake the panel.
+  bump `usedPercent` upstream (run any real Codex prompt that
+  burns ≥ 1 % of a window). The next poll detects the change and
+  pushes.
 
 ### 7.5 Recovery
 
 - **Panel stuck off after a wake event:** check that the adapter's
   event queue is being drained; check `EV_TIME` is firing at 1 Hz
   via the existing `esp_timer` diagnostics in `/health`.
+- **Codex daemon polls but every iteration is reported as
+  "unchanged"** (panel never refreshes after a real change): check
+  that `account/rateLimits/read` against the long-lived app-server
+  still re-reads from disk — held to be true per A-5, but verify
+  on each codex-cli upgrade. Workaround: restart the daemon
+  (`launchctl unload && load`) to force a fresh bootstrap. If
+  reproducible across restarts, A-5 has regressed and the § 5.1
+  fallback (periodic app-server respawn) applies.
 - **Codex daemon never dedupes (all pushes go through):** verify
-  that `_last_pushed_snapshot` is being updated only after
-  `result.ok`; a bug there leaves it permanently `None`.
+  that `_last_pushed_snapshot` is being updated only on push
+  success; a bug there leaves it permanently `None`.
 
 ---
 
@@ -743,7 +812,7 @@ Unchanged. The idle SM starts in `BURN_IDLE_ACTIVE` at boot.
 | SM-070     | No ESP-IDF includes              | Grep `burn_idle.c` for `esp_`, `freertos`, `lvgl`, `lv_`, `driver/`.      | No matches. |
 | SM-071     | Host compile                     | Invoke host CMake target.                                                 | Builds and tests run outside ESP-IDF. |
 
-### 8.2 Phase 2 Verification — Adapter + Codex Dedupe (hardware + client)
+### 8.2 Phase 2 Verification — Adapter + Codex Poll/Dedupe (hardware + client)
 
 | Test ID    | Feature                          | Procedure                                                                 | Success Criteria |
 |------------|----------------------------------|---------------------------------------------------------------------------|------------------|
@@ -752,15 +821,18 @@ Unchanged. The idle SM starts in `BURN_IDLE_ACTIVE` at boot.
 | WAKE-001   | Motion wake                      | Tap / lift device while OFF.                                              | Panel restores to 70 % within 200 ms. |
 | WAKE-002   | Touch wake                       | Tap screen while OFF.                                                     | Panel restores within 200 ms. |
 | WAKE-003   | Button wake                      | Press button while OFF.                                                   | Panel restores within 200 ms. |
-| WAKE-004   | Qualifying push wake             | While OFF, force a `used_pct` change ≥ 0.5 pp upstream.                   | Push fires, panel restores within 200 ms. |
-| WAKE-005   | Non-qualifying push does NOT wake| While OFF, leave upstream values constant for 5 min.                      | Codex daemon issues no pushes; panel stays OFF. |
-| DEDUPE-001 | First-run always pushes          | Restart `codex_daemon`, observe first push.                               | Push fires; `_last_pushed_snapshot` becomes non-None. |
-| DEDUPE-002 | Identical snapshot drops         | Force two identical `rateLimits` payloads upstream.                       | Second produces no `POST /summary`; debug log shows dedupe drop. |
-| DEDUPE-003 | Tolerance window                 | `used_pct` deltas of 0.001, 0.004, 0.006.                                 | First two: drop. Third: push. |
-| DEDUPE-004 | Session set change pushes        | Add a new session `type` upstream.                                        | Push fires regardless of `used_pct`. |
-| DEDUPE-005 | Auth / agent change pushes       | Simulate an `agent` field change (synthetic test).                        | Push fires. |
-| DEDUPE-006 | Failed push does not advance state | Force a transport error on the next push.                              | `_last_pushed_snapshot` unchanged; retry pushes the same content. |
-| DEDUPE-007 | Helper is unit-tested in isolation | `pytest client/tests/test_schema_semantic_equal.py`.                    | All cases pass. |
+| WAKE-004   | Qualifying push wake             | While OFF, run a Codex prompt that burns ≥ 1 % of a window.               | Within ≤ 60 s of activity, push fires and panel restores within 200 ms of the push. |
+| WAKE-005   | Non-qualifying poll does NOT wake| While OFF, leave upstream untouched for 5 min.                            | Codex daemon issues no pushes; panel stays OFF. |
+| POLL-001   | Poll fires on cadence             | Run daemon with `BURNSCOPE_LOG_LEVEL=DEBUG`; tail the log for 70 s with no upstream activity. | At least one "codex poll: rate limits unchanged; skipping push" debug line in the window. |
+| POLL-002   | Poll no-ops before bootstrap     | Force `_client_id = None`; let `_poll_loop` run a few iterations.         | Zero calls to `_request`; queue stays empty. |
+| POLL-003   | Poll tolerates request errors    | Inject a `CodexProtocolError` from `_request`; observe.                   | Loop continues; the *next* successful read enqueues correctly. |
+| DEDUPE-001 | First-run always pushes          | Restart `codex_daemon` against a steady upstream.                         | First poll-driven push fires; `_last_pushed_snapshot` becomes non-None. |
+| DEDUPE-002 | Identical snapshot drops         | Two consecutive `account/rateLimits/read` results with the same `usedPercent`. | Second produces no `POST /summary`; debug log shows dedupe drop. |
+| DEDUPE-003 | Any `used_pct` delta pushes      | Inject `usedPercent` deltas of 1 and 5 percentage points.                 | Both push (byte-exact comparison; no tolerance). |
+| DEDUPE-004 | Session set change pushes        | Inject a snapshot adding a new session `type`.                            | Push fires regardless of `used_pct`. |
+| DEDUPE-005 | Resets-at change pushes          | Inject a snapshot with a changed `resets_at` (window rolled over).        | Push fires. |
+| DEDUPE-006 | Failed push does not advance state | Push transport-fails on all paired devices.                            | `_last_pushed_snapshot` unchanged; next poll re-attempts the same content. |
+| DEDUPE-007 | Helper is unit-tested in isolation | `pytest client/tests/test_schema.py`.                                   | All `test_semantically_equal_*` cases pass. |
 
 ### 8.3 Phase 3 Verification — Orientation (hardware)
 
@@ -822,13 +894,14 @@ convention as `docs/fsd/firmware-fsd.md` § 8.4.)
 | FR-3.7      | Must     | WAKE-004, AT-3 (HTTP keeps running)                   | Planned |
 | FR-3.8      | Should   | Build-config inspection during DIM-001                | Planned |
 | FR-4.1      | Must     | DEDUPE-001                                            | Planned |
-| FR-4.2      | Must     | DEDUPE-002                                            | Planned |
+| FR-4.2      | Must     | POLL-001, POLL-002, POLL-003                          | Planned |
 | FR-4.3      | Must     | DEDUPE-002, DEDUPE-003                                | Planned |
-| FR-4.4      | Must     | DEDUPE-003                                            | Planned |
+| FR-4.4      | Must     | DEDUPE-003 (byte-exact, no tolerance)                 | Planned |
 | FR-4.5      | Must     | DEDUPE-004, DEDUPE-005                                | Planned |
 | FR-4.6      | Must     | DEDUPE-006                                            | Planned |
-| FR-4.7      | Should   | DEDUPE-007                                            | Planned |
-| FR-4.8      | May      | DEDUPE-007 (helper is agent-agnostic)                 | Planned |
+| FR-4.7      | Should   | POLL-001 (cadence patchable via constant)             | Planned |
+| FR-4.8      | Should   | Code inspection — `_dispatch` notification path retained | Planned |
+| FR-4.9      | May     | DEDUPE-007 (helper is agent-agnostic)                 | Planned |
 | FR-5.1      | Must     | PALETTE-001, PALETTE-003                              | Planned |
 | FR-5.2      | Must     | PALETTE-002, PALETTE-004                              | Planned |
 | FR-5.3      | Should   | PALETTE-001 (build fail proves enforcement)           | Planned |
@@ -839,8 +912,8 @@ convention as `docs/fsd/firmware-fsd.md` § 8.4.)
 | NFR-1.2     | Should   | CPU profiler measurement during AT-1                  | Planned |
 | NFR-2.1     | Must     | WAKE-001 / WAKE-004 with stopwatch / oscilloscope     | Planned |
 | NFR-2.2     | Should   | Visual inspection during DIM-001/DIM-002              | Planned |
-| NFR-3.1     | Must     | Microbenchmark during DEDUPE-007                      | Planned |
-| NFR-3.2     | Should   | AT-3                                                  | Planned |
+| NFR-3.1     | Must     | AT-3                                                  | Planned |
+| NFR-3.2     | Should   | Microbenchmark during DEDUPE-007                      | Planned |
 | NFR-4.1     | Must     | SM-071                                                | Planned |
 | NFR-5.1     | Should   | Coverage report from SM-* host tests                  | Planned |
 | NFR-6.1     | Should   | AT-2                                                  | Planned |
@@ -851,11 +924,11 @@ convention as `docs/fsd/firmware-fsd.md` § 8.4.)
 
 | Symptom                                              | Likely Cause                                                      | Diagnostic Steps                                                              | Corrective Action |
 |------------------------------------------------------|-------------------------------------------------------------------|-------------------------------------------------------------------------------|-------------------|
-| Panel never dims                                     | Codex daemon pushing on every tick (dedupe regressed)             | Tail daemon at debug; expect dedupe drops in steady state.                    | Re-check `_last_pushed_snapshot` is updated only on `result.ok`. |
+| Panel never dims                                     | Codex daemon pushing on every poll (dedupe regressed)             | Tail daemon at debug; expect "rate limits unchanged; skipping push" in steady state. | Re-check `_last_pushed_snapshot` is updated only when push success (`overall_ok`). |
 | Panel dims but never turns off                       | `EV_TIME` not firing at 1 Hz                                       | Add `ESP_LOGD` in `EV_TIME` handler; verify timer running.                    | Re-arm `esp_timer`; check timer queue depth. |
 | Panel turns off and never comes back                 | Wake source unwired                                                | Manual motion test (WAKE-001) and touch test (WAKE-002).                      | Inspect adapter event queue and ISR registration. |
 | UI rotates wildly                                    | Hysteresis band too narrow or noisy accel                          | Inspect raw accel samples; widen `motion_threshold_mg` and rotation hysteresis. | Tune Kconfig. |
-| Daemon pushes every minute even when nothing changes | `USAGE_PERCENT_TOLERANCE` smaller than upstream jitter             | Compare deltas in `_last_snapshot` vs `_last_pushed_snapshot`.                | Increase tolerance; document the new value. |
+| Daemon polls but panel never refreshes after real activity | `rateLimits/read` against long-lived app-server stopped re-reading from disk (A-5 regression) | Restart the daemon (`launchctl unload && load`); if a fresh bootstrap shows up-to-date values but subsequent polls drift, A-5 has regressed. | Apply the § 5.1 fallback: periodically respawn the app-server via the existing `_terminate()` + restart machinery. |
 | Build fails with palette error                       | A colour token violates FR-5                                       | Read the build-error file/line.                                               | Replace the colour with a compliant value. |
 
 ---
@@ -874,7 +947,7 @@ convention as `docs/fsd/firmware-fsd.md` § 8.4.)
 | Rotation hysteresis                 | 0.2 g                         | A1 source spec |
 | Rotation debounce                   | 500 ms                        | A1 source spec |
 | Accel ODR                           | `Qmi8658AccOdr_LowPower_21Hz` | A1 source spec |
-| `USAGE_PERCENT_TOLERANCE` (client)  | 0.005 (= 0.5 percentage points in `[0,1]`) | This FSD |
+| `POLL_INTERVAL_S` (client)          | 60 s                          | This FSD |
 | SM tick cadence                     | 1 Hz                          | This FSD |
 | Palette: max channel cap            | 0xC0 per channel              | A4 source spec |
 | Palette: saturated-blue rule        | B ≥ 0xB0 AND R < 0x40 AND G < 0x40 → reject | A4 source spec |
@@ -911,6 +984,6 @@ t=30:06   EV_TIME                   → ACTIVE, br=70, panel=on, changed=0
 - `[[burnscope/docs/fsd/firmware-fsd.md]]` — existing firmware FSD; `POST /summary` and snapshot store inherited from here.
 - `[[burnscope/docs/wire-format.md]]` — `AgentSnapshot` shape; basis of FR-4 semantic equality.
 - `[[burnscope/docs/client-spec-v2.html]]` — multi-agent client architecture; locates the Codex daemon.
-- `[[burnscope/docs/codex-app-server.html]]` — `account/rateLimits/updated` cadence assumption (A-4).
+- `[[burnscope/docs/codex-app-server.html]]` — `account/rateLimits/read` and `rateLimits/updated` semantics (basis of A-4, A-5, FR-4).
 - `[[burnscope/CLAUDE.md]]` — repository conventions.
 - `[[burnscope/docs/ESP32-S3-AMOLED-1.43-Demo]]` - Waveshare demo code for ESP32-S3-AMOLED-1.43.

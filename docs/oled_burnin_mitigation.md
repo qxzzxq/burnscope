@@ -220,66 +220,76 @@ Any wake source returns the state machine to *Active* and restores
 `DEFAULT_BRIGHTNESS` immediately — no fade-up, instant response feels
 better when the user picks the device up.
 
-#### Client side: push gating in the Codex daemon
-The Codex app-server (`codex_daemon.py`) forwards an
-`account/rateLimits/updated` notification roughly once per minute as
-long as the daemon is alive — completely decoupled from whether the
-user is present. If every notification became a push, the firmware's
-`last_activity` would refresh every minute and the panel would never
-enter the *Dimmed* or *Display off* states.
+#### Client side: active poll + dedupe in the Codex daemon
 
-To make pushes a faithful "something changed" signal, the daemon
-**deduplicates** before pushing:
+The naïve assumption — that `account/rateLimits/updated`
+notifications would flow steadily from the `codex app-server`
+subprocess our daemon manages — turned out to be wrong. The
+long-lived app-server is a passive observer: it reads its
+rate-limit cache from disk at bootstrap and never sees the changes
+that happen when separate `codex` CLI processes burn tokens
+elsewhere on the same machine. Verified empirically — `lsof` on
+the running app-server shows zero file watchers on
+`~/.codex/state_*.sqlite` and no IPC channels to the other CLI
+processes. So if we sat on notifications alone, the daemon would
+push exactly once at bootstrap and then go silent for the lifetime
+of the connection.
 
-1. Keep the last successfully-pushed `AgentSnapshot` in memory
-   (`self._last_pushed_snapshot`, separate from `_last_snapshot`,
-   which already exists and tracks the latest-received).
-2. On each newly-received snapshot, compare against
-   `_last_pushed_snapshot` using a *semantic equality* check
-   (see below for which fields count).
-3. If equal → log at debug and skip the push entirely; do **not**
-   enqueue for `_pusher_loop`. If different → enqueue and, on
-   successful push, update `_last_pushed_snapshot`.
-4. On first-run (`_last_pushed_snapshot is None`) always push, so the
-   firmware has initial data.
+The codex CLI's on-disk cache *does* advance with real activity,
+and `account/rateLimits/read` against the long-lived app-server
+*does* re-read from that cache on each call (verified by holding
+one app-server alive across 120 s of real CLI activity and
+observing `usedPercent` advance between two `read` calls into the
+same process). So the daemon **actively polls** and **dedupes**:
 
-**Semantic equality** (with tolerance): compare the fields that
-represent user-visible state, not wall-clock metadata. As a starting
-point:
+1. Every `POLL_INTERVAL_S` seconds (default: 60), call
+   `account/rateLimits/read` against the daemon's own app-server.
+2. Build an `AgentSnapshot` from the result.
+3. Compare against `_last_pushed_snapshot` (the last snapshot we
+   successfully delivered to at least one device) via
+   `AgentSnapshot.semantically_equal(other)`.
+4. If equal → log at debug and skip. If different → enqueue for
+   `_pusher_loop`.
+5. On the first iteration (`_last_pushed_snapshot is None`) always
+   push, so the firmware has data immediately.
+6. Update `_last_pushed_snapshot` only after the push completes
+   with at least one device accepting it. A transport failure or
+   auth drop leaves the previous value untouched, so the next
+   poll re-attempts.
 
-- Include: `sessions[*].usage_percent`, `sessions[*].window_label`,
-  the set of session identifiers / window keys, and any auth state.
-- Exclude: monotonically-advancing `reset_at` timestamps if they
-  only tick forward without the window itself rolling over. (If a
-  reset boundary *does* cross — i.e. the window resets to 0 % —
-  `usage_percent` will change anyway, so we catch it.)
-- **Numeric tolerance**: `usage_percent` is considered unchanged if
-  `|new - old| < 0.5` (percentage points, absolute). This absorbs
-  sub-percent jitter from the OpenAI rate-limit API without
-  suppressing meaningful movement — a 0.5 pp change at 80 % usage
-  is roughly one extra prompt, which is exactly the granularity a
-  user would want a wake-up for.
-- Non-numeric fields (labels, session sets, auth) are compared
-  byte-exact — no tolerance, since any change there is by
-  definition a state transition.
+**Semantic equality** — no tolerance needed:
 
-The exact field list lives in `schema.py` and should be encoded as a
-small helper (e.g. `AgentSnapshot.semantically_equal(other)` or an
-equivalent free function in `codex_daemon.py`) so the comparison is
-testable in isolation. The tolerance value should be a named
-constant (`USAGE_PERCENT_TOLERANCE = 0.5`) so it's easy to tune.
+- Compare `agent` and per-session `(type, used_pct, resets_at)`
+  tuples, sorted by `type` so session order is not significant.
+- Ignore `captured_at` (bumps every read, not user-visible state).
+- Byte-exact on numerics. The Codex wire format gives us
+  `usedPercent` as an integer in the 0–100 range, which the
+  daemon converts to a fraction; there is no sub-unit jitter to
+  absorb, so the earlier 0.5 pp tolerance idea is unnecessary.
+- A `resets_at` change counts as a real transition — the window
+  rolled over.
+
+Coexistence with the existing notification path: the daemon's
+`_dispatch` handler for `rateLimits/updated` is kept as-is.
+Costs nothing today and would be a free win if a future codex
+release ever propagates notifications across processes.
 
 **Claude statusline** already has this property naturally: the
 statusline only fires when the user is active in Claude Code, so
-each fire is implicit evidence of presence. No dedupe needed there
-for the idle-wake use case, though we may still add one later to
-cut redundant pushes within a single coding session.
+each fire is implicit evidence of presence. No active polling
+needed there for the idle-wake use case.
 
 While the display is dimmed or off, the HTTP server keeps running.
 Any push that *does* arrive (because the upstream gating decided it
 was meaningful) both updates the framebuffer **and** wakes the panel
 — which is exactly what we want: a real change in your usage is the
 one signal that should pull your eye back to the device.
+
+**Known limitation — multi-machine staleness.** A daemon installed
+on PC A polls PC A's local cache only. Codex activity on PC B
+won't update PC A's cache, so PC A's panel can drift behind the
+true global account state. Accepted for v1; cross-machine sync is
+out of scope.
 
 #### Implementation notes
 The idle state machine is implemented as a **pure-logic module**,

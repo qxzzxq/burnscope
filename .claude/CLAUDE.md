@@ -44,6 +44,29 @@ The `esp32` target defaults to CYD; the `esp32s3` target defaults to AMOLED
 (see `firmware/sdkconfig.defaults.<target>`). Override via
 `idf.py menuconfig → BurnScope display`.
 
+### Partition layouts
+
+- **CYD (4 MB)** — `partitions-4mb.csv`. Two 2 MB OTA slots, no
+  data partition.
+- **AMOLED (16 MB)** — `partitions-16mb.csv`. Two 5 MB OTA slots plus
+  a ~5.8 MB `storage` partition mounted as LittleFS at `/storage` by
+  `firmware/main/storage.c`. The volume is reserved for the future
+  pixel-aging map and any persistent assets that don't fit in NVS.
+
+The bootloader build enables `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`
+on the AMOLED target so a bad OTA can't brick the device — the
+firmware marks the image valid only after the first authorized
+`/summary` push succeeds end-to-end (see `maybe_mark_ota_valid` in
+`firmware/main/http_server.c`).
+
+### OTA
+
+`POST /ota` (firmware) + `burnscope ota <bin> --device <id>` (CLI)
+push a firmware image to a paired device's inactive slot. Auth is
+the same `X-BurnScope-Client-Id` slot match as `/summary`, but
+`/ota` never TOFU-binds — the device must have been paired by a
+prior `/summary` push first. See `docs/wire-format.md` § `POST /ota`.
+
 ## ESP-IDF
 
 Path: `~/.espressif/v6.0.1/esp-idf`

@@ -440,11 +440,15 @@ no-push rate when usage is unchanged.
   predicate shall also require byte-exact equality. Session order
   shall not be significant (sorted before comparison). A change in
   the set of session types is by definition a state transition.
-- **FR-4.6** [Must]: `_last_pushed_snapshot` shall be updated only
-  after a push completes with `overall_ok == True` (at least one
-  device accepted the push). A transport failure, auth drop, or
-  wholesale failure shall leave the previous value untouched so
-  the next poll iteration re-pushes the same content.
+- **FR-4.6** [Must]: `_last_pushed_snapshot` shall be updated when
+  *any* device's `PushResult.ok == True` — i.e. as soon as at least
+  one paired device has the snapshot, the dedupe baseline advances
+  so a working device is not re-pushed every minute because of a
+  flaky peer. A wholesale failure (no device accepted) shall leave
+  the previous value untouched so the next poll iteration retries
+  the same content. Distinct from `overall_ok`, which reports
+  per-agent push health to `burnscope status` and is True only
+  when every kept device succeeded.
 - **FR-4.7** [Should]: The poll interval shall live in a named
   module-level constant (`POLL_INTERVAL_S`) so tests can patch it
   to a sub-second cadence without changing daemon logic.
@@ -924,7 +928,7 @@ convention as `docs/fsd/firmware-fsd.md` § 8.4.)
 
 | Symptom                                              | Likely Cause                                                      | Diagnostic Steps                                                              | Corrective Action |
 |------------------------------------------------------|-------------------------------------------------------------------|-------------------------------------------------------------------------------|-------------------|
-| Panel never dims                                     | Codex daemon pushing on every poll (dedupe regressed)             | Tail daemon at debug; expect "rate limits unchanged; skipping push" in steady state. | Re-check `_last_pushed_snapshot` is updated only when push success (`overall_ok`). |
+| Panel never dims                                     | Codex daemon pushing on every poll (dedupe regressed)             | Tail daemon at debug; expect "rate limits unchanged; skipping push" in steady state. | Re-check `_last_pushed_snapshot` is updated when *any* device's `PushResult.ok == True` (FR-4.6 — `any_ok`, not `overall_ok`). |
 | Panel dims but never turns off                       | `EV_TIME` not firing at 1 Hz                                       | Add `ESP_LOGD` in `EV_TIME` handler; verify timer running.                    | Re-arm `esp_timer`; check timer queue depth. |
 | Panel turns off and never comes back                 | Wake source unwired                                                | Manual motion test (WAKE-001) and touch test (WAKE-002).                      | Inspect adapter event queue and ISR registration. |
 | UI rotates wildly                                    | Hysteresis band too narrow or noisy accel                          | Inspect raw accel samples; widen `motion_threshold_mg` and rotation hysteresis. | Tune Kconfig. |

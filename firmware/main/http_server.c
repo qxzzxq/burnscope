@@ -60,7 +60,13 @@ static bool eat(cursor_t *c, char ch)
 
 /* Read a string. Stores into out[out_len] with NUL. Supports only
  * printable ASCII + the standard backslash escapes; rejects \uXXXX since
- * the wire schema never uses them in MVP. */
+ * the wire schema never uses them in MVP.
+ *
+ * Fails (sets c->err and returns false) if the JSON value is longer than
+ * out_len-1 bytes. Silent truncation here would corrupt fixed-size
+ * fields like session_type (16-byte cap) and let the daemon's
+ * `/health` divergence detector chase the corruption forever
+ * (deep-review M-3). */
 static bool read_string(cursor_t *c, char *out, size_t out_len)
 {
     skip_ws(c);
@@ -80,7 +86,11 @@ static bool read_string(cursor_t *c, char *out, size_t out_len)
             default: c->err = true; return false;
             }
         }
-        if (i + 1 < out_len) out[i++] = ch;
+        if (i + 1 >= out_len) {
+            c->err = true;
+            return false;
+        }
+        out[i++] = ch;
     }
     if (c->p >= c->end) { c->err = true; return false; }
     c->p++;
@@ -207,17 +217,13 @@ static bool authorize_summary(httpd_req_t *req, const char *agent)
         return false;
     }
 
-    char stored[BURNSCOPE_CLIENT_ID_MAX];
-    esp_err_t err = nvs_store_load_client_id(agent, stored, sizeof(stored));
-    if (err == ESP_ERR_NVS_NOT_FOUND) {
-        /* TOFU: first push for this agent claims the slot. */
-        esp_err_t s = nvs_store_save_client_id(agent, header);
-        if (s != ESP_OK) {
-            ESP_LOGE(TAG, "failed to bind %s on first push: %s",
-                     agent, esp_err_to_name(s));
-            httpd_resp_send_500(req);
-            return false;
-        }
+    /* Atomic load-check-bind so two concurrent first-pushes can't both
+     * win TOFU (deep-review H-1). */
+    nvs_bind_result_t r = nvs_store_bind_or_check_client_id(agent, header);
+    switch (r) {
+    case NVS_BIND_OK_EXISTING:
+        return true;
+    case NVS_BIND_OK_NEW:
         /* Flip paired_<agent>=1 in the mDNS TXT so other clients on the
          * LAN stop offering this slot for pairing. */
         mdns_svc_refresh_paired(agent);
@@ -226,23 +232,19 @@ static bool authorize_summary(httpd_req_t *req, const char *agent)
          * confirm a non-empty bind for diagnostics. */
         ESP_LOGI(TAG, "TOFU bound %s (id %u bytes)", agent, (unsigned)strlen(header));
         return true;
-    }
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "nvs_store_load_client_id(%s) failed: %s",
-                 agent, esp_err_to_name(err));
-        httpd_resp_send_500(req);
-        return false;
-    }
-
-    if (strcmp(stored, header) != 0) {
+    case NVS_BIND_MISMATCH:
         ESP_LOGW(TAG, "/summary client-id mismatch for %s", agent);
         httpd_resp_set_status(req, "401 Unauthorized");
         httpd_resp_set_type(req, "application/json");
         const char *body = "{\"error\":\"client id mismatch\"}";
         httpd_resp_send(req, body, strlen(body));
         return false;
+    case NVS_BIND_ERROR:
+    default:
+        ESP_LOGE(TAG, "nvs_store_bind_or_check_client_id(%s) failed", agent);
+        httpd_resp_send_500(req);
+        return false;
     }
-    return true;
 }
 
 /* Parse one {"type":..,"used_pct":..,"resets_at":..} object. Accepts the
@@ -262,6 +264,15 @@ static bool parse_session(cursor_t *c, session_snapshot_t *out)
 
         if (strcmp(key, "type") == 0) {
             if (!read_string(c, out->type, sizeof(out->type))) return false;
+            /* Session type ends up rendered on the panel; reject control
+             * bytes so a wire payload can't smuggle \n / \r / \t into
+             * the LVGL label (deep-review L-1). */
+            for (size_t k = 0; out->type[k] != '\0'; k++) {
+                if ((unsigned char)out->type[k] < 0x20) {
+                    c->err = true;
+                    return false;
+                }
+            }
             have_type = true;
         } else if (strcmp(key, "used_pct") == 0) {
             double v;
@@ -608,11 +619,26 @@ static bool authorize_health(httpd_req_t *req)
         return false;
     }
 
+    /* Constant-time match against every populated slot. We never break
+     * early on a hit, so the wall-clock cost of a successful match is
+     * the same as a successful mismatch — denies the LAN attacker a
+     * timing channel for narrowing the bound client_id (deep-review
+     * L-2). Whether a slot is *populated* is already leaked by
+     * /health's own response body, so we don't try to hide that. */
+    bool matched = false;
     for (size_t i = 0; i < KNOWN_AGENT_COUNT; ++i) {
-        if (slot_filled[i] && strcmp(slots[i], header) == 0) {
-            return true;
+        if (!slot_filled[i]) continue;
+        size_t la = strnlen(slots[i], sizeof(slots[i]));
+        size_t lb = strnlen(header, BURNSCOPE_CLIENT_ID_MAX);
+        unsigned char diff = (la == lb) ? 0 : 1;
+        size_t n = (la < lb) ? la : lb;
+        for (size_t k = 0; k < n; ++k) {
+            diff |= (unsigned char)slots[i][k] ^ (unsigned char)header[k];
         }
+        bool slot_match = (la == lb) && (diff == 0);
+        matched = matched || slot_match;
     }
+    if (matched) return true;
 
     ESP_LOGW(TAG, "/health client-id matches no populated slot");
     httpd_resp_set_status(req, "401 Unauthorized");

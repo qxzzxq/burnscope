@@ -73,6 +73,33 @@ esp_err_t nvs_store_save_client_id(const char *agent, const char *id);
  */
 esp_err_t nvs_store_erase_client_ids(void);
 
+typedef enum {
+    NVS_BIND_OK_EXISTING = 0,  /* Slot was already bound to this `id`. */
+    NVS_BIND_OK_NEW,           /* Slot was empty; just bound to this `id`. */
+    NVS_BIND_MISMATCH,         /* Slot is bound to a *different* id (caller → 401). */
+    NVS_BIND_ERROR,            /* Underlying NVS failure (caller → 500). */
+} nvs_bind_result_t;
+
+/**
+ * TOFU-bind `id` to `agent`, atomically.
+ *
+ * The non-atomic alternative — `load_client_id` followed by
+ * `save_client_id` — has a race: two concurrent first-pushes can both
+ * observe NOT_FOUND and both write, with last-writer-wins; the loser
+ * thinks it owns the device but its next request gets 401. This
+ * helper holds an internal mutex across the load-check-save sequence
+ * so that race is closed.
+ *
+ * Semantics:
+ *   - Slot empty and `id` non-empty → write, return `OK_NEW`.
+ *   - Slot already holds `id` byte-for-byte → no-op, return `OK_EXISTING`.
+ *   - Slot holds a different id → leave unchanged, return `MISMATCH`.
+ *   - Any other NVS error → return `ERROR`.
+ *
+ * `id` must be NUL-terminated and < `BURNSCOPE_CLIENT_ID_MAX` bytes.
+ */
+nvs_bind_result_t nvs_store_bind_or_check_client_id(const char *agent, const char *id);
+
 /**
  * Load the cached LCD silicon ID (RDID1 byte) into `*out`. Returns
  * `ESP_ERR_NVS_NOT_FOUND` when the slot is empty (first boot — the

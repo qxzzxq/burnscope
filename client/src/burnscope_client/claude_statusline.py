@@ -153,16 +153,33 @@ def _build_snapshot(five: dict, seven: dict) -> AgentSnapshot | None:
 
     Both windows must have both a used_percentage and a resets_at to be
     included. If neither window is usable, no push happens this fire.
+
+    Both of Anthropic's windows are anchored to the first message of
+    their respective period (5h or 7d from first prompt), not sliding
+    with wall-clock during idle — so `rolling=False` and the firmware
+    trusts `resets_at` literally. `window_duration_mins` is sent for
+    completeness even though the firmware ignores it when rolling=False.
     """
     sessions: list[SessionSnapshot] = []
-    for label, window in (("current", five), ("weekly", seven)):
+    for label, window, duration_mins in (
+        ("current", five, 300),
+        ("weekly", seven, 10080),
+    ):
         pct = window.get("used_percentage")
         resets = window.get("resets_at")
         if not isinstance(pct, (int, float)):
             continue
         if not isinstance(resets, int):
             continue
-        sessions.append(SessionSnapshot(label, float(pct) / 100.0, int(resets)))
+        sessions.append(
+            SessionSnapshot(
+                type=label,
+                used_pct=float(pct) / 100.0,
+                resets_at=int(resets),
+                rolling=False,
+                window_duration_mins=duration_mins,
+            )
+        )
     if not sessions:
         return None
     return AgentSnapshot(

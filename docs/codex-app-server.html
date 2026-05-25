@@ -314,9 +314,9 @@
 
 <table>
   <tr><th>Field</th><th>Type</th><th>Description</th></tr>
-  <tr><td class="mono">usedPercent</td><td>integer (0–100)</td><td>Percentage of the window consumed. <strong>Required.</strong></td></tr>
+  <tr><td class="mono">usedPercent</td><td>number (0–100)</td><td>Percentage of the window consumed. <strong>Required.</strong> The openai/codex Rust source (<code>codex-rs/codex-api/src/rate_limits.rs</code>) deserializes it as <code>f64</code>; in practice the ChatGPT-plan backend ships integer values (e.g. <code>1</code>, <code>3</code>) but consumers should not rely on integer-exact equality.</td></tr>
   <tr><td class="mono">windowDurationMins</td><td>int64 | null</td><td>Window length. ChatGPT Plus today: <code>300</code> (5h) for primary, <code>10080</code> (7d) for secondary.</td></tr>
-  <tr><td class="mono">resetsAt</td><td>int64 | null</td><td>Unix seconds (UTC) when the window rolls over.</td></tr>
+  <tr><td class="mono">resetsAt</td><td>int64 | null</td><td>Unix seconds (UTC) when the window rolls over. Verified empirically that the value drifts ~60 s per 60 s of wall-clock at low usage — the backend appears to compute it as roughly <code>now + remainingMins</code>, not as a fixed window-end. Consumers that want a stable countdown must either dedupe by <code>usedPercent</code> on the daemon side (the BurnScope codex daemon does this via <code>_anchor_resets_at</code>) or synthesise a local countdown when usage is essentially zero.</td></tr>
 </table>
 
 <h3 id="updated-notification">4.4 <code>account/rateLimits/updated</code></h3>

@@ -124,10 +124,17 @@ specification lives at [`client-spec-v2.html`](./client-spec-v2.html).
    and enqueues a push only when the freshly-read snapshot differs
    from the last successfully pushed one — the long-lived app-server
    doesn't see rate-limit changes from other `codex` CLI processes,
-   so notifications alone would fall silent after bootstrap.
-   Every 30 s the daemon also probes the firmware's `/health` to
-   detect drift (e.g. reboot wiped the RAM-only snapshot store) and
-   re-pushes on divergence.
+   so notifications alone would fall silent after bootstrap. Before
+   the diff check, the poll loop anchors each session's `resets_at`
+   to the last-pushed value when `used_pct` is unchanged: codex
+   reports `resetsAt` as ≈ `now + remaining`, so the raw value
+   drifts ~60 s per 60 s of wall-clock at low usage and without
+   anchoring the daemon would push (and wake the firmware) every
+   minute with no real change. The firmware compensates by
+   synthesising `now + window_duration_mins * 60` when a session is
+   `rolling` and `used_pct ≤ 0.01`. Every 30 s the daemon also probes
+   the firmware's `/health` to detect drift (e.g. reboot wiped the
+   RAM-only snapshot store) and re-pushes only the diverged devices.
 
 Each collector ships its plaintext identifier in `X-BurnScope-Client-Id`.
 The ESP32 binds it on first push (TOFU) and rejects mismatches with `401`.

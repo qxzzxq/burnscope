@@ -465,6 +465,15 @@ class CodexDaemon:
             snapshot = _snapshot_from_rate_limits(result.get("rateLimits"))
             if snapshot is None:
                 continue
+            # Codex's backend reports `resetsAt` as roughly `now + remaining`,
+            # so it slides ~60 s per 60 s of wall-clock even with zero
+            # activity (verified empirically). Without anchoring the dedupe
+            # gate fires on every poll and we wake the firmware out of
+            # burn-in idle once a minute for no real change. Anchor each
+            # session's `resets_at` to what we last pushed when `used_pct`
+            # is unchanged — the firmware-side synthesis (when rolling and
+            # used_pct ≤ 0.01) keeps the displayed countdown sensible.
+            snapshot = _anchor_resets_at(snapshot, self._last_pushed_snapshot)
             if snapshot.semantically_equal(self._last_pushed_snapshot):
                 log.debug("codex poll: rate limits unchanged; skipping push")
                 continue
@@ -507,13 +516,19 @@ class CodexDaemon:
                     # Health succeeded — clear only the health counter.
                     # Push has its own counter and resets independently.
                     self._health_failures.pop(device.device_id, None)
-                    if self._last_snapshot is not None and _firmware_diverged(
-                        body, self._last_snapshot
+                    # Compare against `_last_pushed_snapshot` (the anchored
+                    # value the firmware actually has), not `_last_snapshot`
+                    # (the raw, possibly-drifted value from the app-server).
+                    # Otherwise poll-loop anchoring would manufacture a
+                    # spurious divergence here every cycle.
+                    if (
+                        self._last_pushed_snapshot is not None
+                        and _firmware_diverged(body, self._last_pushed_snapshot)
                     ):
                         diverged_devices.append(device)
                 if all_unreachable:
                     host_cache.write_push_state(AGENT_NAME, ok=False)
-                if diverged_devices and self._last_snapshot is not None:
+                if diverged_devices and self._last_pushed_snapshot is not None:
                     # Re-push only to the device(s) that actually diverged,
                     # not the whole fleet. Non-diverged peers don't need
                     # the update; pushing to them would wake their idle
@@ -524,7 +539,7 @@ class CodexDaemon:
                         [d.device_id for d in diverged_devices],
                     )
                     await self._push_to_devices(
-                        self._last_snapshot, diverged_devices, client
+                        self._last_pushed_snapshot, diverged_devices, client
                     )
 
     # ----------------------------------------------------------- device list
@@ -586,11 +601,63 @@ def _extract_email(account: dict) -> str | None:
     return None
 
 
+def _anchor_resets_at(
+    fresh: AgentSnapshot,
+    last: AgentSnapshot | None,
+) -> AgentSnapshot:
+    """Return `fresh` with each session's `resets_at` rewritten to the
+    matching last-pushed session's value when `used_pct` is unchanged.
+
+    Codex's rolling windows report `resetsAt` as roughly `now + remaining`,
+    so it advances ~60 s per 60 s of wall-clock at low usage. Pushing that
+    drift to the firmware every minute defeats the burn-in-mitigation
+    idle state machine. Anchoring keeps the wire-level `resets_at` stable
+    until the daemon observes a real change (`used_pct`, `rolling`,
+    `window_duration_mins`, or the set of session types). The firmware
+    extrapolates from there: when `rolling=True` and `used_pct ≤ 0.01`,
+    it synthesizes `now + window_duration_mins * 60` so the displayed
+    countdown stays sensible even as the anchored `resets_at` ages.
+
+    Anchoring keys on `(type, used_pct)`. Any other field difference
+    (rolling, window_duration_mins) flows through unmodified — those are
+    contract-level changes and should reach the firmware immediately.
+    """
+    if last is None:
+        return fresh
+    last_by_type = {s.type: s for s in last.sessions}
+    anchored: list[SessionSnapshot] = []
+    for s in fresh.sessions:
+        prior = last_by_type.get(s.type)
+        if prior is None or prior.used_pct != s.used_pct:
+            anchored.append(s)
+            continue
+        anchored.append(
+            SessionSnapshot(
+                type=s.type,
+                used_pct=s.used_pct,
+                resets_at=prior.resets_at,
+                rolling=s.rolling,
+                window_duration_mins=s.window_duration_mins,
+            )
+        )
+    return AgentSnapshot(
+        agent=fresh.agent,
+        captured_at=fresh.captured_at,
+        sessions=anchored,
+    )
+
+
 def _snapshot_from_rate_limits(rate_limits: object) -> AgentSnapshot | None:
     """Convert a RateLimitSnapshot dict to an AgentSnapshot.
 
     Skips a window when any of usedPercent, windowDurationMins, or resetsAt
     is missing/null. Empty result → returns None (no push).
+
+    Both codex windows are rolling against wall-clock — verified
+    empirically against a held app-server: `resetsAt` advances ~60 s per
+    60 s of real time at low usage. We mark them as such on the wire so
+    the firmware can synthesize a fresh countdown locally during idle
+    (`rolling=True` + the window's duration in minutes).
     """
     if not isinstance(rate_limits, dict):
         return None
@@ -609,7 +676,15 @@ def _snapshot_from_rate_limits(rate_limits: object) -> AgentSnapshot | None:
             continue
         if not isinstance(duration, int):
             continue
-        sessions.append(SessionSnapshot(label, float(pct) / 100.0, int(resets)))
+        sessions.append(
+            SessionSnapshot(
+                type=label,
+                used_pct=float(pct) / 100.0,
+                resets_at=int(resets),
+                rolling=True,
+                window_duration_mins=int(duration),
+            )
+        )
 
     if not sessions:
         return None
@@ -626,6 +701,11 @@ def _firmware_diverged(health_body: dict, expected: AgentSnapshot) -> bool:
     Conservative comparison — any structural mismatch counts as divergence
     and triggers a re-push. Exact equality on the JSON-ified shape so we
     don't get fooled by float-vs-int or order differences in `sessions`.
+
+    Must include every field the firmware echoes back in /health
+    (`rolling`, `window_duration_mins` were added in the wire-format
+    extension); otherwise dict equality always fails on a key-count
+    mismatch and the health loop re-pushes every cycle.
     """
     by_agent = health_body.get("agents")
     if not isinstance(by_agent, dict):
@@ -635,7 +715,13 @@ def _firmware_diverged(health_body: dict, expected: AgentSnapshot) -> bool:
         return True
     stored_sessions = stored.get("sessions")
     expected_sessions = [
-        {"type": s.type, "used_pct": s.used_pct, "resets_at": s.resets_at}
+        {
+            "type": s.type,
+            "used_pct": s.used_pct,
+            "resets_at": s.resets_at,
+            "rolling": s.rolling,
+            "window_duration_mins": s.window_duration_mins,
+        }
         for s in expected.sessions
     ]
     return stored_sessions != expected_sessions

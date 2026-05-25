@@ -81,9 +81,15 @@ The core is a vertical stack centred on `cx`:
   flush with the percentage's bottom edge. Re-centre the row each
   render to keep the optical centre stable as the percentage glyph
   count changes ("1%" → "100%").
-- **Countdown source.** `format_countdown(resets_at - now)` —
+- **Countdown source.** `format_countdown(effective_resets_at(s, now) - now)` —
   `Xd XXh` / `Xh XXm` / `Xm XXs`, `"reset due"` when negative,
-  `"syncing..."` while the wall clock is unsynced.
+  `"syncing..."` while the wall clock is unsynced. `effective_resets_at`
+  is defined in `firmware/main/snapshot.h`: it returns
+  `now + window_duration_mins * 60` when `s->rolling &&
+  s->used_pct <= 0.01 && window_duration_mins > 0` so a rolling-window
+  countdown stays sensible during long idle without requiring the
+  daemon to push drift updates. For fixed-window agents (Claude) and
+  for any non-trivial usage, the helper returns `s->resets_at` verbatim.
 
 The AMOLED's true black is the core surface — no fill, no stroke. M3
 elevation via *absence* rather than tint, justified by the AMOLED
@@ -203,7 +209,7 @@ Ring fill (claude, clockwise from 135°):
 | `session_count >= 3`                 | Extra slot silently ignored on AMOLED (CYD still renders three rows). |
 | Unused rings                         | **Hidden entirely**, not greyed. Greying would imply "empty data" rather than "no such session" — mirrors cyd2usb's row-hide pattern. |
 | Clock unsynced (`now < 1700000000`)  | Per-row countdowns read `"syncing..."`; percentages still render; footer top line empty. |
-| Post-reset auto-zero (`now >= resets_at`) | Clamp `pct = 0` until next push. Ring collapses to zero, % reads `0%`, countdown reads `"reset due"`. |
+| Post-reset auto-zero (`now >= effective_resets_at(s, now)`) | Clamp `pct = 0` until next push. Ring collapses to zero, % reads `0%`, countdown reads `"reset due"`. For rolling windows at idle the helper returns `now + window_duration_mins*60`, so this branch only fires after a real used_pct change ages out — fixed-window agents (Claude) still trip it the moment wall-clock passes the pushed `resets_at`. |
 | "unpaired" footer (empty NVS)        | Top line empty, bottom line `"unpaired"`. |
 | Splash → agent first push            | Only swap on `s_visible_agent[0] == '\0'`; subsequent pushes re-render in place (1 Hz tick handles cycling). |
 

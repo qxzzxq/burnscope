@@ -51,10 +51,17 @@ Five concrete problems, each addressed by one of the five mitigations:
    originate in other `codex` CLI processes on the same machine, so
    left to the `rateLimits/updated` notification stream alone it
    would push exactly once at bootstrap and never again. Solved by
-   client-side **active poll + dedupe**: read every minute, push
-   only when the snapshot differs from the last successfully pushed
-   one. This both keeps the firmware fresh *and* preserves the
-   silent-when-idle property A2 needs.
+   client-side **active poll + anchor + dedupe**: read every minute,
+   anchor `resets_at` to the last-pushed value on each session whose
+   `used_pct` is unchanged (codex's `resetsAt` drifts ~60 s per 60 s
+   of wall-clock at low usage, so without anchoring the dedupe key
+   would change every poll), and push only when the anchored
+   snapshot differs from the last successfully pushed one. The
+   firmware compensates for the stale stored `resets_at` by
+   synthesising `now + window_duration_mins * 60` at render time
+   when the session is `rolling=true` and `used_pct ≤ 0.01`. This
+   keeps the firmware fresh *and* preserves the silent-when-idle
+   property A2 needs.
 4. **100 % brightness wears the panel super-linearly** — solved by
    **A3** default-brightness cap at 70 %.
 5. **Pure white and saturated blue ghost worst** — solved by **A4**
@@ -69,10 +76,12 @@ Five concrete problems, each addressed by one of the five mitigations:
   directly. Notices: the screen dims when ignored, wakes when picked
   up, rotates with the device, and looks visually softer.
 - **Codex daemon (`codex_daemon.py`):** owns active polling +
-  dedupe. Polls `account/rateLimits/read` once a minute and
-  produces a push only when the result differs from the last
-  successfully pushed snapshot, so the firmware's idle state
-  machine can sleep when nothing is changing.
+  anchoring + dedupe. Polls `account/rateLimits/read` once a
+  minute, anchors `resets_at` to the last-pushed value when
+  `used_pct` is unchanged (to defeat codex's wall-clock-driven
+  `resetsAt` drift), and produces a push only when the anchored
+  result differs from the last successfully pushed snapshot, so the
+  firmware's idle state machine can sleep when nothing is changing.
 - **Firmware integrator** swapping panels: reuses the pure-logic
   idle state machine on a new display profile by writing a new
   adapter; SM is unchanged.
@@ -86,9 +95,13 @@ Five concrete problems, each addressed by one of the five mitigations:
 - The idle state machine is implemented as a pure-logic module with
   zero ESP-IDF dependencies, host-testable, reusable across display
   profiles (FR-2.x).
-- Codex daemon polls `account/rateLimits/read` every minute and
-  pushes only when the freshly-read `AgentSnapshot` differs from
-  the last successfully pushed one (FR-4.x).
+- Codex daemon polls `account/rateLimits/read` every minute,
+  anchors `resets_at` to the last-pushed value when `used_pct` is
+  unchanged, and pushes only when the anchored `AgentSnapshot`
+  differs from the last successfully pushed one (FR-4.x). The
+  wire format carries `rolling: bool` and `window_duration_mins:
+  int` per session so the firmware can synthesise its countdown
+  during idle without waking on a refresh push.
 - The AMOLED profile dims at 5 min idle and turns off at 30 min idle
   (defaults; both Kconfig-configurable). Any of accelerometer
   motion, touch, button, or qualifying `POST /summary` wakes the
@@ -144,7 +157,10 @@ HTTP POST /sum   ─►───────┤                     EV_PUSH│ �
                           │   see § 5.2 A-4. Poll is the authoritative    │
                           │   trigger.)                                   │
                           │                                                │
-                          │  semantically_equal(new, _last_pushed)?        │
+                          │  anchored = _anchor_resets_at(new, _last_p.)  │
+                          │      (rewrites resets_at to last-pushed value │
+                          │       per session when used_pct is unchanged) │
+                          │  semantically_equal(anchored, _last_pushed)?  │
                           │      yes ──► drop (log debug)                  │
                           │      no  ──► enqueue → push → update last      │
                           └────────────────────────────────────────────────┘
@@ -433,8 +449,11 @@ no-push rate when usage is unchanged.
 - **FR-4.4** [Must]: The semantic-equality predicate shall be
   insensitive to `captured_at` (which bumps on every read) and
   shall compare `used_pct` byte-exact. No numeric tolerance: the
-  Codex wire format returns `usedPercent` as an integer (cast to
-  fraction client-side), so there is no sub-unit jitter to absorb.
+  Codex wire format types `usedPercent` as `f64` but the
+  ChatGPT-plan backend ships integer values, and the daemon's
+  `_anchor_resets_at` runs *before* this predicate so the
+  separately-drifting `resets_at` field doesn't contaminate the
+  comparison.
 - **FR-4.5** [Must]: For non-numeric fields (`agent`,
   `sessions[*].type`, and the set of `(type)` keys present), the
   predicate shall also require byte-exact equality. Session order
@@ -582,9 +601,25 @@ no-push rate when usage is unchanged.
   codex-cli release, the fallback in § 5.1 (recycle the subprocess
   via the existing reconnect machinery) applies.
 - **A-6** The wire-format `used_pct` field is normalised to the
-  0.0–1.0 range (per `docs/wire-format.md`), but the Codex upstream
-  `usedPercent` is integer in the 0–100 range, so semantic equality
-  comparisons are byte-exact with no jitter to absorb.
+  0.0–1.0 range (per `docs/wire-format.md`). The Codex upstream
+  `usedPercent` is typed `f64` in the openai/codex Rust source; in
+  practice the ChatGPT-plan backend ships integer-valued percentages
+  so byte-exact comparison still works.
+- **A-8** Codex's `resetsAt` slides ~60 s per 60 s of wall-clock
+  even with zero activity — verified empirically by holding one
+  app-server and observing two consecutive poll responses for the
+  same `usedPercent`:
+
+      prev=[('primary', 0.01, 1779733577), ...]
+      new =[('primary', 0.01, 1779733637), ...]
+
+  `_anchor_resets_at` rewrites the fresh `resets_at` to the
+  last-pushed value on per-session `used_pct` match so this drift
+  doesn't fire the dedupe gate every poll and wake the firmware out
+  of idle. The firmware compensates for the (now intentionally
+  stale) stored `resets_at` by synthesising `now +
+  window_duration_mins*60` at render time whenever the session is
+  `rolling=true` and `used_pct ≤ 0.01`.
 - **A-7** LVGL 9.x is in use; `LV_DRAW_SW_COMPLEX` and the
   anti-aliased font path are available.
 
@@ -744,7 +779,8 @@ class AgentSnapshot:
     def semantically_equal(self, other: "AgentSnapshot | None") -> bool:
         """Return True iff `other` represents the same user-visible state.
 
-        Compares `agent` and the per-session `(type, used_pct, resets_at)`
+        Compares `agent` and the per-session
+        `(type, used_pct, resets_at, rolling, window_duration_mins)`
         tuples, sorted by `type` so session order is not significant.
         Ignores `captured_at` — that timestamp bumps every time the daemon
         re-reads, but does not reflect a user-visible change. Returns
@@ -752,15 +788,21 @@ class AgentSnapshot:
         """
 ```
 
-Byte-exact on numerics — no tolerance kwarg. The Codex upstream
-returns `usedPercent` as integer (cast to a fraction client-side),
-so there is no sub-percent jitter to absorb.
+Byte-exact on numerics — no tolerance kwarg. Codex reports
+`usedPercent` as a `f64` in the openai/codex Rust source; in
+practice the ChatGPT-plan backend ships integer values so byte-exact
+still holds, but the dedupe key is robust to that detail because
+`_anchor_resets_at` papers over the unrelated `resets_at` drift
+*before* this comparison runs.
 
 ### 6.3 Data Models / Schemas
 
-`AgentSnapshot` and `SessionSnapshot` are unchanged on the wire (see
-`docs/wire-format.md` and `docs/fsd/firmware-fsd.md` § 6.3). The
-semantic-equality helper is a method on the existing dataclass — no
+`AgentSnapshot` is unchanged. `SessionSnapshot` gained two new wire
+fields — `rolling: bool` and `window_duration_mins: int` — to let
+the firmware distinguish rolling-vs-fixed windows and synthesise a
+local countdown at idle (see `docs/wire-format.md` and
+`docs/fsd/firmware-fsd.md` § 6.3). The semantic-equality helper is
+a method on the existing dataclass — no
 new types.
 
 ### 6.4 Commands / Opcodes
@@ -868,7 +910,8 @@ Unchanged. The idle SM starts in `BURN_IDLE_ACTIVE` at boot.
 | DEDUPE-002 | Identical snapshot drops         | Two consecutive `account/rateLimits/read` results with the same `usedPercent`. | Second produces no `POST /summary`; debug log shows dedupe drop. |
 | DEDUPE-003 | Any `used_pct` delta pushes      | Inject `usedPercent` deltas of 1 and 5 percentage points.                 | Both push (byte-exact comparison; no tolerance). |
 | DEDUPE-004 | Session set change pushes        | Inject a snapshot adding a new session `type`.                            | Push fires regardless of `used_pct`. |
-| DEDUPE-005 | Resets-at change pushes          | Inject a snapshot with a changed `resets_at` (window rolled over).        | Push fires. |
+| DEDUPE-005 | Resets-at-only drift is anchored, not pushed | Inject two snapshots with identical `used_pct` but `resets_at` advancing ~60 s per poll (codex's wall-clock-driven `resetsAt`). | Second produces no `POST /summary`; debug log shows dedupe drop. `_anchor_resets_at` rewrites the fresh value to match. |
+| DEDUPE-008 | Real rollover (`used_pct` reset + new `resets_at`) | Inject a snapshot whose `used_pct` drops to 0 alongside a forward `resets_at` jump. | Push fires (anchor is gated on `used_pct` match, so a `used_pct` change always flows through). |
 | DEDUPE-006 | Failed push does not advance state | Push transport-fails on all paired devices.                            | `_last_pushed_snapshot` unchanged; next poll re-attempts the same content. |
 | DEDUPE-007 | Helper is unit-tested in isolation | `pytest client/tests/test_schema.py`.                                   | All `test_semantically_equal_*` cases pass. |
 

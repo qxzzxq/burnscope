@@ -15,8 +15,8 @@ have I used / when does it reset" without unlocking a laptop.
 
 | Agent | Source on your laptop | Push lifecycle | Windows |
 | --- | --- | --- | --- |
-| **Claude Code** | Statusline hook reading `rate_limits.*` from the runtime payload | Per-fire (after each assistant message) | `current` (5 h), `weekly` (7 d) |
-| **Codex CLI** | Long-lived daemon over `codex app-server` JSON-RPC | Per-event (`account/rateLimits/updated`) + 30 s drift reconciliation | `primary`, `secondary` |
+| **Claude Code** | Statusline hook reading `rate_limits.*` from the runtime payload | Per-fire (after each assistant message) | `current` (5 h), `weekly` (7 d) — fixed, anchored to first prompt of the period |
+| **Codex CLI** | Long-lived daemon over `codex app-server` JSON-RPC | 60 s poll of `account/rateLimits/read`, anchored on `used_pct` so wall-clock-driven `resetsAt` drift doesn't trigger pushes + 30 s `/health` divergence reconciliation | `primary` (5 h), `secondary` (7 d) — both rolling against wall-clock |
 
 Each collector ships its own plaintext identifier (`oauthAccount.emailAddress`
 for Claude, `account.email` for Codex) in `X-BurnScope-Client-Id`. The ESP32

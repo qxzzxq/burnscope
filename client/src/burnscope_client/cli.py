@@ -67,6 +67,17 @@ _PATH_FALLBACKS_LINUX = (
 )
 
 
+def _codex_daemon_installed() -> bool:
+    """True if the codex daemon's supervisor unit exists on disk.
+
+    Used by `pair-reset` to print a daemon-restart warning when
+    applicable. Detects either supervisor (launchd plist on macOS,
+    systemd user unit on Linux) — does not check whether it's
+    actually loaded/running.
+    """
+    return LAUNCHD_PLIST_PATH.exists() or SYSTEMD_UNIT_PATH.exists()
+
+
 def _supervisor_path() -> str:
     """Return the PATH to bake into the launchd/systemd unit.
 
@@ -133,6 +144,24 @@ def main(argv: list[str] | None = None) -> int:
             host_cache.clear_push_state(agent)
             host_cache.invalidate_client_id(agent)
         print("Forgot paired devices, push state, and per-agent client_ids.")
+        # The codex daemon, if installed, holds an in-memory copy of
+        # _last_pushed_snapshot and _transport_failures that we just
+        # invalidated on disk. Without a restart the next poll will
+        # auto-re-pair, but failure-counter state from before the
+        # reset can cause spurious early eviction on the freshly
+        # re-claimed devices. Tell the user explicitly rather than
+        # signalling — launchd/systemd both need the user's hands
+        # anyway, and signal handling adds complexity for a rare op.
+        if _codex_daemon_installed():
+            print()
+            print("⚠  The codex daemon is installed but still running with the")
+            print("   pre-reset in-memory state. Restart it so the freshly")
+            print("   re-claimed devices start with clean failure counters:")
+            print()
+            print("     launchctl unload ~/Library/LaunchAgents/com.burnscope.codex.plist")
+            print("     launchctl load   ~/Library/LaunchAgents/com.burnscope.codex.plist")
+            print()
+            print("   (On Linux: systemctl --user restart burnscope-codex.)")
         return 0
     return 1
 

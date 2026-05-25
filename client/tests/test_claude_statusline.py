@@ -376,3 +376,69 @@ def test_push_migrates_legacy_host_file(monkeypatch, _isolate_state):
 
     claude_statusline.main(["--push"])
     assert not legacy.exists()
+
+
+# =================================== M-3: statusline persistent failure counter
+
+
+def test_push_evicts_device_after_max_consecutive_transport_failures(monkeypatch):
+    """Statusline children are short-lived, but the per-device push-state
+    file carries `consecutive_failures` across fires. After
+    MAX_TRANSPORT_FAILURES bumps the device must be evicted on the
+    next fire — without this, an offline device would stay paired
+    forever because each child starts from a clean in-memory state
+    (deep-review M-3).
+    """
+    _stub_identity(monkeypatch)
+    _stub_discover_none(monkeypatch)
+    _stub_push_to_all(
+        monkeypatch,
+        [PushResult("dev-dead", False, "transport")],
+    )
+    host_cache.add_paired_device("claude", PairedDevice("dev-dead", "10.0.0.5:80"))
+
+    # Fire enough times to cross the threshold. Each `main(["--push"])`
+    # consumes stdin, so re-stub it before every fire.
+    for _ in range(claude_statusline.MAX_TRANSPORT_FAILURES):
+        _stub_stdin(monkeypatch)
+        claude_statusline.main(["--push"])
+
+    # Device removed; per-device state cleaned up by remove_paired_device.
+    assert host_cache.load_paired_devices("claude") == []
+    assert host_cache.read_push_state("claude", device_id="dev-dead") is None
+
+
+def test_push_transport_failure_then_success_resets_counter(monkeypatch):
+    """A successful push must zero the per-device failure counter so a
+    later transient blip doesn't piggyback on an old streak.
+    """
+    _stub_identity(monkeypatch)
+    _stub_discover_none(monkeypatch)
+    host_cache.add_paired_device("claude", PairedDevice("dev-flaky", "10.0.0.5:80"))
+
+    # Three transient failures, then a success.
+    for _ in range(3):
+        _stub_stdin(monkeypatch)
+        _stub_push_to_all(
+            monkeypatch,
+            [PushResult("dev-flaky", False, "transport")],
+        )
+        claude_statusline.main(["--push"])
+
+    state = host_cache.read_push_state("claude", device_id="dev-flaky")
+    assert state["consecutive_failures"] == 3
+
+    _stub_stdin(monkeypatch)
+    _stub_push_to_all(
+        monkeypatch,
+        [PushResult("dev-flaky", True, "ok")],
+    )
+    claude_statusline.main(["--push"])
+
+    # Counter cleared, device still paired.
+    state = host_cache.read_push_state("claude", device_id="dev-flaky")
+    assert state["consecutive_failures"] == 0
+    assert state["ok"] is True
+    assert {d.device_id for d in host_cache.load_paired_devices("claude")} == {
+        "dev-flaky",
+    }

@@ -590,8 +590,8 @@ async def test_pusher_loop_recovers_when_device_ip_changed(monkeypatch):
         PairedDevice("dev-moved", "10.0.0.9:80")
     ]
     assert host_cache.read_push_state("codex")["ok"] is True
-    # Transport-failure counter must NOT advance — the failure was healed.
-    assert daemon._transport_failures.get("dev-moved", 0) == 0
+    # Push-failure counter must NOT advance — the failure was healed.
+    assert daemon._push_failures.get("dev-moved", 0) == 0
 
 
 async def test_pusher_loop_auto_pairs_when_empty(monkeypatch):
@@ -916,8 +916,11 @@ async def test_push_one_advances_last_pushed_snapshot_on_partial_success(monkeyp
     # Aggregate `ok` still reports the truth that one device is unhealthy.
     assert host_cache.read_push_state("codex")["ok"] is False
     # Flaky peer is still paired (transport failure, not auth) and its
-    # failure counter has advanced toward MAX_TRANSPORT_FAILURES.
-    assert daemon._transport_failures.get("dev-flaky") == 1
+    # push-failure counter has advanced toward MAX_TRANSPORT_FAILURES.
+    # Health counter is independent and should still be zero (no health
+    # probe ran in this test).
+    assert daemon._push_failures.get("dev-flaky") == 1
+    assert daemon._health_failures.get("dev-flaky", 0) == 0
     assert {d.device_id for d in host_cache.load_paired_devices("codex")} == {
         "dev-ok",
         "dev-flaky",
@@ -950,3 +953,155 @@ def test_enqueue_bounded_caps_queue_and_keeps_newest():
     while not daemon._snapshot_queue.empty():
         seen.append(daemon._snapshot_queue.get_nowait().captured_at)
     assert seen == list(range(total - cap, total))
+
+
+# ============================================== H-2: split push/health counters
+
+
+async def test_push_counter_does_not_reset_health_counter(monkeypatch):
+    """A push success must not clear the health failure counter, and
+    vice versa. Without separated counters, either path's success
+    masked the other's accumulated failures (deep-review H-2).
+    """
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+    host_cache.add_paired_device("codex", PairedDevice("dev-x", "10.0.0.5:80"))
+    # Pretend the health loop already saw 3 health failures.
+    daemon._health_failures["dev-x"] = 3
+
+    async def fake_push_to_all(snapshot, devices, client_id, client):
+        return {"dev-x": PushResult("dev-x", True, "ok")}
+
+    monkeypatch.setattr(codex_daemon, "push_to_all", fake_push_to_all)
+
+    daemon._enqueue_snapshot(
+        AgentSnapshot(
+            agent="codex",
+            captured_at=1,
+            sessions=[SessionSnapshot("primary", 0.5, 1779066600)],
+        )
+    )
+    await _drain_one_push(
+        daemon,
+        predicate=lambda: daemon._last_pushed_snapshot is not None,
+    )
+
+    # Push success cleared its own counter but the health counter
+    # must remain at 3 — health still hasn't seen recovery.
+    assert daemon._push_failures.get("dev-x", 0) == 0
+    assert daemon._health_failures.get("dev-x") == 3
+
+
+async def test_health_failures_alone_trigger_eviction(monkeypatch):
+    """If health-side accumulates MAX failures, evict even when the
+    push-side hasn't observed any failures (deep-review H-2).
+    """
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+    host_cache.add_paired_device("codex", PairedDevice("dev-quiet", "10.0.0.5:80"))
+
+    from burnscope_client import pusher as pusher_mod
+
+    async def fake_fetch_health(host, client_id, client):
+        return None  # always transport-fails
+
+    monkeypatch.setattr(codex_daemon, "fetch_health", fake_fetch_health)
+    monkeypatch.setattr(codex_daemon, "HEALTH_INTERVAL_S", 0.005)
+
+    async def fake_push_to_all(snapshot, devices, client_id, client):
+        # Health loop never enqueues a push in this test — but if it does,
+        # don't double-evict from this side.
+        return {d.device_id: PushResult(d.device_id, True, "ok") for d in devices}
+
+    monkeypatch.setattr(codex_daemon, "push_to_all", fake_push_to_all)
+
+    async def fake_discover_all(timeout=4.0, agent=None, zc=None):
+        return []
+    monkeypatch.setattr(pusher_mod, "discover_all", fake_discover_all)
+
+    task = asyncio.create_task(daemon._health_loop())
+    try:
+        for _ in range(200):
+            if "dev-quiet" not in {d.device_id for d in host_cache.load_paired_devices("codex")}:
+                break
+            await asyncio.sleep(0.005)
+        else:
+            raise AssertionError("device was never evicted by health loop")
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert host_cache.load_paired_devices("codex") == []
+    # Health failure counter was cleared as part of eviction.
+    assert daemon._health_failures.get("dev-quiet", 0) == 0
+
+
+# =================================================== L-6: per-device divergence
+
+
+async def test_health_divergence_pushes_only_to_diverged_device(monkeypatch):
+    """When one of two paired devices shows divergence, the re-push
+    must target only that device — not fan out to the healthy peer
+    and wake its idle SM (deep-review L-6).
+    """
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+    host_cache.add_paired_device("codex", PairedDevice("dev-good", "10.0.0.5:80"))
+    host_cache.add_paired_device("codex", PairedDevice("dev-diverged", "10.0.0.6:80"))
+
+    # Daemon's idea of what should be on the firmware.
+    snap = AgentSnapshot(
+        agent="codex",
+        captured_at=1,
+        sessions=[SessionSnapshot("primary", 0.5, 1779066600)],
+    )
+    daemon._last_snapshot = snap
+
+    async def fake_fetch_health(host, client_id, client):
+        if host == "10.0.0.5:80":
+            # dev-good already has the snapshot
+            return {
+                "agents": {
+                    "codex": {
+                        "sessions": [
+                            {"type": "primary", "used_pct": 0.5, "resets_at": 1779066600}
+                        ]
+                    }
+                }
+            }
+        # dev-diverged lost state (reboot)
+        return {"agents": {}}
+
+    monkeypatch.setattr(codex_daemon, "fetch_health", fake_fetch_health)
+    monkeypatch.setattr(codex_daemon, "HEALTH_INTERVAL_S", 0.005)
+
+    pushed_to: list[list[str]] = []
+
+    async def fake_push_to_all(snapshot, devices, client_id, client):
+        pushed_to.append([d.device_id for d in devices])
+        return {d.device_id: PushResult(d.device_id, True, "ok") for d in devices}
+
+    monkeypatch.setattr(codex_daemon, "push_to_all", fake_push_to_all)
+
+    from burnscope_client import pusher as pusher_mod
+
+    async def fake_discover_all(timeout=4.0, agent=None, zc=None):
+        return []
+    monkeypatch.setattr(pusher_mod, "discover_all", fake_discover_all)
+
+    task = asyncio.create_task(daemon._health_loop())
+    try:
+        for _ in range(200):
+            if pushed_to:
+                break
+            await asyncio.sleep(0.005)
+        else:
+            raise AssertionError("health loop never re-pushed")
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    # Re-push went to dev-diverged ONLY — not the healthy dev-good.
+    assert pushed_to[0] == ["dev-diverged"]

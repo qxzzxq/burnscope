@@ -146,6 +146,45 @@ def test_pair_reset_wipes_paired_lists_and_client_ids(_isolate_state=None):
     assert host_cache.load_paired_devices("codex")  == []
 
 
+def test_pair_reset_warns_when_codex_daemon_supervisor_present(
+    monkeypatch, capsys, tmp_path
+):
+    """When the codex daemon is installed (launchd plist or systemd
+    unit on disk), pair-reset must print a daemon-restart warning so
+    the user reloads it — otherwise stale in-memory state
+    (_last_pushed_snapshot, failure counters) survives the reset and
+    can cause spurious early eviction on freshly re-claimed devices
+    (deep-review M-4).
+    """
+    # Fake a launchd plist on disk.
+    plist = tmp_path / "com.burnscope.codex.plist"
+    plist.write_text("<plist/>")
+    monkeypatch.setattr(cli, "LAUNCHD_PLIST_PATH", plist)
+    # Make sure the systemd unit path doesn't accidentally also exist.
+    monkeypatch.setattr(cli, "SYSTEMD_UNIT_PATH", tmp_path / "not-present.service")
+
+    rc = cli.main(["pair-reset"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "codex daemon is installed" in out
+    assert "launchctl" in out
+
+
+def test_pair_reset_silent_when_no_supervisor_installed(monkeypatch, capsys, tmp_path):
+    """If neither supervisor unit is on disk, pair-reset shouldn't
+    print the daemon-restart paragraph — that just confuses users
+    who never installed the codex daemon.
+    """
+    monkeypatch.setattr(cli, "LAUNCHD_PLIST_PATH", tmp_path / "absent.plist")
+    monkeypatch.setattr(cli, "SYSTEMD_UNIT_PATH", tmp_path / "absent.service")
+
+    rc = cli.main(["pair-reset"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "codex daemon" not in out
+    assert "launchctl" not in out
+
+
 # ================================================================ status
 
 def test_status_shows_per_device_breakdown(capsys):

@@ -129,7 +129,16 @@ class CodexDaemon:
         # change — see `_poll_loop`.
         self._last_pushed_snapshot: AgentSnapshot | None = None
         self._proc: asyncio.subprocess.Process | None = None
-        self._transport_failures: dict[str, int] = {}
+        # Two transport-failure counters, one per probe path. Sharing a
+        # single counter caused either path's success to mask the other's
+        # failures: e.g. a device unreachable on `POST /summary` but
+        # answering `GET /health` would never get evicted because health
+        # kept resetting the counter the pusher was trying to accumulate
+        # (and vice versa). With separate counters, *either* path crossing
+        # MAX_TRANSPORT_FAILURES is enough to evict, and each path only
+        # resets its own counter on its own success.
+        self._push_failures: dict[str, int] = {}
+        self._health_failures: dict[str, int] = {}
 
     # ------------------------------------------------------------------ run
 
@@ -351,6 +360,27 @@ class CodexDaemon:
             host_cache.write_push_state(AGENT_NAME, ok=False)
             return
 
+        await self._push_to_devices(snapshot, devices, client)
+
+    async def _push_to_devices(
+        self,
+        snapshot: AgentSnapshot,
+        devices: list[PairedDevice],
+        client: httpx.AsyncClient,
+    ) -> None:
+        """Fan out `snapshot` to `devices` and apply result bookkeeping.
+
+        Factored out of `_push_one` so the health-loop can drive a
+        targeted push (only the diverged devices) instead of going
+        through the queue + fan-out-to-all path.
+
+        Updates per-device push state, evicts on 401 or
+        MAX_TRANSPORT_FAILURES, advances `_last_pushed_snapshot` on any
+        device's success, and writes the aggregate status.
+
+        Caller must have already verified `self._client_id is not None`.
+        """
+        assert self._client_id is not None
         results = await push_to_all(snapshot, devices, self._client_id, client)
         results = await refresh_and_retry_transport_failures(
             snapshot, devices, results, self._client_id, client, AGENT_NAME,
@@ -368,21 +398,25 @@ class CodexDaemon:
             if result.kind == "auth":
                 log.info("dropping %s from codex paired list (401)", device_id)
                 host_cache.remove_paired_device(AGENT_NAME, device_id)
-                self._transport_failures.pop(device_id, None)
+                self._push_failures.pop(device_id, None)
+                self._health_failures.pop(device_id, None)
                 continue
             if result.kind == "transport":
-                failures = self._transport_failures.get(device_id, 0) + 1
-                self._transport_failures[device_id] = failures
+                failures = self._push_failures.get(device_id, 0) + 1
+                self._push_failures[device_id] = failures
                 if failures >= MAX_TRANSPORT_FAILURES:
                     log.warning(
-                        "dropping %s after %d transport failures",
+                        "dropping %s after %d push transport failures",
                         device_id, MAX_TRANSPORT_FAILURES,
                     )
                     host_cache.remove_paired_device(AGENT_NAME, device_id)
-                    self._transport_failures.pop(device_id, None)
+                    self._push_failures.pop(device_id, None)
+                    self._health_failures.pop(device_id, None)
                     continue
             else:
-                self._transport_failures.pop(device_id, None)
+                # Push succeeded — clear only the push counter. Health
+                # has its own counter and resets independently.
+                self._push_failures.pop(device_id, None)
             kept += 1
             if not result.ok:
                 overall_ok = False
@@ -448,7 +482,7 @@ class CodexDaemon:
                 devices = host_cache.load_paired_devices(AGENT_NAME)
                 if not devices:
                     continue
-                diverged_any = False
+                diverged_devices: list[PairedDevice] = []
                 all_unreachable = True
                 for device in devices:
                     body = await fetch_health(device.host, self._client_id, client)
@@ -457,30 +491,41 @@ class CodexDaemon:
                             AGENT_NAME, ok=False, device_id=device.device_id
                         )
                         failures = (
-                            self._transport_failures.get(device.device_id, 0) + 1
+                            self._health_failures.get(device.device_id, 0) + 1
                         )
-                        self._transport_failures[device.device_id] = failures
+                        self._health_failures[device.device_id] = failures
                         if failures >= MAX_TRANSPORT_FAILURES:
                             log.warning(
                                 "dropping %s after %d health failures",
                                 device.device_id, MAX_TRANSPORT_FAILURES,
                             )
                             host_cache.remove_paired_device(AGENT_NAME, device.device_id)
-                            self._transport_failures.pop(device.device_id, None)
+                            self._push_failures.pop(device.device_id, None)
+                            self._health_failures.pop(device.device_id, None)
                         continue
                     all_unreachable = False
-                    self._transport_failures.pop(device.device_id, None)
+                    # Health succeeded — clear only the health counter.
+                    # Push has its own counter and resets independently.
+                    self._health_failures.pop(device.device_id, None)
                     if self._last_snapshot is not None and _firmware_diverged(
                         body, self._last_snapshot
                     ):
-                        diverged_any = True
+                        diverged_devices.append(device)
                 if all_unreachable:
                     host_cache.write_push_state(AGENT_NAME, ok=False)
-                if diverged_any and self._last_snapshot is not None:
+                if diverged_devices and self._last_snapshot is not None:
+                    # Re-push only to the device(s) that actually diverged,
+                    # not the whole fleet. Non-diverged peers don't need
+                    # the update; pushing to them would wake their idle
+                    # state machine and waste bandwidth.
                     log.info(
-                        "firmware diverged on >=1 device; re-enqueuing last snapshot"
+                        "firmware diverged on %d device(s); re-pushing to %s",
+                        len(diverged_devices),
+                        [d.device_id for d in diverged_devices],
                     )
-                    self._enqueue_bounded(self._last_snapshot)
+                    await self._push_to_devices(
+                        self._last_snapshot, diverged_devices, client
+                    )
 
     # ----------------------------------------------------------- device list
 

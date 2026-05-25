@@ -965,12 +965,27 @@ flowchart LR
   <li>Send <code>account/rateLimits/read</code>; on
       <code>CodexProtocolError</code> log at debug and loop.</li>
   <li>Convert the response via <code>_snapshot_from_rate_limits</code>;
-      <code>None</code> → loop.</li>
-  <li>If the new snapshot
+      <code>None</code> → loop. Each session is tagged
+      <code>rolling: true</code> with the upstream's
+      <code>windowDurationMins</code> on the wire so the firmware can
+      synthesise a local countdown during idle.</li>
+  <li><strong>Anchor</strong> the fresh snapshot via
+      <code>_anchor_resets_at(fresh, _last_pushed_snapshot)</code>:
+      for each session whose <code>used_pct</code> matches the
+      last-pushed entry of the same <code>type</code>, rewrite its
+      <code>resets_at</code> to the last-pushed value. Required
+      because codex's backend reports <code>resetsAt</code> as roughly
+      <code>now + remaining</code>, so it slides ~60 s per 60 s of
+      wall-clock at low usage. Without anchoring the dedupe key
+      changes every poll and we'd push (and wake the firmware out of
+      burn-in idle) once per minute. The firmware-side synthesis
+      compensates for the stale <code>resets_at</code> when
+      <code>used_pct ≤ 0.01</code>.</li>
+  <li>If the anchored snapshot
       <code>semantically_equal</code> to
       <code>_last_pushed_snapshot</code> → debug-log "rate limits
       unchanged; skipping push" and loop.</li>
-  <li>Otherwise enqueue the snapshot for the pusher.</li>
+  <li>Otherwise enqueue the (anchored) snapshot for the pusher.</li>
 </ol>
 
 <h4>Pusher coroutine</h4>
@@ -1001,10 +1016,15 @@ flowchart LR
   <li>On <code>401</code>: silently
       <code>remove_paired_device("codex", device_id)</code>.</li>
   <li>On success: compare body's per-agent <code>sessions</code> against
-      the last pushed snapshot. On divergence for any device (firmware
-      lost state), enqueue the latest snapshot to re-push to <em>all</em>
-      paired devices (<code>push_to_all</code> is idempotent on
-      already-fresh devices).</li>
+      <code>_last_pushed_snapshot</code> (the anchored value the
+      firmware actually received — comparing against the raw
+      <code>_last_snapshot</code> would manufacture a spurious
+      divergence each cycle because the poll-loop anchoring keeps
+      <code>_last_pushed_snapshot</code> stable while
+      <code>_last_snapshot</code> tracks the drifting wire value). On
+      divergence, re-push <em>only</em> to the diverged devices —
+      pushing to already-fresh peers would wake their idle SM and
+      waste bandwidth.</li>
 </ol>
 
 <h4>Subprocess failure</h4>

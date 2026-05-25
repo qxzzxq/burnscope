@@ -63,6 +63,13 @@ from .schema import AgentSnapshot, SessionSnapshot  # noqa: E402
 
 AGENT_NAME = "claude"
 DISCOVERY_TIMEOUT_S = 4.0
+# Statusline children are short-lived (one per Claude Code turn), so we
+# can't keep a per-process failure counter the way codex_daemon does.
+# Instead, the per-device `last-push.claude.<device_id>` file carries a
+# `consecutive_failures` field that survives between fires. After this
+# many consecutive transport failures, the device is evicted from the
+# paired list — matching codex_daemon's MAX_TRANSPORT_FAILURES policy.
+MAX_TRANSPORT_FAILURES = 5
 
 log = logging.getLogger(__name__)
 
@@ -241,15 +248,27 @@ async def _do_fanout(snapshot: AgentSnapshot, client_id: str) -> int:
 
     overall_ok = True
     for device_id, result in results.items():
-        host_cache.write_push_state(
-            AGENT_NAME, ok=result.ok, device_id=device_id
-        )
+        if result.ok:
+            host_cache.reset_push_failures(AGENT_NAME, device_id)
+            continue
         if result.kind == "auth":
+            # Device is no longer ours — don't let it tip the aggregate.
+            # `remove_paired_device` also unlinks the per-device file.
             log.info("dropping %s from claude paired list (401)", device_id)
+            host_cache.write_push_state(
+                AGENT_NAME, ok=False, device_id=device_id
+            )
             host_cache.remove_paired_device(AGENT_NAME, device_id)
             continue
-        if not result.ok:
-            overall_ok = False
+        # Transport (or any other non-auth) failure: persist the bump.
+        overall_ok = False
+        failures = host_cache.bump_push_failures(AGENT_NAME, device_id)
+        if failures >= MAX_TRANSPORT_FAILURES:
+            log.warning(
+                "dropping %s after %d push transport failures",
+                device_id, MAX_TRANSPORT_FAILURES,
+            )
+            host_cache.remove_paired_device(AGENT_NAME, device_id)
 
     host_cache.write_push_state(AGENT_NAME, ok=overall_ok)
     return 0 if overall_ok else 1

@@ -1,11 +1,12 @@
 """Long-lived Codex daemon — owns the `codex app-server` subprocess.
 
-Three coroutines run for the lifetime of one app-server connection:
+Four coroutines run for the lifetime of one app-server connection:
 
   * Reader  — pulls JSONL lines off stdout, resolves outstanding requests
               by `id`, and translates `account/rateLimits/updated`
               notifications into AgentSnapshots that get enqueued for the
-              pusher.
+              pusher. (The notification path is preserved for free, but
+              cross-process emission is unreliable; see Poll below.)
   * Pusher  — drains the snapshot queue, resolves the ESP32 host via the
               mDNS cache, POSTs with the cached client_id header, and
               writes the per-agent last-push state file.
@@ -13,8 +14,14 @@ Three coroutines run for the lifetime of one app-server connection:
               host cache; on body/snapshot divergence (firmware lost state)
               re-enqueues the latest snapshot. Mirrors v1's edge-triggered
               reconciliation.
+  * Poll    — every POLL_INTERVAL_S, calls `account/rateLimits/read`
+              against our own app-server and enqueues a push only when
+              the freshly-read snapshot differs from `_last_pushed_snapshot`.
+              Authoritative trigger for changes that originate in other
+              `codex` CLI processes (which never reach the long-lived
+              app-server's notification stream).
 
-If the app-server EOFs, all three coroutines unwind, the manager backs off
+If the app-server EOFs, all four coroutines unwind, the manager backs off
 (1s exponential up to 60s), and re-bootstraps. Identity is re-derived on
 each fresh connection.
 

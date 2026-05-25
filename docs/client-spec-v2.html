@@ -181,8 +181,14 @@
       passing the current session's <code>rate_limits</code> on stdin.</li>
   <li><strong>Codex</strong> → the
       <a href="./codex-app-server.html"><code>codex app-server</code></a>
-      JSON-RPC subprocess. Listens for
-      <code>account/rateLimits/updated</code> server notifications.</li>
+      JSON-RPC subprocess. Actively polls
+      <code>account/rateLimits/read</code> on a 60 s cadence and
+      dedupes against the last successfully pushed snapshot;
+      <code>account/rateLimits/updated</code> notifications are still
+      handled if they fire, but the long-lived app-server doesn't
+      observe rate-limit changes that originate in other
+      <code>codex</code> CLI processes, so polling is the
+      authoritative trigger.</li>
 </ul>
 
 <p>
@@ -273,8 +279,8 @@ flowchart LR
   bgpush -. "fan-out POST" .-> esp32Y
 
   %% Codex wiring
-  cas -- "stdout notifications" --> codexd
-  codexd -- "stdin JSON-RPC" --> cas
+  cas -- "stdout notifications + poll responses" --> codexd
+  codexd -- "stdin JSON-RPC (poll + bootstrap)" --> cas
   codexd --> pdcodex
   codexd --> lpcodex
   codexd -. "fan-out POST<br/>X-BurnScope-Client-Id" .-> esp32X
@@ -718,7 +724,7 @@ flowchart LR
 <p>
   Long-running async process. Owns one <code>codex app-server</code>
   subprocess for the lifetime of the daemon. Restarts the subprocess on
-  unexpected EOF. Three coroutines:
+  unexpected EOF. Four coroutines:
 </p>
 
 <ul>
@@ -726,17 +732,32 @@ flowchart LR
       demuxes responses by <code>id</code> and notifications by
       <code>method</code>. On
       <code>account/rateLimits/updated</code>: build <code>AgentSnapshot</code>,
-      enqueue push.</li>
+      enqueue push. (Notifications fire only when the app-server's
+      own in-process cache changes; the Poll coroutine below is the
+      authoritative trigger for changes that originate elsewhere.)</li>
   <li><strong>Pusher</strong> — consumes the push queue, runs
       mDNS-cached <code>POST /summary</code>. After each attempt,
       calls <code>write_push_state("codex", ok=…)</code> so
       <code>burnscope status</code> can report health. On transport
       failure, invalidates the host cache and retries on the next
-      event (no aggressive retry loop).</li>
+      event (no aggressive retry loop). Advances
+      <code>_last_pushed_snapshot</code> only when at least one
+      device's <code>PushResult.ok</code> is True (gates the Poll
+      coroutine's dedupe — see below).</li>
   <li><strong>Health</strong> — periodic <code>GET /health</code>; on
       transport failure invalidates the host cache; on body mismatch
       with the latest snapshot, re-enqueues a push. Preserves v1's
       edge-triggered reconciliation guarantee for Codex.</li>
+  <li><strong>Poll</strong> — every <code>POLL_INTERVAL_S</code>
+      (60 s), sends <code>account/rateLimits/read</code> to the
+      app-server, builds an <code>AgentSnapshot</code>, and enqueues
+      it only when <code>AgentSnapshot.semantically_equal</code>
+      reports a real change against <code>_last_pushed_snapshot</code>.
+      Required because the long-lived app-server doesn't observe
+      rate-limit changes that originate in other <code>codex</code>
+      CLI processes (no file watchers on
+      <code>~/.codex/state_*.sqlite</code>); the notification path
+      alone would push exactly once at bootstrap and then go silent.</li>
 </ul>
 
 <p>
@@ -899,15 +920,35 @@ flowchart LR
 <ol>
   <li>Read a JSONL line.</li>
   <li>If it has an <code>id</code> matching a pending request → resolve
-      that request's future.</li>
+      that request's future. (Includes responses to the Poll
+      coroutine's <code>account/rateLimits/read</code> requests.)</li>
   <li>If it has a <code>method</code>:
     <ul>
       <li><code>account/rateLimits/updated</code> → build
           <code>AgentSnapshot</code>, set <code>captured_at = now</code>,
-          enqueue push.</li>
+          enqueue push. Rarely fires in practice (the app-server only
+          emits when its own in-process cache changes); the Poll
+          coroutine is the authoritative trigger.</li>
       <li>Other methods → log at debug, ignore.</li>
     </ul>
   </li>
+</ol>
+
+<h4>Steady state (poll loop)</h4>
+
+<ol>
+  <li>Sleep <code>POLL_INTERVAL_S</code> seconds (default 60).</li>
+  <li>Skip if <code>self._client_id is None</code> (bootstrap hasn't
+      finished yet).</li>
+  <li>Send <code>account/rateLimits/read</code>; on
+      <code>CodexProtocolError</code> log at debug and loop.</li>
+  <li>Convert the response via <code>_snapshot_from_rate_limits</code>;
+      <code>None</code> → loop.</li>
+  <li>If the new snapshot
+      <code>semantically_equal</code> to
+      <code>_last_pushed_snapshot</code> → debug-log "rate limits
+      unchanged; skipping push" and loop.</li>
+  <li>Otherwise enqueue the snapshot for the pusher.</li>
 </ol>
 
 <h4>Pusher coroutine</h4>

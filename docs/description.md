@@ -118,11 +118,16 @@ specification lives at [`client-spec-v2.html`](./client-spec-v2.html).
    (`oauthAccount.emailAddress`, fallback `userID`), POSTs the snapshot,
    and writes `~/.burnscope/last-push.claude`.
 2. **Codex — long-lived daemon** (`codex_daemon.py`). Owns a
-   `codex app-server` JSON-RPC subprocess. Reader / pusher / health-
-   reconciliation coroutines run together; new snapshots arrive as
-   `account/rateLimits/updated` notifications and every 30 s the daemon
-   compares its latest snapshot against the firmware's `/health` to detect
-   drift after a reboot.
+   `codex app-server` JSON-RPC subprocess. Reader / pusher / health /
+   poll coroutines run together. New snapshots arrive primarily via
+   the poll loop, which calls `account/rateLimits/read` every 60 s
+   and enqueues a push only when the freshly-read snapshot differs
+   from the last successfully pushed one — the long-lived app-server
+   doesn't see rate-limit changes from other `codex` CLI processes,
+   so notifications alone would fall silent after bootstrap.
+   Every 30 s the daemon also probes the firmware's `/health` to
+   detect drift (e.g. reboot wiped the RAM-only snapshot store) and
+   re-pushes on divergence.
 
 Each collector ships its plaintext identifier in `X-BurnScope-Client-Id`.
 The ESP32 binds it on first push (TOFU) and rejects mismatches with `401`.

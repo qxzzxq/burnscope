@@ -591,6 +591,12 @@ def _snapshot_from_rate_limits(rate_limits: object) -> AgentSnapshot | None:
 
     Skips a window when any of usedPercent, windowDurationMins, or resetsAt
     is missing/null. Empty result → returns None (no push).
+
+    Both codex windows are rolling against wall-clock — verified
+    empirically against a held app-server: `resetsAt` advances ~60 s per
+    60 s of real time at low usage. We mark them as such on the wire so
+    the firmware can synthesize a fresh countdown locally during idle
+    (`rolling=True` + the window's duration in minutes).
     """
     if not isinstance(rate_limits, dict):
         return None
@@ -609,7 +615,15 @@ def _snapshot_from_rate_limits(rate_limits: object) -> AgentSnapshot | None:
             continue
         if not isinstance(duration, int):
             continue
-        sessions.append(SessionSnapshot(label, float(pct) / 100.0, int(resets)))
+        sessions.append(
+            SessionSnapshot(
+                type=label,
+                used_pct=float(pct) / 100.0,
+                resets_at=int(resets),
+                rolling=True,
+                window_duration_mins=int(duration),
+            )
+        )
 
     if not sessions:
         return None

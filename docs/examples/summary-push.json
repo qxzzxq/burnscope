@@ -5,12 +5,16 @@
     {
       "type": "current",
       "used_pct": 0.03,
-      "resets_at": 1779066600
+      "resets_at": 1779066600,
+      "rolling": false,
+      "window_duration_mins": 300
     },
     {
       "type": "weekly",
       "used_pct": 0.09,
-      "resets_at": 1779156000
+      "resets_at": 1779156000,
+      "rolling": false,
+      "window_duration_mins": 10080
     }
   ]
 }

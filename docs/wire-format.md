@@ -13,13 +13,15 @@ and is kept in sync by hand.
 
 ### `SessionSnapshot`
 
-One rate-limit session (rolling-quota window) at one point in time.
+One rate-limit session (quota window) at one point in time.
 
-| Field       | Type    | Range / format     | Description |
-|-------------|---------|--------------------|-------------|
-| `type`      | string  | agent-defined      | Label for this session, in the upstream agent's own vocabulary. See the per-agent vocabulary table below. |
-| `used_pct`  | float   | `0.0` – `1.0`      | Fraction of the session used. `0.03` = 3%. |
-| `resets_at` | integer | unix seconds (UTC) | When the session rolls over. Clients compute the countdown locally against their own (NTP-synced) clock. |
+| Field                  | Type    | Range / format     | Description |
+|------------------------|---------|--------------------|-------------|
+| `type`                 | string  | agent-defined      | Label for this session, in the upstream agent's own vocabulary. See the per-agent vocabulary table below. |
+| `used_pct`             | float   | `0.0` – `1.0`      | Fraction of the session used. `0.03` = 3%. |
+| `resets_at`            | integer | unix seconds (UTC) | When the session rolls over. Clients compute the countdown locally against their own (NTP-synced) clock. |
+| `rolling`              | bool    | `true` / `false`   | `true` if the underlying window's reset time drifts with wall-clock during idle (Codex). `false` if it is anchored to the first usage event and stays put until expiry (Claude). Lets the firmware decide whether to trust the pushed `resets_at` as-is or synthesize a fresh countdown locally during idle. |
+| `window_duration_mins` | integer | minutes (≥ 0)      | Total length of the window. Used by the firmware to synthesize a countdown locally when `rolling` is `true` and `used_pct` is essentially zero; otherwise informational. `0` is allowed and means "unknown / synthesis not desired". |
 
 ### `AgentSnapshot`
 
@@ -159,12 +161,12 @@ rate-limit headers from upstream HTTP responses (which cost tokens);
 it reads the same numbers from agent-native sources. The mapping each
 collector applies before constructing a `SessionSnapshot`:
 
-| Agent    | `sessions[].type` | Source field                                                | Notes |
-|----------|-------------------|-------------------------------------------------------------|-------|
-| `claude` | `current`         | Claude Code statusline payload: `rate_limits.five_hour.used_percentage` ÷ 100, `rate_limits.five_hour.resets_at` | See `docs/claude-statusline.html`. |
-| `claude` | `weekly`          | Claude Code statusline payload: `rate_limits.seven_day.used_percentage` ÷ 100, `rate_limits.seven_day.resets_at` | Same source. |
-| `codex`  | `primary`         | `codex app-server`: `rateLimits.primary.usedPercent` ÷ 100, `rateLimits.primary.resetsAt` | See `docs/codex-app-server.html`. Method `account/rateLimits/read` for the initial snapshot, notification `account/rateLimits/updated` for live updates. |
-| `codex`  | `secondary`       | `codex app-server`: `rateLimits.secondary.usedPercent` ÷ 100, `rateLimits.secondary.resetsAt` | Same source. |
+| Agent    | `sessions[].type` | Source field                                                | `rolling` | `window_duration_mins` | Notes |
+|----------|-------------------|-------------------------------------------------------------|-----------|------------------------|-------|
+| `claude` | `current`         | Claude Code statusline payload: `rate_limits.five_hour.used_percentage` ÷ 100, `rate_limits.five_hour.resets_at` | `false`   | `300`                  | See `docs/claude-statusline.html`. Anthropic's 5h window is anchored to the first message of the session — `resets_at` stays put until expiry, so synthesis is unnecessary. |
+| `claude` | `weekly`          | Claude Code statusline payload: `rate_limits.seven_day.used_percentage` ÷ 100, `rate_limits.seven_day.resets_at` | `false`   | `10080`                | Same source. 7d window is anchored to the first prompt of the week. |
+| `codex`  | `primary`         | `codex app-server`: `rateLimits.primary.usedPercent` ÷ 100, `rateLimits.primary.resetsAt` | `true`    | from `rateLimits.primary.windowDurationMins` (typically `300`) | See `docs/codex-app-server.html`. The backend reports `resetsAt` as roughly `now + remaining`, so it drifts with wall-clock during idle — `rolling: true` tells the firmware to synthesize a countdown when `used_pct ≤ 0.01`. |
+| `codex`  | `secondary`       | `codex app-server`: `rateLimits.secondary.usedPercent` ÷ 100, `rateLimits.secondary.resetsAt` | `true`    | from `rateLimits.secondary.windowDurationMins` (typically `10080`) | Same source. |
 
 Both upstream sources return percentages on a 0–100 scale; the
 collector divides by 100 before constructing the `SessionSnapshot`.

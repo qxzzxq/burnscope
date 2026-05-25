@@ -37,6 +37,23 @@ def test_snapshot_from_rate_limits_maps_both_windows():
     assert types == {"primary", "secondary"}
 
 
+def test_snapshot_from_rate_limits_marks_both_windows_rolling_with_duration():
+    """Codex windows are rolling against wall-clock; the wire fields must
+    reflect that so the firmware can synthesize during idle."""
+    snap = _snapshot_from_rate_limits(
+        {
+            "primary": {"usedPercent": 1, "windowDurationMins": 300, "resetsAt": 1779066600},
+            "secondary": {"usedPercent": 3, "windowDurationMins": 10080, "resetsAt": 1779156000},
+        }
+    )
+    assert snap is not None
+    by_type = {s.type: s for s in snap.sessions}
+    assert by_type["primary"].rolling is True
+    assert by_type["primary"].window_duration_mins == 300
+    assert by_type["secondary"].rolling is True
+    assert by_type["secondary"].window_duration_mins == 10080
+
+
 def test_snapshot_from_rate_limits_skips_window_with_null_resets_at():
     snap = _snapshot_from_rate_limits(
         {
@@ -736,10 +753,20 @@ async def test_poll_loop_skips_when_rate_limits_unchanged(monkeypatch):
 
     daemon = CodexDaemon()
     daemon._client_id = "u@example.com"
+    # Baseline must mirror the shape `_snapshot_from_rate_limits` produces
+    # (rolling=True, window_duration_mins=300) so the dedupe key matches.
     daemon._last_pushed_snapshot = AgentSnapshot(
         agent="codex",
         captured_at=1,
-        sessions=[SessionSnapshot("primary", 0.12, 1779066600)],
+        sessions=[
+            SessionSnapshot(
+                type="primary",
+                used_pct=0.12,
+                resets_at=1779066600,
+                rolling=True,
+                window_duration_mins=300,
+            )
+        ],
     )
     monkeypatch.setattr(
         daemon,

@@ -16,7 +16,7 @@ from typing import Any
 
 @dataclass(frozen=True)
 class SessionSnapshot:
-    """One rate-limit session (rolling-quota window) at one point in time.
+    """One rate-limit session (quota window) at one point in time.
 
     Fields:
         type: Agent-defined label (e.g. `"current"`, `"weekly"` for Claude;
@@ -26,11 +26,26 @@ class SessionSnapshot:
             must scale upstream values into this range before
             constructing the snapshot.
         resets_at: Unix seconds (UTC) when the session rolls over.
+        rolling: True when the upstream's `resets_at` drifts with
+            wall-clock during idle (Codex). False when it is anchored to
+            a first-usage event and stays put until expiry (Claude). The
+            firmware uses this to decide whether to synthesize a local
+            countdown when `used_pct` is essentially zero.
+        window_duration_mins: Total length of the window in minutes
+            (e.g. 300 for a 5h window, 10080 for a 7d window). Required
+            for the firmware's idle-synthesis path; the wire format
+            accepts 0 to mean "unknown / synthesis disabled".
+
+    Defaults exist for the two new fields so call sites that don't
+    distinguish rolling-vs-fixed (older tests, ad-hoc construction) keep
+    working. Producers that know the answer must set both explicitly.
     """
 
     type: str
     used_pct: float
     resets_at: int
+    rolling: bool = False
+    window_duration_mins: int = 0
 
 
 @dataclass(frozen=True)
@@ -60,11 +75,12 @@ class AgentSnapshot:
     def semantically_equal(self, other: "AgentSnapshot | None") -> bool:
         """Return True iff `other` represents the same user-visible state.
 
-        Compares `agent` and the per-session `(type, used_pct, resets_at)`
+        Compares `agent` and the per-session
+        `(type, used_pct, resets_at, rolling, window_duration_mins)`
         tuples, sorted by `type` so session order is not significant.
-        Ignores `captured_at` — that timestamp bumps every time the daemon
-        re-reads, but does not reflect a user-visible change. Returns
-        False if `other is None`.
+        Ignores `captured_at` — that timestamp bumps every time the
+        daemon re-reads, but does not reflect a user-visible change.
+        Returns False if `other is None`.
 
         Used by the Codex daemon's poll loop to decide whether a freshly
         read rate-limit snapshot needs to be pushed to the firmware.
@@ -73,6 +89,12 @@ class AgentSnapshot:
             return False
         if self.agent != other.agent:
             return False
-        a = sorted((s.type, s.used_pct, s.resets_at) for s in self.sessions)
-        b = sorted((s.type, s.used_pct, s.resets_at) for s in other.sessions)
+        a = sorted(
+            (s.type, s.used_pct, s.resets_at, s.rolling, s.window_duration_mins)
+            for s in self.sessions
+        )
+        b = sorted(
+            (s.type, s.used_pct, s.resets_at, s.rolling, s.window_duration_mins)
+            for s in other.sessions
+        )
         return a == b

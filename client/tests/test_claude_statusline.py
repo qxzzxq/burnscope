@@ -49,7 +49,15 @@ def test_foreground_renders_with_pending_indicator(monkeypatch, capsys):
     written = popen_instance.stdin.write.call_args.args[0]
     snap = json.loads(written.decode())
     assert snap["agent"] == "claude"
-    assert {s["type"] for s in snap["sessions"]} == {"current", "weekly"}
+    by_type = {s["type"]: s for s in snap["sessions"]}
+    assert set(by_type) == {"current", "weekly"}
+    # Anthropic's windows are anchored to first-prompt-in-period, not
+    # drifting with wall-clock — wire format must say so explicitly so the
+    # firmware doesn't synthesize a replacement countdown.
+    assert by_type["current"]["rolling"] is False
+    assert by_type["current"]["window_duration_mins"] == 300
+    assert by_type["weekly"]["rolling"] is False
+    assert by_type["weekly"]["window_duration_mins"] == 10080
 
 
 def test_foreground_uses_check_indicator_after_successful_push(monkeypatch, capsys):

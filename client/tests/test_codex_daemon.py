@@ -639,6 +639,291 @@ async def test_pusher_loop_auto_pairs_when_empty(monkeypatch):
     }
 
 
+async def _drive_poll_loop(
+    daemon: CodexDaemon, *, until, max_iter: int = 200
+) -> None:
+    """Run `_poll_loop` until `until()` returns True or we time out."""
+    task = asyncio.create_task(daemon._poll_loop())
+    try:
+        for _ in range(max_iter):
+            if until():
+                return
+            await asyncio.sleep(0.005)
+        raise AssertionError("poll-loop predicate never satisfied")
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+def _fake_request_returning(rate_limits: dict | None):
+    """Build a stub for `daemon._request` that always returns the same result.
+
+    Lets poll-loop tests skip the full stdin/stdout dance and focus on the
+    dedupe + enqueue logic.
+    """
+
+    async def fake(method: str, params: dict) -> dict:
+        assert method == "account/rateLimits/read"
+        return {"rateLimits": rate_limits} if rate_limits is not None else {}
+
+    return fake
+
+
+async def test_poll_loop_first_iteration_always_enqueues(monkeypatch):
+    """First poll fires with `_last_pushed_snapshot is None` → must enqueue.
+
+    This is the guard against an installed daemon being silent forever if
+    the bootstrap push failed.
+    """
+    monkeypatch.setattr(codex_daemon, "POLL_INTERVAL_S", 0.005)
+
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+    monkeypatch.setattr(
+        daemon,
+        "_request",
+        _fake_request_returning(
+            {
+                "primary": {
+                    "usedPercent": 12,
+                    "windowDurationMins": 300,
+                    "resetsAt": 1779066600,
+                }
+            }
+        ),
+    )
+
+    await _drive_poll_loop(daemon, until=lambda: daemon._snapshot_queue.qsize() >= 1)
+    snap = daemon._snapshot_queue.get_nowait()
+    assert [s.type for s in snap.sessions] == ["primary"]
+    assert snap.sessions[0].used_pct == pytest.approx(0.12)
+
+
+async def test_poll_loop_enqueues_when_rate_limits_change(monkeypatch):
+    monkeypatch.setattr(codex_daemon, "POLL_INTERVAL_S", 0.005)
+
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+    # Baseline: a previous push went out at 12%.
+    daemon._last_pushed_snapshot = AgentSnapshot(
+        agent="codex",
+        captured_at=1,
+        sessions=[SessionSnapshot("primary", 0.12, 1779066600)],
+    )
+    # Read now returns 15% — different from baseline.
+    monkeypatch.setattr(
+        daemon,
+        "_request",
+        _fake_request_returning(
+            {
+                "primary": {
+                    "usedPercent": 15,
+                    "windowDurationMins": 300,
+                    "resetsAt": 1779066600,
+                }
+            }
+        ),
+    )
+
+    await _drive_poll_loop(daemon, until=lambda: daemon._snapshot_queue.qsize() >= 1)
+    snap = daemon._snapshot_queue.get_nowait()
+    assert snap.sessions[0].used_pct == pytest.approx(0.15)
+
+
+async def test_poll_loop_skips_when_rate_limits_unchanged(monkeypatch):
+    monkeypatch.setattr(codex_daemon, "POLL_INTERVAL_S", 0.005)
+
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+    daemon._last_pushed_snapshot = AgentSnapshot(
+        agent="codex",
+        captured_at=1,
+        sessions=[SessionSnapshot("primary", 0.12, 1779066600)],
+    )
+    monkeypatch.setattr(
+        daemon,
+        "_request",
+        _fake_request_returning(
+            {
+                "primary": {
+                    "usedPercent": 12,
+                    "windowDurationMins": 300,
+                    "resetsAt": 1779066600,
+                }
+            }
+        ),
+    )
+
+    # Let several poll iterations run; queue must stay empty.
+    task = asyncio.create_task(daemon._poll_loop())
+    try:
+        await asyncio.sleep(0.05)  # >= ~10 iterations at 5 ms cadence
+        assert daemon._snapshot_queue.empty()
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_poll_loop_skips_when_client_id_missing(monkeypatch):
+    """Before bootstrap completes (`_client_id is None`), poll must no-op."""
+    monkeypatch.setattr(codex_daemon, "POLL_INTERVAL_S", 0.005)
+
+    daemon = CodexDaemon()
+    daemon._client_id = None
+
+    called = False
+
+    async def fake_request(method: str, params: dict) -> dict:
+        nonlocal called
+        called = True
+        return {"rateLimits": {}}
+
+    monkeypatch.setattr(daemon, "_request", fake_request)
+
+    task = asyncio.create_task(daemon._poll_loop())
+    try:
+        await asyncio.sleep(0.05)
+        assert called is False
+        assert daemon._snapshot_queue.empty()
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_poll_loop_tolerates_request_errors(monkeypatch):
+    """A protocol error from `read` must not kill the loop."""
+    monkeypatch.setattr(codex_daemon, "POLL_INTERVAL_S", 0.005)
+
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+
+    call_count = 0
+
+    async def flaky_request(method: str, params: dict) -> dict:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise codex_daemon.CodexProtocolError("transient")
+        return {
+            "rateLimits": {
+                "primary": {
+                    "usedPercent": 33,
+                    "windowDurationMins": 300,
+                    "resetsAt": 1779066600,
+                }
+            }
+        }
+
+    monkeypatch.setattr(daemon, "_request", flaky_request)
+
+    await _drive_poll_loop(daemon, until=lambda: daemon._snapshot_queue.qsize() >= 1)
+    assert call_count >= 2  # first failed, second succeeded
+
+
+async def test_push_one_updates_last_pushed_snapshot_on_success(monkeypatch):
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+    host_cache.add_paired_device("codex", PairedDevice("dev-a", "10.0.0.5:80"))
+
+    async def fake_push_to_all(snapshot, devices, client_id, client):
+        return {d.device_id: PushResult(d.device_id, True, "ok") for d in devices}
+
+    monkeypatch.setattr(codex_daemon, "push_to_all", fake_push_to_all)
+
+    snap = AgentSnapshot(
+        agent="codex",
+        captured_at=42,
+        sessions=[SessionSnapshot("primary", 0.5, 1779066600)],
+    )
+    daemon._enqueue_snapshot(snap)
+    await _drain_one_push(
+        daemon,
+        predicate=lambda: daemon._last_pushed_snapshot is not None,
+    )
+
+    assert daemon._last_pushed_snapshot is snap
+
+
+async def test_push_one_keeps_last_pushed_snapshot_unchanged_on_failure(monkeypatch):
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+    host_cache.add_paired_device("codex", PairedDevice("dev-drop", "10.0.0.5:80"))
+
+    async def fake_push_to_all(snapshot, devices, client_id, client):
+        # All devices fail with 401 → device dropped, overall_ok=False.
+        return {d.device_id: PushResult(d.device_id, False, "auth") for d in devices}
+
+    monkeypatch.setattr(codex_daemon, "push_to_all", fake_push_to_all)
+
+    daemon._enqueue_snapshot(
+        AgentSnapshot(
+            agent="codex",
+            captured_at=1,
+            sessions=[SessionSnapshot("primary", 0.5, 1779066600)],
+        )
+    )
+    await _drain_one_push(
+        daemon,
+        predicate=lambda: host_cache.read_push_state("codex") is not None,
+    )
+
+    assert daemon._last_pushed_snapshot is None
+
+
+async def test_push_one_advances_last_pushed_snapshot_on_partial_success(monkeypatch):
+    """One device accepts, one fails → the snapshot was delivered, so the
+    dedupe baseline must advance. Otherwise the working device would get
+    re-pushed every minute until the flaky peer either recovers or gets
+    evicted — exactly what the dedupe is meant to prevent.
+    """
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+    host_cache.add_paired_device("codex", PairedDevice("dev-ok", "10.0.0.5:80"))
+    host_cache.add_paired_device("codex", PairedDevice("dev-flaky", "10.0.0.6:80"))
+
+    async def fake_push_to_all(snapshot, devices, client_id, client):
+        return {
+            "dev-ok":    PushResult("dev-ok",    True,  "ok"),
+            "dev-flaky": PushResult("dev-flaky", False, "transport"),
+        }
+
+    monkeypatch.setattr(codex_daemon, "push_to_all", fake_push_to_all)
+    # Block the refresh-and-retry helper from healing the transport failure,
+    # so partial-success persists into _push_one's accounting.
+    from burnscope_client import pusher
+
+    async def fake_discover_all(timeout=4.0, agent=None, zc=None):
+        return []
+    monkeypatch.setattr(pusher, "discover_all", fake_discover_all)
+
+    snap = AgentSnapshot(
+        agent="codex",
+        captured_at=42,
+        sessions=[SessionSnapshot("primary", 0.5, 1779066600)],
+    )
+    daemon._enqueue_snapshot(snap)
+    await _drain_one_push(
+        daemon,
+        predicate=lambda: daemon._last_pushed_snapshot is not None,
+    )
+
+    # Baseline advanced — dev-ok got the snapshot, so a follow-up poll
+    # with the same data must dedupe out instead of pummeling dev-ok.
+    assert daemon._last_pushed_snapshot is snap
+    # Aggregate `ok` still reports the truth that one device is unhealthy.
+    assert host_cache.read_push_state("codex")["ok"] is False
+    # Flaky peer is still paired (transport failure, not auth) and its
+    # failure counter has advanced toward MAX_TRANSPORT_FAILURES.
+    assert daemon._transport_failures.get("dev-flaky") == 1
+    assert {d.device_id for d in host_cache.load_paired_devices("codex")} == {
+        "dev-ok",
+        "dev-flaky",
+    }
+
+
 def test_enqueue_bounded_caps_queue_and_keeps_newest():
     """Under sustained push failure the snapshot queue must stay bounded.
 

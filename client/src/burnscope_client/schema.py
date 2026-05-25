@@ -56,3 +56,23 @@ class AgentSnapshot:
             "captured_at": self.captured_at,
             "sessions": [asdict(s) for s in self.sessions],
         }
+
+    def semantically_equal(self, other: "AgentSnapshot | None") -> bool:
+        """Return True iff `other` represents the same user-visible state.
+
+        Compares `agent` and the per-session `(type, used_pct, resets_at)`
+        tuples, sorted by `type` so session order is not significant.
+        Ignores `captured_at` — that timestamp bumps every time the daemon
+        re-reads, but does not reflect a user-visible change. Returns
+        False if `other is None`.
+
+        Used by the Codex daemon's poll loop to decide whether a freshly
+        read rate-limit snapshot needs to be pushed to the firmware.
+        """
+        if other is None:
+            return False
+        if self.agent != other.agent:
+            return False
+        a = sorted((s.type, s.used_pct, s.resets_at) for s in self.sessions)
+        b = sorted((s.type, s.used_pct, s.resets_at) for s in other.sessions)
+        return a == b

@@ -67,6 +67,13 @@ AGENT_NAME = "codex"
 APP_SERVER_CMD = ("codex", "app-server")
 CLIENT_NAME = "burnscope"
 HEALTH_INTERVAL_S = 30.0
+# Active poll of `account/rateLimits/read`. Required because the
+# app-server only emits `rateLimits/updated` when its own in-process
+# cache changes — and our long-lived app-server is a passive observer,
+# so external `codex` CLI prompts never reach it. The poll is the
+# authoritative trigger; we dedupe against `_last_pushed_snapshot` so
+# unchanged ticks stay silent (and the firmware can idle).
+POLL_INTERVAL_S = 60.0
 DISCOVERY_TIMEOUT_S = 5.0
 BACKOFF_INITIAL_S = 1.0
 BACKOFF_MAX_S = 60.0
@@ -108,6 +115,12 @@ class CodexDaemon:
         )
         self._client_id: str | None = None
         self._last_snapshot: AgentSnapshot | None = None
+        # The most recent snapshot we *successfully pushed* to at least one
+        # device. Distinct from `_last_snapshot` (latest received from the
+        # app-server, may not have made it through). Used by the poll loop
+        # to decide whether a freshly-read snapshot represents a real
+        # change — see `_poll_loop`.
+        self._last_pushed_snapshot: AgentSnapshot | None = None
         self._proc: asyncio.subprocess.Process | None = None
         self._transport_failures: dict[str, int] = {}
 
@@ -149,6 +162,7 @@ class CodexDaemon:
         await asyncio.gather(
             self._pusher_loop(),
             self._health_loop(),
+            self._poll_loop(),
         )
 
     # ----------------------------------------------------------- subprocess
@@ -336,11 +350,14 @@ class CodexDaemon:
             discovery_timeout=DISCOVERY_TIMEOUT_S,
         )
         overall_ok = True
+        any_ok = False
         kept = 0
         for device_id, result in results.items():
             host_cache.write_push_state(
                 AGENT_NAME, ok=result.ok, device_id=device_id
             )
+            if result.ok:
+                any_ok = True
             if result.kind == "auth":
                 log.info("dropping %s from codex paired list (401)", device_id)
                 host_cache.remove_paired_device(AGENT_NAME, device_id)
@@ -368,6 +385,50 @@ class CodexDaemon:
         if kept == 0:
             overall_ok = False
         host_cache.write_push_state(AGENT_NAME, ok=overall_ok)
+        # Advance the dedupe baseline as soon as *any* device accepted
+        # the push — that device now has the snapshot, so re-pushing the
+        # same content next minute would pummel a working peer because
+        # of a flaky one. Failing devices fall behind by at most one
+        # poll cycle until the next semantic change, and persistent
+        # failures get evicted by MAX_TRANSPORT_FAILURES (here) and by
+        # the health loop. `overall_ok` is reserved for status reporting.
+        if any_ok:
+            self._last_pushed_snapshot = snapshot
+
+    # ----------------------------------------------------------------- poll
+
+    async def _poll_loop(self) -> None:
+        """Actively poll `account/rateLimits/read` and dedupe before push.
+
+        Required because the long-lived `codex app-server` doesn't watch
+        `~/.codex/state_*.sqlite` (verified via lsof — zero file watchers),
+        so rate-limit changes that happen in other `codex` CLI processes
+        never reach it via `rateLimits/updated` notifications. The read
+        call itself does re-read from disk on each invocation (verified
+        empirically against a held app-server with mid-test CLI activity).
+
+        Silent during steady-state — only enqueues when the freshly-read
+        snapshot differs semantically from `_last_pushed_snapshot`. This
+        is what lets the firmware's idle state machine reach the dimmed
+        and off states.
+        """
+        while True:
+            await asyncio.sleep(POLL_INTERVAL_S)
+            if self._client_id is None:
+                continue
+            try:
+                result = await self._request("account/rateLimits/read", {})
+            except CodexProtocolError as exc:
+                log.debug("codex poll: read failed (%s); skipping iteration", exc)
+                continue
+            snapshot = _snapshot_from_rate_limits(result.get("rateLimits"))
+            if snapshot is None:
+                continue
+            if snapshot.semantically_equal(self._last_pushed_snapshot):
+                log.debug("codex poll: rate limits unchanged; skipping push")
+                continue
+            log.info("codex poll: rate limits changed; enqueueing push")
+            self._enqueue_snapshot(snapshot)
 
     # --------------------------------------------------------------- health
 

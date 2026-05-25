@@ -13,6 +13,7 @@ import pytest
 from burnscope_client import codex_daemon, host_cache
 from burnscope_client.codex_daemon import (
     CodexDaemon,
+    _anchor_resets_at,
     _firmware_diverged,
     _snapshot_from_rate_limits,
 )
@@ -74,6 +75,89 @@ def test_snapshot_from_rate_limits_returns_none_when_all_null():
 
 def test_snapshot_from_rate_limits_returns_none_for_non_dict():
     assert _snapshot_from_rate_limits(None) is None
+
+
+# =============================================================== anchoring
+
+
+def _codex_session(
+    used_pct: float, resets_at: int, *, type_: str = "primary"
+) -> SessionSnapshot:
+    return SessionSnapshot(
+        type=type_,
+        used_pct=used_pct,
+        resets_at=resets_at,
+        rolling=True,
+        window_duration_mins=300,
+    )
+
+
+def test_anchor_resets_at_returns_fresh_when_no_baseline():
+    fresh = AgentSnapshot(
+        agent="codex",
+        captured_at=10,
+        sessions=[_codex_session(0.01, 1779066600)],
+    )
+    anchored = _anchor_resets_at(fresh, None)
+    assert anchored is fresh
+
+
+def test_anchor_resets_at_preserves_resets_at_when_used_pct_unchanged():
+    """The core drift-defeat behavior: same used_pct → keep last's resets_at."""
+    last = AgentSnapshot(
+        agent="codex",
+        captured_at=1,
+        sessions=[_codex_session(0.01, 1779000000)],
+    )
+    fresh = AgentSnapshot(
+        agent="codex",
+        captured_at=2,
+        sessions=[_codex_session(0.01, 1779000060)],
+    )
+    anchored = _anchor_resets_at(fresh, last)
+    assert anchored.sessions[0].resets_at == 1779000000
+    # used_pct, rolling, duration must still come from `fresh`.
+    assert anchored.sessions[0].used_pct == 0.01
+    assert anchored.sessions[0].rolling is True
+    assert anchored.sessions[0].window_duration_mins == 300
+
+
+def test_anchor_resets_at_uses_fresh_when_used_pct_changed():
+    last = AgentSnapshot(
+        agent="codex",
+        captured_at=1,
+        sessions=[_codex_session(0.01, 1779000000)],
+    )
+    fresh = AgentSnapshot(
+        agent="codex",
+        captured_at=2,
+        sessions=[_codex_session(0.02, 1779000060)],
+    )
+    anchored = _anchor_resets_at(fresh, last)
+    # Real change → keep the fresh resets_at so the firmware re-anchors.
+    assert anchored.sessions[0].used_pct == 0.02
+    assert anchored.sessions[0].resets_at == 1779000060
+
+
+def test_anchor_resets_at_passes_through_unmatched_session_type():
+    """A session type that didn't exist in `last` flows through unchanged."""
+    last = AgentSnapshot(
+        agent="codex",
+        captured_at=1,
+        sessions=[_codex_session(0.01, 1779000000, type_="primary")],
+    )
+    fresh = AgentSnapshot(
+        agent="codex",
+        captured_at=2,
+        sessions=[
+            _codex_session(0.01, 1779000060, type_="primary"),
+            _codex_session(0.03, 1779999999, type_="secondary"),
+        ],
+    )
+    anchored = _anchor_resets_at(fresh, last)
+    by_type = {s.type: s for s in anchored.sessions}
+    assert by_type["primary"].resets_at == 1779000000  # anchored
+    assert by_type["secondary"].resets_at == 1779999999  # passed through
 
 
 def test_firmware_diverged_matches_exact_sessions():
@@ -793,6 +877,55 @@ async def test_poll_loop_skips_when_rate_limits_unchanged(monkeypatch):
             await task
 
 
+async def test_poll_loop_silent_on_resets_at_drift_only(monkeypatch):
+    """Anchoring must defeat codex's wall-clock-driven `resets_at` drift.
+
+    Same `used_pct` but a sliding `resets_at` (the exact pattern observed
+    against a live app-server at low usage) must not result in a push —
+    otherwise the firmware wakes out of burn-in idle every poll.
+    """
+    monkeypatch.setattr(codex_daemon, "POLL_INTERVAL_S", 0.005)
+
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+    daemon._last_pushed_snapshot = AgentSnapshot(
+        agent="codex",
+        captured_at=1,
+        sessions=[
+            SessionSnapshot(
+                type="primary",
+                used_pct=0.01,
+                resets_at=1779000000,
+                rolling=True,
+                window_duration_mins=300,
+            )
+        ],
+    )
+    # Same used_pct, resets_at slid forward by 60s — the exact symptom.
+    monkeypatch.setattr(
+        daemon,
+        "_request",
+        _fake_request_returning(
+            {
+                "primary": {
+                    "usedPercent": 1,
+                    "windowDurationMins": 300,
+                    "resetsAt": 1779000060,
+                }
+            }
+        ),
+    )
+
+    task = asyncio.create_task(daemon._poll_loop())
+    try:
+        await asyncio.sleep(0.05)
+        assert daemon._snapshot_queue.empty()
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
 async def test_poll_loop_skips_when_client_id_missing(monkeypatch):
     """Before bootstrap completes (`_client_id is None`), poll must no-op."""
     monkeypatch.setattr(codex_daemon, "POLL_INTERVAL_S", 0.005)
@@ -1077,13 +1210,17 @@ async def test_health_divergence_pushes_only_to_diverged_device(monkeypatch):
     host_cache.add_paired_device("codex", PairedDevice("dev-good", "10.0.0.5:80"))
     host_cache.add_paired_device("codex", PairedDevice("dev-diverged", "10.0.0.6:80"))
 
-    # Daemon's idea of what should be on the firmware.
+    # Daemon's idea of what the firmware *should* have — the health
+    # divergence baseline is `_last_pushed_snapshot` (post-anchoring,
+    # this is the value the firmware actually received), not the raw
+    # `_last_snapshot` which may carry an un-anchored resets_at from the
+    # app-server.
     snap = AgentSnapshot(
         agent="codex",
         captured_at=1,
         sessions=[SessionSnapshot("primary", 0.5, 1779066600)],
     )
-    daemon._last_snapshot = snap
+    daemon._last_pushed_snapshot = snap
 
     async def fake_fetch_health(host, client_id, client):
         if host == "10.0.0.5:80":

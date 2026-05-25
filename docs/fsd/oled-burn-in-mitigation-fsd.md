@@ -185,10 +185,10 @@ client:
 firmware/main/
 ├── burn_protection/
 │   ├── burn_idle.h            # pure SM API
-│   ├── burn_idle.c            # pure logic, <stdint.h> + <stdbool.h> only
+│   ├── burn_idle.c            # pure logic, <stdint.h>/<stdbool.h>/<stddef.h>/<assert.h> only
 │   ├── Kconfig                # tunables: thresholds, default brightness
 │   └── test/
-│       ├── burn_idle_test.c   # host unit tests (Unity-style)
+│       ├── burn_idle_test.c   # host unit tests (custom ~60-line harness)
 │       └── CMakeLists.txt     # host-only target
 └── displays/amoled_sh8601/
     ├── driver.c               # existing — SH8601 bring-up
@@ -806,7 +806,7 @@ Unchanged. The idle SM starts in `BURN_IDLE_ACTIVE` at boot.
 | SM-014     | Push wakes from OFF              | Drive to OFF, then `EV_PUSH`.                                             | Wakes to ACTIVE. |
 | SM-020     | Brightness lookup from config    | Configure `active=70, dimmed=20`; drive ACTIVE / DIMMED / OFF.            | Output brightness matches table; OFF → 0. |
 | SM-021     | Brightness changes when cfg differs | Same as SM-020 with `active=50`.                                       | `brightness_pct == 50` in ACTIVE. |
-| SM-030     | `changed` is true only on change | Two `EV_TIME` calls inside ACTIVE.                                        | First call may set `changed=true` (init), second false. |
+| SM-030     | `changed` is true only on change | Two `EV_TIME` calls inside ACTIVE, well below `dim_after_us`.             | Both calls report `changed == false`. The SM records its post-init output as the baseline in `burn_idle_init`, so a steady-state step does not spuriously report change. |
 | SM-031     | `changed` is true on transition  | `EV_TIME` crossing `dim_after`.                                           | `changed == true` exactly once. |
 | SM-040     | Threshold edge — just below      | `EV_TIME` at `dim_after - 1`.                                             | State unchanged. |
 | SM-041     | Threshold edge — exactly at      | `EV_TIME` at `dim_after`.                                                 | State transitions (spec uses `≥`). |
@@ -959,7 +959,7 @@ convention as `docs/fsd/firmware-fsd.md` § 8.4.)
 ### 10.2 Example Idle Sequence (SM trace)
 
 ```
-t=0       init                      → ACTIVE, br=70, panel=on, changed=1
+t=0       init                      (no output; baseline = ACTIVE, br=70, panel=on)
 t=60 s    EV_TIME                   → ACTIVE, br=70, panel=on, changed=0
 t=5 min   EV_TIME                   → DIMMED, br=20, panel=on, changed=1
 t=10 min  EV_TIME                   → DIMMED, br=20, panel=on, changed=0
@@ -967,6 +967,10 @@ t=30 min  EV_TIME                   → OFF,    br=0,  panel=off, changed=1
 t=30:05   EV_PUSH                   → ACTIVE, br=70, panel=on, changed=1
 t=30:06   EV_TIME                   → ACTIVE, br=70, panel=on, changed=0
 ```
+
+`burn_idle_init` returns `void` — it records `{ACTIVE, br=70, panel=on}`
+as the internal baseline so the very first `burn_idle_step` can
+compute `changed` honestly against the post-init state.
 
 ### 10.3 Source-of-Truth Crosswalk
 

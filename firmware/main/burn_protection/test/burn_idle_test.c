@@ -189,9 +189,14 @@ TEST(test_sm_030_changed_false_on_repeated_steady_step)
     burn_idle_output_t a = drive_to(&sm, SEC(1));
     burn_idle_output_t b = drive_to(&sm, SEC(2));
 
-    /* Both steps are inside ACTIVE; no field changed between them. */
+    /* Both steps are inside ACTIVE; no field differs from the init
+     * baseline (or from each other). The first step must already
+     * report changed=false — the post-init baseline is what makes
+     * this work. Without it the first step would spuriously claim
+     * a change. */
     TEST_ASSERT_EQ_INT(a.state, BURN_IDLE_ACTIVE);
     TEST_ASSERT_EQ_INT(b.state, BURN_IDLE_ACTIVE);
+    TEST_ASSERT_EQ_BOOL(a.changed, false);
     TEST_ASSERT_EQ_BOOL(b.changed, false);
 }
 

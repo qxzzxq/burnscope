@@ -164,13 +164,29 @@ def test_firmware_diverged_matches_exact_sessions():
     expected = AgentSnapshot(
         agent="codex",
         captured_at=1,
-        sessions=[SessionSnapshot("primary", 0.23, 1779066600)],
+        sessions=[
+            SessionSnapshot(
+                type="primary",
+                used_pct=0.23,
+                resets_at=1779066600,
+                rolling=True,
+                window_duration_mins=300,
+            )
+        ],
     )
+    # Firmware /health echoes back every wire field; the comparison must
+    # match all of them or the health loop re-pushes every cycle.
     body_match = {
         "agents": {
             "codex": {
                 "sessions": [
-                    {"type": "primary", "used_pct": 0.23, "resets_at": 1779066600}
+                    {
+                        "type": "primary",
+                        "used_pct": 0.23,
+                        "resets_at": 1779066600,
+                        "rolling": True,
+                        "window_duration_mins": 300,
+                    }
                 ]
             }
         }
@@ -192,18 +208,67 @@ def test_firmware_diverged_detects_value_mismatch():
     expected = AgentSnapshot(
         agent="codex",
         captured_at=1,
-        sessions=[SessionSnapshot("primary", 0.23, 1779066600)],
+        sessions=[
+            SessionSnapshot(
+                type="primary",
+                used_pct=0.23,
+                resets_at=1779066600,
+                rolling=True,
+                window_duration_mins=300,
+            )
+        ],
     )
     body = {
         "agents": {
             "codex": {
                 "sessions": [
-                    {"type": "primary", "used_pct": 0.99, "resets_at": 1779066600}
+                    {
+                        "type": "primary",
+                        "used_pct": 0.99,
+                        "resets_at": 1779066600,
+                        "rolling": True,
+                        "window_duration_mins": 300,
+                    }
                 ]
             }
         }
     }
     assert _firmware_diverged(body, expected) is True
+
+
+def test_firmware_diverged_detects_missing_wire_fields():
+    """An old firmware that doesn't echo `rolling`/`window_duration_mins`
+    must be flagged as diverged so the daemon re-pushes — keeping the
+    behaviour conservative until the firmware is flashed with the
+    matching wire-format extension.
+
+    Also locks in the regression that broke in production: when a new
+    firmware echoes the new fields but the daemon's diff key omitted
+    them, every health probe manufactured a spurious divergence.
+    """
+    expected = AgentSnapshot(
+        agent="codex",
+        captured_at=1,
+        sessions=[
+            SessionSnapshot(
+                type="primary",
+                used_pct=0.23,
+                resets_at=1779066600,
+                rolling=True,
+                window_duration_mins=300,
+            )
+        ],
+    )
+    body_old_firmware = {
+        "agents": {
+            "codex": {
+                "sessions": [
+                    {"type": "primary", "used_pct": 0.23, "resets_at": 1779066600}
+                ]
+            }
+        }
+    }
+    assert _firmware_diverged(body_old_firmware, expected) is True
 
 
 # ============================================================== fake server
@@ -1218,18 +1283,33 @@ async def test_health_divergence_pushes_only_to_diverged_device(monkeypatch):
     snap = AgentSnapshot(
         agent="codex",
         captured_at=1,
-        sessions=[SessionSnapshot("primary", 0.5, 1779066600)],
+        sessions=[
+            SessionSnapshot(
+                type="primary",
+                used_pct=0.5,
+                resets_at=1779066600,
+                rolling=True,
+                window_duration_mins=300,
+            )
+        ],
     )
     daemon._last_pushed_snapshot = snap
 
     async def fake_fetch_health(host, client_id, client):
         if host == "10.0.0.5:80":
-            # dev-good already has the snapshot
+            # dev-good already has the snapshot — must echo every wire
+            # field or `_firmware_diverged` flags it as out-of-sync.
             return {
                 "agents": {
                     "codex": {
                         "sessions": [
-                            {"type": "primary", "used_pct": 0.5, "resets_at": 1779066600}
+                            {
+                                "type": "primary",
+                                "used_pct": 0.5,
+                                "resets_at": 1779066600,
+                                "rolling": True,
+                                "window_duration_mins": 300,
+                            }
                         ]
                     }
                 }

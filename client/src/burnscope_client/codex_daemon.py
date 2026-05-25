@@ -701,6 +701,11 @@ def _firmware_diverged(health_body: dict, expected: AgentSnapshot) -> bool:
     Conservative comparison — any structural mismatch counts as divergence
     and triggers a re-push. Exact equality on the JSON-ified shape so we
     don't get fooled by float-vs-int or order differences in `sessions`.
+
+    Must include every field the firmware echoes back in /health
+    (`rolling`, `window_duration_mins` were added in the wire-format
+    extension); otherwise dict equality always fails on a key-count
+    mismatch and the health loop re-pushes every cycle.
     """
     by_agent = health_body.get("agents")
     if not isinstance(by_agent, dict):
@@ -710,7 +715,13 @@ def _firmware_diverged(health_body: dict, expected: AgentSnapshot) -> bool:
         return True
     stored_sessions = stored.get("sessions")
     expected_sessions = [
-        {"type": s.type, "used_pct": s.used_pct, "resets_at": s.resets_at}
+        {
+            "type": s.type,
+            "used_pct": s.used_pct,
+            "resets_at": s.resets_at,
+            "rolling": s.rolling,
+            "window_duration_mins": s.window_duration_mins,
+        }
         for s in expected.sessions
     ]
     return stored_sessions != expected_sessions

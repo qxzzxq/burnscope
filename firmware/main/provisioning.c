@@ -131,16 +131,28 @@ static esp_err_t scan_get(httpd_req_t *req)
     return httpd_resp_send(req, body, off);
 }
 
-/* Tiny x-www-form-urlencoded value extractor. Decodes %XX and `+`. */
+/* Tiny x-www-form-urlencoded value extractor. Decodes %XX and `+`.
+ *
+ * Returns false if the field is absent OR if the decoded value would
+ * exceed the destination buffer (out_len-1 bytes). Silent truncation
+ * here would store a partial SSID/password and the user would see
+ * "WiFi unavailable" with no hint that the value they typed didn't
+ * fit (deep-review M-4). */
 static bool extract_field(const char *body, const char *key, char *out, size_t out_len)
 {
+    if (out_len == 0) return false;
     size_t key_len = strlen(key);
     const char *p = body;
     while (*p) {
         if (strncmp(p, key, key_len) == 0 && p[key_len] == '=') {
             p += key_len + 1;
             size_t i = 0;
-            while (*p && *p != '&' && i + 1 < out_len) {
+            while (*p && *p != '&') {
+                if (i + 1 >= out_len) {
+                    /* Value too long — fail loud so the caller returns 400. */
+                    out[0] = '\0';
+                    return false;
+                }
                 if (*p == '+') {
                     out[i++] = ' ';
                     p++;
@@ -183,9 +195,18 @@ static esp_err_t provision_post(httpd_req_t *req)
     wifi_creds_t c = { 0 };
     if (!extract_field(buf, "ssid", c.ssid, sizeof(c.ssid)) ||
         c.ssid[0] == '\0') {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing ssid");
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                   "missing or too-long ssid");
     }
-    extract_field(buf, "password", c.password, sizeof(c.password));
+    /* Password may be absent (open AP), but if present it must fit. The
+     * tri-state of extract_field: true = decoded (possibly empty),
+     * false = absent or too long. Check the presence of the key
+     * separately so we can distinguish. */
+    if (strstr(buf, "password=") != NULL &&
+        !extract_field(buf, "password", c.password, sizeof(c.password))) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                   "password too long");
+    }
 
     esp_err_t err = nvs_store_save_creds(&c);
     if (err != ESP_OK) {

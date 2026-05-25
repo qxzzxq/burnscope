@@ -619,6 +619,13 @@ static void tick_lvgl_cb(lv_timer_t *t)
 
 void display_profile_init(void)
 {
+    /* Idempotency guard (deep-review M-1). The header documents this
+     * function as safe to call once at boot; without the guard a second
+     * call would create a second 1 Hz lv_timer and the agent-cycling
+     * state machine would advance twice as fast. */
+    static bool s_initialized = false;
+    if (s_initialized) return;
+
     lv_display_t *disp = amoled_sh8601_driver_init();
 
     if (!lvgl_port_lock(0)) {
@@ -629,6 +636,7 @@ void display_profile_init(void)
     build_agent_screen();
     lv_timer_create(tick_lvgl_cb, 1000, NULL);
     lvgl_port_unlock();
+    s_initialized = true;
 }
 
 void display_profile_show_status(const char *text)

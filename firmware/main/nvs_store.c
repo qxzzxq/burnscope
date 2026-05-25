@@ -3,10 +3,19 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 
 static const char *TAG = "nvs";
+
+/* Serializes the TOFU bind transaction so two concurrent first-pushes
+ * can't both observe NOT_FOUND and both write — see
+ * nvs_store_bind_or_check_client_id() below. Lazy-init in the helper
+ * itself: app_main calls into this module only after nvs_flash_init,
+ * so a one-shot semaphore creation under a static-init guard is fine. */
+static SemaphoreHandle_t s_bind_mutex = NULL;
 
 #define NS_WIFI         "burnscope_wifi"
 #define KEY_SSID        "ssid"
@@ -234,6 +243,62 @@ esp_err_t nvs_store_erase_client_ids(void)
         ESP_LOGI(TAG, "erased all pairing slots");
     }
     return err;
+}
+
+static SemaphoreHandle_t bind_mutex(void)
+{
+    /* Lazy one-shot init. Called only from
+     * `nvs_store_bind_or_check_client_id`, which itself is called from
+     * the httpd task that comes up after `init_nvs()` in `app_main`. No
+     * concurrent first-call possible. */
+    if (s_bind_mutex == NULL) {
+        s_bind_mutex = xSemaphoreCreateMutex();
+    }
+    return s_bind_mutex;
+}
+
+nvs_bind_result_t nvs_store_bind_or_check_client_id(const char *agent, const char *id)
+{
+    if (agent == NULL || agent[0] == '\0' || id == NULL || id[0] == '\0') {
+        return NVS_BIND_ERROR;
+    }
+    if (strnlen(id, BURNSCOPE_CLIENT_ID_MAX) >= BURNSCOPE_CLIENT_ID_MAX) {
+        return NVS_BIND_ERROR;
+    }
+
+    SemaphoreHandle_t m = bind_mutex();
+    if (m == NULL) {
+        return NVS_BIND_ERROR;
+    }
+    xSemaphoreTake(m, portMAX_DELAY);
+
+    /* Load existing binding. The local helpers return ESP_ERR_NVS_NOT_FOUND
+     * for both "key absent" and "stored value is empty"; either way we
+     * treat the slot as available. */
+    char stored[BURNSCOPE_CLIENT_ID_MAX];
+    esp_err_t lerr = nvs_store_load_client_id(agent, stored, sizeof(stored));
+
+    nvs_bind_result_t result;
+    if (lerr == ESP_ERR_NVS_NOT_FOUND) {
+        /* TOFU: slot empty → bind now. */
+        esp_err_t serr = nvs_store_save_client_id(agent, id);
+        result = (serr == ESP_OK) ? NVS_BIND_OK_NEW : NVS_BIND_ERROR;
+        if (serr != ESP_OK) {
+            ESP_LOGE(TAG, "TOFU bind failed for %s: %s",
+                     agent, esp_err_to_name(serr));
+        }
+    } else if (lerr != ESP_OK) {
+        ESP_LOGE(TAG, "load_client_id failed for %s: %s",
+                 agent, esp_err_to_name(lerr));
+        result = NVS_BIND_ERROR;
+    } else if (strcmp(stored, id) == 0) {
+        result = NVS_BIND_OK_EXISTING;
+    } else {
+        result = NVS_BIND_MISMATCH;
+    }
+
+    xSemaphoreGive(m);
+    return result;
 }
 
 /* --------------------------------------------------------------------- */

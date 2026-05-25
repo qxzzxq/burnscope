@@ -8,6 +8,7 @@
 
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "nvs_flash.h"
 
 #include "display_profile.h"
@@ -66,9 +67,15 @@ static void on_wifi_state(wifi_state_t state)
         display_profile_show_status("WiFi unavailable");
         break;
     case WIFI_STATE_GOT_IP:
+        /* http_server first so port 80 is accepting connections before
+         * we announce the service via mDNS — otherwise a client that's
+         * already browsing _burnscope._tcp can see the announcement and
+         * try to POST /summary in the millisecond gap, getting a
+         * spurious ECONNREFUSED that the daemon classifies as a
+         * transport failure (deep-review M-5). */
+        http_server_start();
         mdns_svc_start();
         ntp_start();
-        http_server_start();
         /* Restore whichever view makes sense for the moment:
          *   - Fresh boot, no data yet: "Waiting for daemon..."
          *   - Reconnect after a blip with snapshots still in RAM: jump
@@ -101,9 +108,37 @@ static void init_nvs(void)
     ESP_ERROR_CHECK(err);
 }
 
+/* Map esp_reset_reason_t to a short tag for the boot log. The IDF's
+ * own enum names are LOUD and the values shift between releases, so
+ * we map the ones we actually care to diagnose. */
+static const char *reset_reason_tag(esp_reset_reason_t r)
+{
+    switch (r) {
+    case ESP_RST_POWERON:   return "power-on";
+    case ESP_RST_EXT:       return "external";
+    case ESP_RST_SW:        return "esp_restart";
+    case ESP_RST_PANIC:     return "panic";
+    case ESP_RST_INT_WDT:   return "interrupt-watchdog";
+    case ESP_RST_TASK_WDT:  return "task-watchdog";
+    case ESP_RST_WDT:       return "other-watchdog";
+    case ESP_RST_DEEPSLEEP: return "deep-sleep";
+    case ESP_RST_BROWNOUT:  return "brownout";
+    case ESP_RST_SDIO:      return "sdio";
+    case ESP_RST_USB:       return "usb";
+    case ESP_RST_JTAG:      return "jtag";
+    case ESP_RST_UNKNOWN:
+    default:                return "unknown";
+    }
+}
+
 void app_main(void)
 {
-    ESP_LOGI(TAG, "BurnScope firmware_version=%s starting", BURNSCOPE_FW_VERSION);
+    /* Boot diagnostics first — a watchdog or brownout reboot is the
+     * single most informative thing we want in the log, and the
+     * default IDF banner doesn't print it (deep-review L-3). */
+    esp_reset_reason_t rr = esp_reset_reason();
+    ESP_LOGI(TAG, "BurnScope firmware_version=%s starting (reset_reason=%d %s)",
+             BURNSCOPE_FW_VERSION, (int)rr, reset_reason_tag(rr));
 
 #ifdef CONFIG_BURNSCOPE_AMOLED_DEMO
     /* Driver-verification build: bring up the panel, render a static

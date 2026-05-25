@@ -240,34 +240,52 @@ and `account/rateLimits/read` against the long-lived app-server
 *does* re-read from that cache on each call (verified by holding
 one app-server alive across 120 s of real CLI activity and
 observing `usedPercent` advance between two `read` calls into the
-same process). So the daemon **actively polls** and **dedupes**:
+same process). So the daemon **actively polls**, **anchors**, and
+**dedupes**:
 
 1. Every `POLL_INTERVAL_S` seconds (default: 60), call
    `account/rateLimits/read` against the daemon's own app-server.
 2. Build an `AgentSnapshot` from the result.
-3. Compare against `_last_pushed_snapshot` (the last snapshot we
-   successfully delivered to at least one device) via
-   `AgentSnapshot.semantically_equal(other)`.
-4. If equal → log at debug and skip. If different → enqueue for
+3. **Anchor** the fresh snapshot via
+   `_anchor_resets_at(fresh, _last_pushed_snapshot)`: for each
+   session whose `used_pct` matches the corresponding last-pushed
+   entry, rewrite its `resets_at` to the last-pushed value. Codex's
+   backend reports `resetsAt` as roughly `now + remaining`, so the
+   raw value drifts ~60 s per 60 s of wall clock at low usage —
+   without anchoring the dedupe key would change every poll and the
+   firmware would be woken out of burn-in idle every minute. The
+   firmware-side synthesis (`effective_resets_at` in `snapshot.h`)
+   compensates for the now-stale stored `resets_at` whenever the
+   session is `rolling` and `used_pct ≤ 0.01`.
+4. Compare the anchored snapshot against `_last_pushed_snapshot`
+   via `AgentSnapshot.semantically_equal(other)`.
+5. If equal → log at debug and skip. If different → enqueue for
    `_pusher_loop`.
-5. On the first iteration (`_last_pushed_snapshot is None`) always
+6. On the first iteration (`_last_pushed_snapshot is None`) always
    push, so the firmware has data immediately.
-6. Update `_last_pushed_snapshot` only after the push completes
+7. Update `_last_pushed_snapshot` only after the push completes
    with at least one device accepting it. A transport failure or
    auth drop leaves the previous value untouched, so the next
    poll re-attempts.
 
 **Semantic equality** — no tolerance needed:
 
-- Compare `agent` and per-session `(type, used_pct, resets_at)`
+- Compare `agent` and per-session
+  `(type, used_pct, resets_at, rolling, window_duration_mins)`
   tuples, sorted by `type` so session order is not significant.
 - Ignore `captured_at` (bumps every read, not user-visible state).
-- Byte-exact on numerics. The Codex wire format gives us
-  `usedPercent` as an integer in the 0–100 range, which the
-  daemon converts to a fraction; there is no sub-unit jitter to
-  absorb, so the earlier 0.5 pp tolerance idea is unnecessary.
-- A `resets_at` change counts as a real transition — the window
-  rolled over.
+- The anchoring step above papers over codex's wall-clock-driven
+  `resets_at` drift, so byte-exact comparison stays meaningful even
+  though the raw wire value is unstable.
+- `usedPercent` is a `f64` in the openai/codex source (the wire
+  spec previously said "integer"; corrected in
+  `docs/codex-app-server.html`). In practice the ChatGPT-plan
+  backend ships integer-valued percentages so byte-exact still
+  works, but consumers shouldn't lean on integer-exact equality.
+- A `resets_at` change with `used_pct` *also* changing counts as a
+  real transition (anchor doesn't fire). A `resets_at` change with
+  `used_pct` unchanged is presumed to be wall-clock drift and gets
+  anchored back to the last-pushed value.
 
 Coexistence with the existing notification path: the daemon's
 `_dispatch` handler for `rateLimits/updated` is kept as-is.

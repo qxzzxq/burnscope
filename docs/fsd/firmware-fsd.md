@@ -612,11 +612,13 @@ table must match it.
 
 **`SessionSnapshot`** (element of `sessions[]`):
 
-| Field       | Type            | Notes |
-|-------------|-----------------|-------|
-| `type`      | `string`        | Agent's own vocabulary; rendered verbatim. |
-| `used_pct`  | `float` 0.0–1.0 | Outside range → 400. |
-| `resets_at` | `int` (unix s)  | Firmware computes `resets_at − now()` locally. |
+| Field                  | Type            | Notes |
+|------------------------|-----------------|-------|
+| `type`                 | `string`        | Agent's own vocabulary; rendered verbatim. |
+| `used_pct`             | `float` 0.0–1.0 | Outside range → 400. |
+| `resets_at`            | `int` (unix s)  | Firmware computes `resets_at − now()` locally, modulated by the rolling-window synthesis described in `snapshot.h::effective_resets_at()`. |
+| `rolling`              | `bool`          | `true` when the upstream's `resets_at` slides with wall-clock during idle (Codex); `false` when anchored to a usage event (Claude). Optional on the wire — absent ≡ `false`. |
+| `window_duration_mins` | `int`           | Total window length in minutes (e.g. 300 / 10080). Used by the firmware to synthesise the displayed countdown when `rolling=true` and `used_pct ≤ 0.01`. Optional on the wire — absent ≡ 0 (disables synthesis). |
 
 ### 6.4 Commands / Opcodes
 
@@ -956,8 +958,20 @@ Source: `firmware/main/main.c`.
   "agent": "claude",
   "captured_at": 1779050146,
   "sessions": [
-    { "type": "current", "used_pct": 0.03, "resets_at": 1779066600 },
-    { "type": "weekly", "used_pct": 0.09, "resets_at": 1779156000 }
+    {
+      "type": "current",
+      "used_pct": 0.03,
+      "resets_at": 1779066600,
+      "rolling": false,
+      "window_duration_mins": 300
+    },
+    {
+      "type": "weekly",
+      "used_pct": 0.09,
+      "resets_at": 1779156000,
+      "rolling": false,
+      "window_duration_mins": 10080
+    }
   ]
 }
 ```

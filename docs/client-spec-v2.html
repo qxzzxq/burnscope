@@ -452,6 +452,28 @@ flowchart LR
     <td>Auto-pair-on-first-run race (two clients claiming the same free device simultaneously)</td>
     <td>NVS is serialized — first writer wins. The loser sees <code>401</code> on its first push and silently drops the device.</td>
   </tr>
+  <tr>
+    <td>Previously-paired device disappears for &gt; <code>MAX_TRANSPORT_FAILURES</code> consecutive probes, then returns</td>
+    <td>
+      <strong>Known limitation.</strong> The codex daemon evicts the
+      device from <code>paired-devices.&lt;agent&gt;.json</code> after
+      5 consecutive health/push failures (~2.5 minutes for the health
+      loop). When the device comes back online and re-advertises via
+      mDNS, the daemon will <em>not</em> auto-re-pair it as long as at
+      least one other device remains in the paired list — the auto-pair
+      discovery path in <code>_resolve_paired_devices</code> only fires
+      when the entire list is empty. Workaround: run
+      <code>burnscope pair</code> after a known long disconnect, or
+      <code>burnscope pair-reset</code> + restart the daemon. The
+      Claude statusline has the same gap (and additionally never
+      transport-evicts in the first place — see H-1/H-3 in the deep
+      review). A non-invasive fix would be to merge fresh
+      <code>discover_all()</code> results into the cached list on
+      every fire/poll instead of short-circuiting on a non-empty
+      cache, but this needs design work to avoid hammering mDNS at
+      every poll tick.
+    </td>
+  </tr>
 </table>
 
 <!-- =============================================================== -->

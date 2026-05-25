@@ -621,6 +621,24 @@ no-push rate when usage is unchanged.
   cost real tokens; direct OpenAI calls bypass `app-server` and
   break the no-tokens-consumed property; shared state across PCs
   needs cloud sync). Document the limitation and accept it for v1.
+- **G-5** Reconnected-device blind-spot in multi-screen setups. The
+  daemon evicts a device from `paired-devices.<agent>.json` after
+  `MAX_TRANSPORT_FAILURES` (= 5) consecutive failures, but it does
+  not re-discover the device when it later comes back online if any
+  other device remains in the paired list:
+  `_resolve_paired_devices` short-circuits on a non-empty cache and
+  never calls `discover_all()`. The user has to run `burnscope pair`
+  manually after a long-disconnect-then-reconnect of one display in
+  a multi-display setup.
+  Relevant to OLED Phase 2 because re-pushing on the firmware's
+  `EV_PUSH` event is the most user-visible way to wake the panel —
+  if the daemon never re-pushes to a returning device, the firmware
+  stays on whatever state it had at boot. A non-invasive fix would
+  be to merge fresh `discover_all()` results into the cached list
+  on every fire/poll instead of short-circuiting on a non-empty
+  cache, but a more elegant solution may need design work to avoid
+  hammering mDNS at every poll tick. Tracked separately from this
+  FSD. See deep review (post-#42) finding H-1.
 
 ---
 

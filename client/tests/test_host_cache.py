@@ -299,3 +299,80 @@ def test_paired_devices_round_trip_with_non_ascii_host(_state_dir):
     host_cache.save_paired_devices("claude", devices)
     loaded = host_cache.load_paired_devices("claude")
     assert loaded == devices
+
+
+# ====================================== M-5: unlink_push_state inside the lock
+
+def test_remove_paired_device_unlinks_push_state_under_lock(_state_dir):
+    """remove_paired_device must clean up the per-device push-state
+    file *inside* the same flock that protects the paired-devices
+    file. Otherwise a concurrent writer could leave an orphan visible
+    to `burnscope status` (deep-review M-5).
+
+    We don't directly observe locking here, but we do verify the
+    invariant downstream of it: after remove, the per-device file is
+    gone.
+    """
+    host_cache.add_paired_device("claude", PairedDevice("dev-x", "10.0.0.5:80"))
+    host_cache.write_push_state("claude", ok=False, device_id="dev-x")
+    assert host_cache.read_push_state("claude", device_id="dev-x") is not None
+
+    host_cache.remove_paired_device("claude", "dev-x")
+
+    assert host_cache.load_paired_devices("claude") == []
+    assert host_cache.read_push_state("claude", device_id="dev-x") is None
+
+
+# ==================================================== L-7: fsync atomic write
+
+def test_atomic_write_calls_fsync(monkeypatch, _state_dir):
+    """_atomic_write must fsync the temp file before os.replace so
+    the renamed file is durable across a host power loss, not just
+    a process crash (deep-review L-7).
+    """
+    fsync_calls: list[int] = []
+    real_fsync = host_cache.os.fsync
+
+    def tracking_fsync(fd):
+        fsync_calls.append(fd)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(host_cache.os, "fsync", tracking_fsync)
+    host_cache.write_client_id("claude", "fsynced@example.com")
+
+    assert fsync_calls, "fsync was never called inside _atomic_write"
+    assert host_cache.read_client_id("claude") == "fsynced@example.com"
+
+
+# ===================================== M-3 plumbing: bump/reset failure counter
+
+def test_bump_push_failures_increments_persisted_counter(_state_dir):
+    """The counter must survive write/read cycles so the short-lived
+    statusline child can reason about its eviction policy across
+    independent fires (deep-review M-3).
+    """
+    assert host_cache.bump_push_failures("claude", "dev-x") == 1
+    assert host_cache.bump_push_failures("claude", "dev-x") == 2
+    assert host_cache.bump_push_failures("claude", "dev-x") == 3
+
+    state = host_cache.read_push_state("claude", device_id="dev-x")
+    assert state["ok"] is False
+    assert state["consecutive_failures"] == 3
+
+
+def test_reset_push_failures_clears_counter_and_marks_ok(_state_dir):
+    host_cache.bump_push_failures("claude", "dev-x")
+    host_cache.bump_push_failures("claude", "dev-x")
+
+    host_cache.reset_push_failures("claude", "dev-x")
+
+    state = host_cache.read_push_state("claude", device_id="dev-x")
+    assert state["ok"] is True
+    assert state["consecutive_failures"] == 0
+
+
+def test_bump_push_failures_rejects_unsafe_device_id(_state_dir):
+    """Malicious mDNS responder can't escape the state dir."""
+    assert host_cache.bump_push_failures("claude", "../etc/passwd") == 0
+    # No state file created.
+    assert host_cache.read_push_state("claude", device_id="dev-x") is None

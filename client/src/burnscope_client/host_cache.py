@@ -147,6 +147,13 @@ def _atomic_write(path: Path, data: str) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(data)
+            # fsync before close so the renamed file is durable across
+            # a host power-loss / kernel panic, not just a process crash.
+            # `os.replace` itself is atomic on POSIX, but only with
+            # respect to the *rename*; the data still has to reach the
+            # disk.
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp_path, path)
     except Exception:
         try:
@@ -226,7 +233,10 @@ def remove_paired_device(agent: str, device_id: str) -> None:
 
     Serialized via flock so concurrent 401-drop paths cannot race.
     Also unlinks the per-device `last-push.<agent>.<device_id>` file
-    so orphan push-state files don't accumulate.
+    so orphan push-state files don't accumulate. The unlink stays
+    inside the lock so a concurrent statusline child can't write a
+    fresh per-device file between save-paired and unlink and leave
+    an orphan visible to `burnscope status`.
     """
     with _with_lock(agent):
         existing = load_paired_devices(agent)
@@ -234,7 +244,7 @@ def remove_paired_device(agent: str, device_id: str) -> None:
         if len(filtered) == len(existing):
             return
         save_paired_devices(agent, filtered)
-    unlink_push_state(agent, device_id)
+        unlink_push_state(agent, device_id)
 
 
 def clear_paired_devices(agent: str) -> None:
@@ -268,6 +278,56 @@ def write_push_state(agent: str, ok: bool, *, device_id: str | None = None) -> N
         log.warning("write_push_state: skipping unsafe device_id %r", device_id)
         return
     payload = json.dumps({"ok": bool(ok), "at": int(time.time())})
+    _atomic_write(_last_push_path(agent, device_id), payload)
+
+
+def bump_push_failures(agent: str, device_id: str) -> int:
+    """Atomically increment the per-device `consecutive_failures` counter.
+
+    Returns the new count. Also writes `ok=False, at=now()` so
+    `burnscope status` reflects the latest outcome.
+
+    Stateless callers (the claude statusline `--push` child) use this
+    to make eviction decisions across short-lived process lifetimes:
+    each fire bumps the counter, and after `MAX_TRANSPORT_FAILURES`
+    consecutive bumps the caller can evict the device. Serialized via
+    flock so two concurrent statusline children can't both miss each
+    other's increments.
+
+    Unsafe `device_id` values yield 0 silently (matches the rest of
+    this module's resilient policy on malicious mDNS responders).
+    """
+    if _safe_device_id(device_id) is None:
+        log.warning("bump_push_failures: skipping unsafe device_id %r", device_id)
+        return 0
+    with _with_lock(agent):
+        existing = read_push_state(agent, device_id=device_id) or {}
+        new_count = int(existing.get("consecutive_failures", 0) or 0) + 1
+        payload = json.dumps({
+            "ok": False,
+            "at": int(time.time()),
+            "consecutive_failures": new_count,
+        })
+        _atomic_write(_last_push_path(agent, device_id), payload)
+    return new_count
+
+
+def reset_push_failures(agent: str, device_id: str) -> None:
+    """Record a successful push and clear the failure counter.
+
+    Atomic — overwrites the per-device file with `ok=True, at=now(),
+    consecutive_failures=0`. Used by stateless callers in place of
+    `write_push_state(..., ok=True, ...)` to also clear the counter
+    that `bump_push_failures` advanced.
+    """
+    if _safe_device_id(device_id) is None:
+        log.warning("reset_push_failures: skipping unsafe device_id %r", device_id)
+        return
+    payload = json.dumps({
+        "ok": True,
+        "at": int(time.time()),
+        "consecutive_failures": 0,
+    })
     _atomic_write(_last_push_path(agent, device_id), payload)
 
 

@@ -118,6 +118,69 @@ static bool peek_key(cursor_t *c, char *out, size_t out_len)
     return true;
 }
 
+/* Consume a JSON value of any type without interpreting it. Used to skip
+ * over unknown keys so the firmware tolerates a newer daemon adding wire
+ * fields it doesn't yet render. Handles strings (with backslash escapes),
+ * numbers/booleans/null, and nested objects/arrays via brace/bracket
+ * depth counting. */
+static bool skip_string_body(cursor_t *c)
+{
+    /* Caller has already consumed the opening '"'. Consume bytes until
+     * the matching closing '"', honouring backslash escapes so a
+     * `"\""` doesn't terminate early. */
+    while (c->p < c->end && *c->p != '"') {
+        if (*c->p == '\\' && c->p + 1 < c->end) c->p += 2;
+        else c->p++;
+    }
+    if (c->p >= c->end) { c->err = true; return false; }
+    c->p++;
+    return true;
+}
+
+static bool skip_value(cursor_t *c)
+{
+    skip_ws(c);
+    if (c->p >= c->end) { c->err = true; return false; }
+    char ch = *c->p;
+    if (ch == '"') {
+        c->p++;
+        return skip_string_body(c);
+    }
+    if (ch == '{' || ch == '[') {
+        char open = ch;
+        char close = (ch == '{') ? '}' : ']';
+        int depth = 1;
+        c->p++;
+        while (c->p < c->end && depth > 0) {
+            char cc = *c->p++;
+            if (cc == '"') {
+                if (!skip_string_body(c)) return false;
+            } else if (cc == open) {
+                depth++;
+            } else if (cc == close) {
+                depth--;
+            }
+        }
+        if (depth != 0) { c->err = true; return false; }
+        return true;
+    }
+    if (ch == 't' || ch == 'f' || ch == 'n') {
+        const char *lit;
+        size_t lit_len;
+        if (ch == 't') { lit = "true";  lit_len = 4; }
+        else if (ch == 'f') { lit = "false"; lit_len = 5; }
+        else { lit = "null"; lit_len = 4; }
+        if ((size_t)(c->end - c->p) < lit_len || memcmp(c->p, lit, lit_len) != 0) {
+            c->err = true;
+            return false;
+        }
+        c->p += lit_len;
+        return true;
+    }
+    double v;
+    return read_number(c, &v);
+}
+
 /* --------------------------------------------------------------------- */
 /* POST /summary                                                          */
 /* --------------------------------------------------------------------- */
@@ -275,9 +338,10 @@ static bool parse_session(cursor_t *c, session_snapshot_t *out)
             out->resets_at = (int64_t)v;
             have_reset = true;
         } else {
-            /* Unknown key — bail; wire format is strict. */
-            c->err = true;
-            return false;
+            /* Unknown key — skip the value and continue. Forward-compat
+             * for daemon-side wire-format additions; required keys above
+             * are still enforced via have_* checks at the bottom. */
+            if (!skip_value(c)) return false;
         }
 
         skip_ws(c);
@@ -351,8 +415,10 @@ static bool parse_snapshot(cursor_t *c, agent_snapshot_t *out)
 sessions_done:
             have_sessions = true;
         } else {
-            c->err = true;
-            return false;
+            /* Unknown top-level key — skip the value and continue. The
+             * required keys above are still enforced by have_* checks at
+             * the bottom. */
+            if (!skip_value(c)) return false;
         }
 
         skip_ws(c);

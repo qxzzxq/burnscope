@@ -873,6 +873,57 @@ async def test_push_one_keeps_last_pushed_snapshot_unchanged_on_failure(monkeypa
     assert daemon._last_pushed_snapshot is None
 
 
+async def test_push_one_advances_last_pushed_snapshot_on_partial_success(monkeypatch):
+    """One device accepts, one fails → the snapshot was delivered, so the
+    dedupe baseline must advance. Otherwise the working device would get
+    re-pushed every minute until the flaky peer either recovers or gets
+    evicted — exactly what the dedupe is meant to prevent.
+    """
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+    host_cache.add_paired_device("codex", PairedDevice("dev-ok", "10.0.0.5:80"))
+    host_cache.add_paired_device("codex", PairedDevice("dev-flaky", "10.0.0.6:80"))
+
+    async def fake_push_to_all(snapshot, devices, client_id, client):
+        return {
+            "dev-ok":    PushResult("dev-ok",    True,  "ok"),
+            "dev-flaky": PushResult("dev-flaky", False, "transport"),
+        }
+
+    monkeypatch.setattr(codex_daemon, "push_to_all", fake_push_to_all)
+    # Block the refresh-and-retry helper from healing the transport failure,
+    # so partial-success persists into _push_one's accounting.
+    from burnscope_client import pusher
+
+    async def fake_discover_all(timeout=4.0, agent=None, zc=None):
+        return []
+    monkeypatch.setattr(pusher, "discover_all", fake_discover_all)
+
+    snap = AgentSnapshot(
+        agent="codex",
+        captured_at=42,
+        sessions=[SessionSnapshot("primary", 0.5, 1779066600)],
+    )
+    daemon._enqueue_snapshot(snap)
+    await _drain_one_push(
+        daemon,
+        predicate=lambda: daemon._last_pushed_snapshot is not None,
+    )
+
+    # Baseline advanced — dev-ok got the snapshot, so a follow-up poll
+    # with the same data must dedupe out instead of pummeling dev-ok.
+    assert daemon._last_pushed_snapshot is snap
+    # Aggregate `ok` still reports the truth that one device is unhealthy.
+    assert host_cache.read_push_state("codex")["ok"] is False
+    # Flaky peer is still paired (transport failure, not auth) and its
+    # failure counter has advanced toward MAX_TRANSPORT_FAILURES.
+    assert daemon._transport_failures.get("dev-flaky") == 1
+    assert {d.device_id for d in host_cache.load_paired_devices("codex")} == {
+        "dev-ok",
+        "dev-flaky",
+    }
+
+
 def test_enqueue_bounded_caps_queue_and_keeps_newest():
     """Under sustained push failure the snapshot queue must stay bounded.
 

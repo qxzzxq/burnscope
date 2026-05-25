@@ -350,11 +350,14 @@ class CodexDaemon:
             discovery_timeout=DISCOVERY_TIMEOUT_S,
         )
         overall_ok = True
+        any_ok = False
         kept = 0
         for device_id, result in results.items():
             host_cache.write_push_state(
                 AGENT_NAME, ok=result.ok, device_id=device_id
             )
+            if result.ok:
+                any_ok = True
             if result.kind == "auth":
                 log.info("dropping %s from codex paired list (401)", device_id)
                 host_cache.remove_paired_device(AGENT_NAME, device_id)
@@ -382,11 +385,14 @@ class CodexDaemon:
         if kept == 0:
             overall_ok = False
         host_cache.write_push_state(AGENT_NAME, ok=overall_ok)
-        # Advance the dedupe baseline only when at least one device
-        # accepted the push. A wholesale failure leaves the previous
-        # value intact so the next poll iteration re-attempts with the
-        # same content.
-        if overall_ok:
+        # Advance the dedupe baseline as soon as *any* device accepted
+        # the push — that device now has the snapshot, so re-pushing the
+        # same content next minute would pummel a working peer because
+        # of a flaky one. Failing devices fall behind by at most one
+        # poll cycle until the next semantic change, and persistent
+        # failures get evicted by MAX_TRANSPORT_FAILURES (here) and by
+        # the health loop. `overall_ok` is reserved for status reporting.
+        if any_ok:
             self._last_pushed_snapshot = snapshot
 
     # ----------------------------------------------------------------- poll

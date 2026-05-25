@@ -596,7 +596,11 @@ no-push rate when usage is unchanged.
   dependency).
 - ESP-IDF v6.0.1 GPIO ISR service, `esp_timer`, `httpd_*`.
 - Python 3.11+, `httpx` (already a daemon dependency).
-- Waveshare demo code in `docs/ESP32-S3-AMOLED-1.43-Demo`. Before trying to invent the wheel, we must check if there is any ref examples.
+- Waveshare demo code under `docs/ESP32-S3-AMOLED-1.43-Demo`. Check
+  for relevant reference examples there before writing custom
+  bring-up code — the QMI8658, SH8601, and touch controllers all
+  ship with vendor demos that document the working register
+  sequences.
 
 ### 5.4 Known Gaps
 
@@ -675,22 +679,34 @@ typedef struct {
 
 typedef struct {
     burn_idle_state_t state;
-    int64_t           last_activity_us;
-    burn_idle_config_t cfg;
-} burn_idle_t;
-
-typedef struct {
-    burn_idle_state_t state;
     uint8_t           brightness_pct;
     bool              panel_on;
     bool              changed;
 } burn_idle_output_t;
 
+typedef struct {
+    burn_idle_state_t  state;
+    int64_t            last_activity_us;
+    burn_idle_config_t cfg;
+    /* Internal — adapter must not read or modify. Stores the previous
+     * step's output so `output.changed` can be computed without the
+     * caller having to remember the last state. */
+    burn_idle_output_t _prev_output;
+} burn_idle_t;
+
+bool               burn_idle_config_valid(const burn_idle_config_t *cfg);
 void               burn_idle_init(burn_idle_t *sm, burn_idle_config_t cfg);
 burn_idle_output_t burn_idle_step(burn_idle_t *sm,
                                   burn_idle_event_t ev,
                                   int64_t now_us);
 ```
+
+`burn_idle_config_valid` checks invariants (positive thresholds,
+`off_after_us ≥ dim_after_us`, brightness ≤ 100, `dimmed ≤ active`,
+non-negative motion threshold) and returns false on any violation.
+`burn_idle_init` asserts on it internally, so adapters that build a
+config dynamically (e.g. from Kconfig at boot) can pre-flight via this
+predicate without risking an `assert()` crash on bad input.
 
 The SM is single-threaded; the adapter is responsible for serialising
 events (an event queue or a mutex held across `burn_idle_step`).

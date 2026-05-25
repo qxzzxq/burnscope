@@ -92,29 +92,34 @@ static uint8_t resolve_lcd_id(void)
  * matching table at runtime after reading RDID1 (see read_lcd_id.c).
  *
  * Both sequences include a brightness ramp (0x51=0x00 before DISPON,
- * 0x51=0xFF after) to suppress the framebuffer-junk flash during
- * LVGL's first frame.
+ * then 0x51=0xB2 after) to suppress the framebuffer-junk flash during
+ * LVGL's first frame. The end-of-ramp value is the OLED-burn-in FSD's
+ * DEFAULT_BRIGHTNESS of 70 % (0xB2 = 178/255 ≈ 70 %) rather than the
+ * vendor demo's 0xFF — burning the panel at 100 % until the Phase-2
+ * idle adapter takes over would defeat the burn-in story.
  *
  * TE registers (0x44 scanline target, 0x35 ON) and MADCTL (0x36) are
  * omitted because we don't wire the TE line to GPIO and we do
  * software rotation in LVGL instead of hardware rotation.
  */
+#define SH8601_DEFAULT_BRIGHTNESS  0xB2  /* ≈ 70 % per OLED-burn-in FSD § A3 */
+
 static const sh8601_lcd_init_cmd_t s_sh8601_init_cmds[] = {
     { 0x11, NULL, 0, 120 },                    /* SLPOUT, 120ms settle */
     { 0x53, (uint8_t[]){ 0x20 }, 1, 10 },      /* WCTRLD1 */
     { 0x51, (uint8_t[]){ 0x00 }, 1, 10 },      /* brightness 0 before DISPON */
     { 0x29, NULL, 0, 10 },                     /* DISPON */
-    { 0x51, (uint8_t[]){ 0xFF }, 1, 0 },       /* brightness ramp to max */
+    { 0x51, (uint8_t[]){ SH8601_DEFAULT_BRIGHTNESS }, 1, 0 }, /* ramp to 70 % */
 };
 
 static const sh8601_lcd_init_cmd_t s_co5300_init_cmds[] = {
     { 0x11, NULL, 0, 80 },                     /* SLPOUT, 80ms settle */
     { 0xC4, (uint8_t[]){ 0x80 }, 1, 0 },       /* SPIMODECTL: stay in QSPI */
     { 0x53, (uint8_t[]){ 0x20 }, 1, 1 },       /* WCTRLD1 */
-    { 0x63, (uint8_t[]){ 0xFF }, 1, 1 },       /* HBM brightness max */
+    { 0x63, (uint8_t[]){ 0xFF }, 1, 1 },       /* HBM ceiling max (only used when WCTRLD HBM=1) */
     { 0x51, (uint8_t[]){ 0x00 }, 1, 1 },       /* brightness 0 before DISPON */
     { 0x29, NULL, 0, 10 },                     /* DISPON */
-    { 0x51, (uint8_t[]){ 0xFF }, 1, 0 },       /* brightness ramp to max */
+    { 0x51, (uint8_t[]){ SH8601_DEFAULT_BRIGHTNESS }, 1, 0 }, /* ramp to 70 % */
 };
 
 static lv_display_t *s_display = NULL;

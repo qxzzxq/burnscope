@@ -49,17 +49,20 @@ The CLI entry point is `burnscope` (installer/status only, not a daemon
 entry). Install it with [uv](https://docs.astral.sh/uv/) — `client/uv.lock`
 pins the deps.
 
-```bash
-uv tool install ./client          # installs `burnscope` on PATH
-burnscope install claude          # writes Claude Code statusline hook
-burnscope install codex           # launchd (macOS) or systemd --user (Linux)
-burnscope status                  # confirm wiring + last push outcomes
-burnscope pair-reset              # forget cached host + per-agent client_ids
+```sh
+uv tool install ./client                              # installs `burnscope` on PATH
+burnscope install claude                              # writes Claude Code statusline hook
+burnscope install codex                               # launchd (macOS) or systemd --user (Linux)
+burnscope status                                      # confirm wiring + last push outcomes
+burnscope pair                                        # rediscover unpaired devices on the LAN
+burnscope pair-reset                                  # forget cached host + per-agent client_ids
+burnscope ota firmware/build-s3/burnscope.bin \
+    --device burnscope-XXXX                           # push a firmware image over the LAN
 ```
 
 For an editable install (source changes picked up automatically):
 
-```bash
+```sh
 uv tool install --editable ./client
 ```
 
@@ -72,21 +75,29 @@ Debugging tips and log-level controls live in [`client/README.md`](./client/READ
 ## Building & flashing the firmware
 
 Two display boards are supported; the target chip picks the default
-display profile automatically:
+display profile automatically.
 
-```bash
-. ~/.espressif/v6.0.1/esp-idf/export.sh
-cd firmware
-idf.py set-target esp32          # Cheap Yellow Display (CYD, ST7789 320×240)
+```sh
+. ~/.espressif/v6.0.1/esp-idf/export.sh   # once per shell
+cd firmware                                # all commands below run from here
+
+idf.py set-target esp32                    # CYD (cyd2usb, ST7789 320×240)
 # or
-idf.py set-target esp32s3        # Waveshare 1.43" round AMOLED (SH8601/CO5300, 466×466)
+idf.py set-target esp32s3                  # Waveshare 1.43" AMOLED (SH8601/CO5300, 466×466)
 
-idf.py -p <PORT> flash monitor
+idf.py -p <PORT> flash monitor             # builds, writes, then tails serial
 ```
 
 First boot brings up a captive portal (`BURNSCOPE-XXXX` open AP) for WiFi.
 Full details, re-provisioning, and on-device smoke tests in
 [`firmware/README.md`](./firmware/README.md).
+
+After the initial USB flash, subsequent updates can ship over the LAN
+via `burnscope ota <bin> --device <device_id>` (see `POST /ota` in
+[`docs/wire-format.md`](./docs/wire-format.md)). The AMOLED uses a
+16 MB layout with two 5 MB OTA slots and a ~5.8 MB LittleFS volume at
+`/storage` (room for the future pixel-aging map); the CYD stays on
+its 4 MB layout and accepts USB-only updates.
 
 ## Repository layout
 
@@ -109,9 +120,10 @@ burnscope/
 │       ├── identity.py           ← plaintext client_id resolver
 │       ├── host_cache.py         ← atomic ~/.burnscope/ state
 │       ├── pusher.py             ← POST /summary, GET /health
+│       ├── ota_pusher.py         ← POST /ota (firmware update over LAN)
 │       ├── claude_statusline.py  ← Claude Code statusline hook (per-fire)
 │       ├── codex_daemon.py       ← long-lived Codex daemon
-│       └── cli.py                ← install/uninstall/status/pair-reset
+│       └── cli.py                ← install/uninstall/status/pair{-reset}/ota
 └── firmware/                     ← ESP32 firmware (ESP-IDF; CYD ST7789 + Waveshare 1.43" AMOLED)
 ```
 

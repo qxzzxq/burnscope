@@ -14,7 +14,7 @@ Claude Code (and most subscription-based agents) work in fixed usage windows —
 
 **MVP (this document):** one machine, two agents (Claude Code and Codex CLI), one board (CYD), one API endpoint. Goal is end-to-end: a real token count from a real session appears on the display and counts down to window reset. Each agent has its own lifecycle — Claude is a per-fire statusline hook, Codex is a long-lived daemon — and either can be installed independently via `burnscope-client install <agent>`.
 
-**Deferred to Phase 2:** multi-machine aggregation, additional agents (Gemini, Copilot, …), additional boards & layout families, web dashboard, auth, OTA, cost/$ estimation, persistent storage of snapshots, and an intermediate aggregation server (see note below).
+**Deferred to Phase 2:** multi-machine aggregation, additional agents (Gemini, Copilot, …), web dashboard, auth, cost/$ estimation, persistent storage of snapshots, and an intermediate aggregation server (see note below). Multi-board layout (CYD + Waveshare 1.43" AMOLED) and LAN-side OTA are now in scope and shipping — see the partition / `POST /ota` notes in [wire-format.md](./wire-format.md).
 
 > **Note on the cut server.** An earlier draft of this document put a Go aggregation server between the daemon and the ESP32. It was cut for the single-user MVP: for one laptop and one display it added two installs and a second always-on process without buying anything. It returns in Phase 2 only if it earns its keep — multi-machine aggregation, non-session agent schemas (credits, overage) that need shared state, or auth. The firmware contract (`POST /summary`) is designed to stay stable in that case: a future server simply takes the daemon's place as the thing speaking it.
 
@@ -33,21 +33,22 @@ Claude Code (and most subscription-based agents) work in fixed usage windows —
 ```
 
 - **Per-agent collectors** — each agent reads from its own zero-cost native source and builds an `AgentSnapshot` matching [wire-format.md](./wire-format.md). Claude is a Claude Code statusline hook that fires after each assistant message and forks a detached `--push` child; Codex is a long-lived daemon owning a `codex app-server` JSON-RPC subprocess that emits snapshots on `account/rateLimits/updated` notifications. There is no unified daemon and no header-scrape probing. Each collector reads a plaintext identifier (`oauthAccount.emailAddress` for Claude, `account.email` for Codex) and ships it in `X-BurnScope-Client-Id`.
-- **ESP32 firmware** — advertises itself over mDNS as `_burnscope._tcp.local` on boot, runs a small HTTP server accepting `POST /summary` and `GET /health`, enforces per-agent TOFU pairing on the client-id header, rejects out-of-order pushes with a monotonic `captured_at` guard, and renders the last snapshot per agent. Holds no rolling-window state of its own — the collectors do the math.
+- **ESP32 firmware** — advertises itself over mDNS as `_burnscope._tcp.local` on boot, runs a small HTTP server accepting `POST /summary`, `GET /health`, and (AMOLED only) `POST /ota`, enforces per-agent TOFU pairing on the client-id header, rejects out-of-order pushes with a monotonic `captured_at` guard, and renders the last snapshot per agent. Holds no rolling-window state of its own — the collectors do the math.
 - **Discovery** — collectors use `zeroconf` to find the advertised service and cache the resolved `host:port` under `~/.burnscope/host`. On a transport failure the cached host is invalidated so the next attempt rediscovers via mDNS.
 
 ---
 
 ## HTTP API
 
-Two endpoints, on the ESP32:
+Three endpoints, on the ESP32:
 
 | Endpoint              | Direction          | Body / Headers                                                                   | Response                                                            |
 | --------------------- | ------------------ | -------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
 | `POST /summary`       | collector → ESP32  | a single `AgentSnapshot` + `X-BurnScope-Client-Id`                               | `204 No Content`, `401` (missing/mismatched id), `409` (stale `captured_at`) |
 | `GET /health`         | collector → ESP32  | `X-BurnScope-Client-Id` (must match any bound slot once one exists)              | firmware version, uptime, free heap, per-agent `client_id` + `seconds_since_last_push` + `sessions` |
+| `POST /ota`           | operator → ESP32   | raw `burnscope.bin` + `X-BurnScope-Client-Id` (must match a *populated* slot — `/ota` never TOFU-binds) | `202 Accepted` + reboot ~1 s out; `400` (image rejected by bootloader), `401`, `409` (concurrent OTA), `413` |
 
-A network-triggered factory reset isn't exposed in MVP — the route was pulled because it would let anything on the LAN wipe the device. Reset is via the BOOT-button long-press (≥ 5 s); a network endpoint will return once an auth scheme lands. Schemas are hand-written in each language (Python, C). See [wire-format.md](./wire-format.md) for the full contract, including TOFU pairing semantics and the monotonic `captured_at` guard. Schema-as-codegen is deferred until there's a third consumer.
+A network-triggered factory reset isn't exposed in MVP — the route was pulled because it would let anything on the LAN wipe the device. Reset is via the BOOT-button long-press (≥ 5 s); a network endpoint will return once an auth scheme lands. Schemas are hand-written in each language (Python, C). See [wire-format.md](./wire-format.md) for the full contract, including TOFU pairing semantics, the monotonic `captured_at` guard, and the OTA rollback flow. Schema-as-codegen is deferred until there's a third consumer.
 
 ---
 
@@ -55,8 +56,8 @@ A network-triggered factory reset isn't exposed in MVP — the route was pulled 
 
 | Component       | Choice                                                              |
 | --------------- | ------------------------------------------------------------------- |
-| Firmware        | ESP-IDF v6.x, C, `esp_lcd_ili9341` + LVGL, `mdns`, `esp_http_server` |
-| Board           | Cheap Yellow Display (ESP32-2432S028R), 320×240                     |
+| Firmware        | ESP-IDF v6.x, C, LVGL 9, `mdns`, `esp_http_server`, `app_update`, `joltwallet/littlefs` |
+| Boards          | Cheap Yellow Display (ESP32, ST7789 320×240, 4 MB flash) and Waveshare ESP32-S3-Touch-AMOLED-1.43 (ESP32-S3, SH8601/CO5300 466×466 round AMOLED, 16 MB flash + 8 MB Octal PSRAM) |
 | Daemon          | Python 3.11+ (`httpx`, `zeroconf`)                                  |
 
 WiFi credentials are captured on first boot via a captive portal and persisted to NVS. mDNS handles the rest — no addresses need to be kept in sync between the two sides.
@@ -86,12 +87,16 @@ burnscope/
 │       ├── identity.py            # plaintext client_id resolver
 │       ├── host_cache.py          # ~/.burnscope/ state
 │       ├── pusher.py              # POST /summary, GET /health
+│       ├── ota_pusher.py          # POST /ota (firmware update over LAN)
 │       ├── claude_statusline.py   # Claude Code statusline hook (per-fire)
 │       ├── codex_daemon.py        # long-lived Codex daemon
-│       └── cli.py                 # install/uninstall/status/pair-reset
-└── firmware/                      # ESP32 (ESP-IDF), CYD only
+│       └── cli.py                 # install/uninstall/status/pair{-reset}/ota
+└── firmware/                      # ESP32 (ESP-IDF), CYD ST7789 + Waveshare 1.43" AMOLED
     ├── CMakeLists.txt
-    ├── sdkconfig.defaults
+    ├── sdkconfig.defaults         # CYD defaults (4 MB layout)
+    ├── sdkconfig.defaults.esp32s3 # AMOLED overrides (16 MB layout, PSRAM, OTA rollback)
+    ├── partitions-4mb.csv         # CYD: nvs + 2× ota_X
+    ├── partitions-16mb.csv        # AMOLED: nvs + 2× ota_X (5 MB) + storage (LittleFS)
     └── main/
 ```
 
@@ -154,8 +159,11 @@ modules. Register a `burnscope-client install <agent>` path that wires the
 supervisor (`settings.json` for statusline-style, launchd/systemd for
 daemon-style). No `Agent` or `Credential` base classes to extend.
 
-The CLI (`cli.py`) is an installer/status tool, not a daemon entry. It
-exposes `install/uninstall {claude,codex}`, `status`, and `pair-reset`.
+The CLI (`cli.py`) is an installer/status/operator tool, not a daemon
+entry. It exposes `install/uninstall {claude,codex}`, `status`, `pair`,
+`pair-reset`, and `ota` (push a firmware `.bin` to a paired device's
+`POST /ota` endpoint, authorising with whichever agent has the device
+paired).
 
 ## ESP32 Firmware
 
@@ -163,12 +171,15 @@ The "display half" of BurnScope. Holds no rolling-window state of its own — th
 
 **Boot and provisioning.** On first power-up the firmware finds an empty NVS, brings up a WiFi Access Point named `BURNSCOPE-<last 4 hex of MAC>`, and serves a captive portal that scans for networks and accepts SSID + password. Credentials are persisted to NVS and the device reboots into normal STA mode. Every subsequent boot reads NVS, connects WiFi, advertises `_burnscope._tcp.local` on port 80 over mDNS, and syncs its wall clock over NTP so the countdowns are accurate. If the upstream WiFi password changes, the firmware falls back to AP mode after a handful of failed reconnect attempts so the user can re-provision without re-flashing.
 
-**HTTP surface.** Two routes, LAN-only with TOFU pairing:
+**HTTP surface.** Three routes, LAN-only with TOFU pairing:
 
 - `POST /summary` — the hot path. Validates `X-BurnScope-Client-Id` (TOFU bind on first push for that agent; `401` on mismatch). Rejects out-of-order pushes against a monotonic `captured_at` guard with `409`. Otherwise overwrites the in-RAM slot for that agent and returns `204`.
 - `GET /health` — firmware version, uptime, free heap, and per known agent: bound `client_id`, `seconds_since_last_push`, and the latest `sessions` array (lets the collector detect drift after an ESP32 reboot). Requires the header to match any populated slot once any slot is bound.
+- `POST /ota` — operator-triggered firmware update. Streams a raw `burnscope.bin` into the inactive OTA slot via `esp_ota_*`, seals the image, and reboots ~1 s after responding 202. Auth is stricter than `/summary`: never TOFU-binds, so a freshly-booted unpaired device returns 401 (otherwise anyone on the LAN could flash arbitrary firmware). Bootloader-driven rollback is wired in — `summary_post_handler` calls `esp_ota_mark_app_valid_cancel_rollback` only after the first authorized snapshot lands end-to-end; an image that boots but never reaches that point reverts on the next reboot. Available on builds whose partition layout reserves OTA slots (AMOLED today; CYD's 4 MB layout is USB-only).
 
 Network-triggered factory reset is intentionally absent for MVP — the route had no auth and was pulled until an auth scheme exists. The BOOT-button long-press in `factory_reset.c` wipes WiFi creds *and* per-agent pairing slots and reboots into the captive portal.
+
+**Storage.** The AMOLED's 16 MB layout reserves a ~5.8 MB `storage` partition mounted as LittleFS at `/storage` (no consumer ships in MVP — reserved for the future pixel-aging map and persisted assets too big for NVS). The CYD's 4 MB layout has no such partition; the mount call no-ops there.
 
 **UI.** Black background, Montserrat-based proportional text in warm off-white. The header has three slots: the agent's brand mark top-left, the literal text `Usage` top-centre, and a battery slot top-right hidden on hardware variants without a battery (every variant in MVP). The body is split into two equal-height rows with rounded dark-grey backgrounds; each row carries the session's `type` rendered as a tag chip, an integer percentage, a progress bar tinted per agent, and a "resets in HH:MM:SS" countdown ticking once a second against the NTP-synced clock. When the wall clock crosses `resets_at` and no fresh push has landed yet, the bar drops to 0 automatically (the old window is logically gone). A footer band shows the bound owner identifier (truncated with an ellipsis) bottom-left and the snapshot's `updated YYYY-MM-DD HH:MM` UTC stamp bottom-right, both in a dim neutral gray so they recede below the percentage rows. When two agents are paired the device cycles between them every ~5 s. WiFi disconnect paints "Reconnecting…" on the splash and restores the agent view from the last stored snapshot as soon as IP comes back.
 

@@ -1,9 +1,11 @@
 # BurnScope ESP32 Firmware — Functional Specification Document (FSD)
 
-> **Scope:** Firmware for the Cheap Yellow Display (CYD) that displays a
-> BurnScope `AgentSnapshot` pushed over HTTP by the Python daemon. MVP only.
-> Multi-machine aggregation, OTA, auth, and additional boards are Phase 2 —
-> not in this document.
+> **Scope:** Firmware for the supported ESP32 boards (CYD on `esp32`,
+> Waveshare 1.43" AMOLED on `esp32s3`) that displays a BurnScope
+> `AgentSnapshot` pushed over HTTP by the Python daemon. Multi-machine
+> aggregation and authentication remain Phase 2; LAN-side OTA and the
+> AMOLED's 16 MB partition layout (with a LittleFS `storage` volume) are
+> in scope and documented here.
 
 > **Inputs to this FSD:** `docs/description.md` (§ ESP32 Firmware) and
 > `docs/wire-format.md` (the daemon ↔ firmware contract). The wire format
@@ -57,8 +59,9 @@ glance.
 
 **Non-goals (deferred to Phase 2 or out of scope):**
 
-- OTA firmware updates.
-- Authentication on `POST /summary` (LAN-trust only).
+- Authentication on `POST /summary` (LAN-trust only; `X-BurnScope-Client-Id`
+  TOFU pairing is *not* authentication — it deters multi-claimant collisions,
+  not adversaries).
 - Persisting snapshots across reboots (RAM-only). The daemon's pushes
   are edge-triggered (see `docs/wire-format.md`), so after a firmware
   reboot the device will sit on the "waiting for daemon..." splash
@@ -112,7 +115,9 @@ Subsystems, runtime-only:
 | **Captive portal**   | AP (`BURNSCOPE-XXXX`), DNS hijack, HTTP form for SSID/password, write to NVS, reboot. |
 | **mDNS responder**   | Advertises `_burnscope._tcp.local` on port 80 with a TXT record carrying firmware version. |
 | **NTP client**       | Syncs wall clock at boot and every 6 h. Used for "X s ago" and "resets in Y" math. |
-| **HTTP server**      | Two routes: `POST /summary`, `GET /health`. No middleware, no auth. |
+| **HTTP server**      | Three routes: `POST /summary`, `GET /health`, `POST /ota` (last is no-op'd on boards without an inactive OTA slot). TOFU pairing via `X-BurnScope-Client-Id` on `/summary`; `/health` and `/ota` require the header to match an *already-bound* slot. No general-purpose auth middleware. |
+| **OTA receiver**     | Streams `POST /ota` body via `esp_ota_*` into the inactive slot, seals, sets boot partition, schedules a 1 s reboot. Bootloader-driven rollback (`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`) arms PENDING_VERIFY at boot; firmware marks the image valid only after the first authorized `/summary` lands end-to-end. |
+| **Storage (AMOLED)** | Mounts the LittleFS volume declared in `partitions-16mb.csv` at `/storage`. No producer ships in MVP — reserved for the future pixel-aging map. The CYD profile has no storage partition; the mount call no-ops. |
 | **Snapshot store**   | RAM-only `map<agent, AgentSnapshot>` (max two agents in MVP — `claude`, `codex`). |
 | **Renderer**         | A 1 Hz LVGL timer re-reads the snapshot store, refreshes the visible agent's bars + countdowns, and cycles between agents (FR-4.10). A `POST /summary` only forces a screen change on the *first* push (splash → agent view). Uses the **Display** abstraction. |
 | **Display abstraction** | `display_t` virtual interface; concrete `cyd2usb_st7789_display` for the MVP panel. |
@@ -129,10 +134,16 @@ that agent.
 
 ### 2.2 Hardware / Platform Architecture
 
+Two boards ship in the same image tree, selected by Kconfig at build
+time (`idf.py set-target esp32` for CYD, `set-target esp32s3` for AMOLED).
+Per-target `sdkconfig.defaults.<target>` files pick the default display
+profile and partition layout.
+
+**CYD (`cyd2usb_st7789`, target = esp32):**
+
 - **Board:** Cheap Yellow Display, `cyd2usb` variant (one USB-C and one
   micro-USB port — either can power the board and expose the serial
-  console). ESP32-WROOM-32, 4 MB flash, 520 KiB SRAM. Reference pinout
-  per the ESP32-Cheap-Yellow-Display project.
+  console). ESP32-WROOM-32, 4 MB flash, 520 KiB SRAM, no PSRAM.
 - **Panel:** ST7789, 320×240 landscape (native 240×320 portrait, rotated
   in LVGL). BGR pixel order, inversion off, 16-bit RGB565. SPI bus at
   20 MHz (40 MHz produces bit errors on the non-IOMUX pins — confirmed
@@ -140,22 +151,81 @@ that agent.
 - **Backlight:** GPIO21, active-high.
 - **Touch:** the panel has a resistive touch controller but **MVP does
   not use touch** — provisioning happens from another device via the AP.
-- **Power:** 5 V via either the USB-C or the micro-USB port. No battery
-  in this hardware revision.
-- **Connectivity:** 2.4 GHz WiFi only (ESP32 single-band).
+
+**AMOLED (`amoled_sh8601`, target = esp32s3):**
+
+- **Board:** Waveshare ESP32-S3-Touch-AMOLED-1.43. ESP32-S3 (QFN56,
+  240 MHz dual-core + LP core), 16 MB Winbond flash, 8 MB Octal PSRAM,
+  native USB.
+- **Panel:** 466×466 round AMOLED driven over QSPI. Waveshare
+  dual-sources the silicon between SH8601 and CO5300 — both speak the
+  same protocol — using Espressif's `esp_lcd_sh8601` managed component.
+  Brightness ramps to ~70 % at boot per the OLED burn-in FSD.
+- **Touch:** CST816 capacitive controller present but unused in MVP.
+
+**Common to both:**
+
+- **Power:** 5 V via the USB port(s). No battery in either hardware
+  revision; the header battery icon is hidden.
+- **Connectivity:** 2.4 GHz WiFi only.
 
 ### 2.3 Software Architecture
 
 - **SDK:** ESP-IDF v6.x (locked at 6.0.1 via `dependencies.lock`).
 - **UI library:** LVGL 9.5 via `espressif/esp_lvgl_port` 2.8.
-- **Display driver:** ESP-IDF built-in `esp_lcd` with ST7789 panel ops.
+- **Display drivers:** ESP-IDF built-in `esp_lcd` with ST7789 panel ops
+  (CYD); `espressif/esp_lcd_sh8601` managed component for the AMOLED.
 - **Networking:** IDF's `esp_wifi`, `esp_netif`, `esp_http_server`,
   `mdns`, `esp_sntp`.
-- **Persistence:** `nvs_flash` partition (6 KiB at 0x9000 per
-  `partitions-4mb.csv`). Stores WiFi credentials only.
-- **Partition layout:** dual OTA app partitions are already reserved
-  in `partitions-4mb.csv` so a future Phase 2 OTA flow can land without
-  re-partitioning — but no OTA logic ships in MVP.
+- **OTA + filesystem:** IDF's `app_update` (`esp_ota_*` for `POST /ota`)
+  and the `joltwallet/littlefs` managed component (mounts the AMOLED
+  `storage` partition at `/storage`).
+- **Persistence:** `nvs_flash` partition (24 KiB at 0x9000, identical
+  on both layouts). Stores WiFi credentials and the per-agent
+  `X-BurnScope-Client-Id` slot. NVS offsets stay constant between
+  `partitions-4mb.csv` and `partitions-16mb.csv` so the layout
+  migration on an AMOLED preserves the TOFU pairing without an
+  `erase-flash`.
+
+### 2.4 Partition Layouts
+
+Two CSVs ship in `firmware/`; the target picks which one via
+`CONFIG_PARTITION_TABLE_*`.
+
+**`partitions-4mb.csv` — CYD (`esp32`):**
+
+| Name     | Type | SubType | Offset    | Size      |
+|----------|------|---------|-----------|-----------|
+| nvs      | data | nvs     | `0x9000`  | `0x6000`  |
+| otadata  | data | ota     | `0xf000`  | `0x2000`  |
+| phy_init | data | phy     | `0x11000` | `0x1000`  |
+| ota_0    | app  | ota_0   | `0x20000` | `0x1E0000`|
+| ota_1    | app  | ota_1   | `0x200000`| `0x1E0000`|
+
+Dual OTA slots are reserved but USB-only updates today — there's no
+data partition to mount as a filesystem, so `/storage`-backed
+features are unavailable on the CYD.
+
+**`partitions-16mb.csv` — AMOLED (`esp32s3`):**
+
+| Name     | Type | SubType  | Offset    | Size      |
+|----------|------|----------|-----------|-----------|
+| nvs      | data | nvs      | `0x9000`  | `0x6000`  |
+| otadata  | data | ota      | `0xf000`  | `0x2000`  |
+| phy_init | data | phy      | `0x11000` | `0x1000`  |
+| ota_0    | app  | ota_0    | `0x20000` | `0x500000`|
+| ota_1    | app  | ota_1    | `0x520000`| `0x500000`|
+| storage  | data | littlefs | `0xa20000`| `0x5E0000`|
+
+5 MB per OTA slot (3.3× the current image, room to grow without
+revisiting flash sizing) plus a ~5.8 MB LittleFS volume mounted at
+`/storage`. The bootloader on this target is built with
+`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y` so a freshly-OTA'd image
+boots in `ESP_OTA_IMG_PENDING_VERIFY`; the app calls
+`esp_ota_mark_app_valid_cancel_rollback()` only after the first
+authorized `/summary` lands end-to-end. An image that boots but
+never reaches that point is rolled back to the previous slot on the
+next reboot — a bad OTA can't brick the device.
 
 **Boot sequence (warm boot, NVS has creds):**
 
@@ -179,7 +249,7 @@ that agent.
 | Task | Stack | Priority | Notes |
 |------|-------|----------|-------|
 | `app_main` (LVGL) | 8 KiB | 1 | Drives LVGL tick; idle most of the time. |
-| HTTP server      | IDF default | 5 | Handles `POST /summary` and `GET /health`. |
+| HTTP server      | IDF default | 5 | Handles `POST /summary`, `GET /health`, `POST /ota`. |
 | WiFi event group | IDF default | 18 | Owned by IDF; we hook events only. |
 | Watchdog task    | 2 KiB | 4 | Heartbeats from each long-lived task. |
 
@@ -195,7 +265,7 @@ skeleton (returns 204 but stores nothing), watchdog.
 
 **Deliverables:**
 
-- Reproducible IDF build (`idf.py build flash monitor`).
+- Reproducible IDF build (`idf.py -p <PORT> flash monitor`).
 - "Hello, world" replaced with a placeholder "Waiting for daemon…"
   splash that survives WiFi reconnects.
 - `dns-sd -B _burnscope._tcp` on macOS finds the device.
@@ -257,9 +327,10 @@ unit-testable on the host).
 
 **Dependencies:** Phase 2 complete.
 
-> **Phase 4+ — out of scope for this FSD:** OTA, push auth, battery
-> support, additional panels, multi-machine aggregation. Tracked in
-> `docs/description.md` § Scope.
+> **Phase 4+ — out of scope for this FSD:** push auth, battery
+> support, web dashboard, multi-machine aggregation. Tracked in
+> `docs/description.md` § Scope. (OTA and the AMOLED board landed in
+> the post-MVP cycle and are documented in §§ 2.2–2.4 and § 6 above.)
 
 ---
 
@@ -630,14 +701,16 @@ Not applicable — JSON over HTTP, no custom opcodes.
 
 ### 7.1 Deployment / Flashing
 
-```bash
-cd firmware
-idf.py set-target esp32
-idf.py build
-idf.py -p <PORT> flash monitor
+```sh
+. ~/.espressif/v6.0.1/esp-idf/export.sh   # once per shell
+cd firmware                                # all commands below run from here
+
+idf.py set-target esp32                    # or esp32s3 for the AMOLED
+idf.py -p <PORT> flash monitor             # builds, writes, then tails serial
 ```
 
-A successful flash + boot yields the "Setup mode — connect to
+`idf.py flash` auto-builds, so a separate `idf.py build` step isn't
+needed. A successful flash + boot yields the "Setup mode — connect to
 `BURNSCOPE-XXXX`" splash on first boot.
 
 ### 7.2 First-time Provisioning
@@ -672,8 +745,11 @@ A successful flash + boot yields the "Setup mode — connect to
 
 - **Updating WiFi credentials:** factory-reset (button hold or
   `POST /factory-reset`) → re-provision via captive portal.
-- **Firmware upgrade:** USB re-flash (`idf.py flash`) in MVP. OTA is
-  Phase 2.
+- **Firmware upgrade:** initial bring-up over USB
+  (`idf.py -p <PORT> flash monitor`). Subsequent updates can ship over
+  the LAN via `burnscope ota <bin> --device <device_id>` on boards
+  whose partition layout reserves OTA slots (AMOLED today; the CYD's
+  4 MB layout is USB-only).
 - **Free-heap monitoring:** `GET /health` returns `free_heap_b`; a drop
   below 64 KiB at steady state should be investigated (NFR-3.1).
 

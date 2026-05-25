@@ -1,3 +1,3 @@
 #pragma once
 
-#define BURNSCOPE_FW_VERSION "0.2.0"
+#define BURNSCOPE_FW_VERSION "0.3.0"

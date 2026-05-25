@@ -20,8 +20,12 @@
 #include "esp_err.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "nvs.h"
 
 #include "mdns_svc.h"
@@ -32,8 +36,18 @@
 static const char *TAG = "http";
 
 #define SUMMARY_MAX_BODY  (16 * 1024)
+/* Loose upper bound — slightly above an OTA slot size (5 MB) so a
+ * malformed Content-Length can't make us malloc-and-stream forever
+ * but a legitimate full-fat image fits comfortably. */
+#define OTA_MAX_BODY      (6 * 1024 * 1024)
+#define OTA_RECV_CHUNK    4096
 
-static httpd_handle_t s_server = NULL;
+static httpd_handle_t   s_server     = NULL;
+/* Serializes /ota across concurrent uploads. Lazily initialized in
+ * http_server_start; held for the duration of one OTA stream + commit.
+ * Two parallel uploads would race esp_ota_write into the same
+ * partition and produce a corrupt image. */
+static SemaphoreHandle_t s_ota_mutex = NULL;
 
 /* --------------------------------------------------------------------- */
 /* Minimal JSON cursor — parses the AgentSnapshot shape and nothing else.*/
@@ -468,6 +482,32 @@ sessions_done:
     return have_agent && have_captured && have_sessions && out->session_count > 0;
 }
 
+/* If the currently-running app is in PENDING_VERIFY (i.e. this boot is
+ * the first one after an OTA), mark it valid so the bootloader stops
+ * arming itself to roll back on the next reboot. Called from
+ * summary_post_handler once a snapshot has been accepted end-to-end —
+ * the strongest evidence we have that the firmware is healthy. Cheap:
+ * after the first valid-mark per boot, this is a single bool test. */
+static void maybe_mark_ota_valid(void)
+{
+    static bool s_done = false;
+    if (s_done) return;
+    s_done = true;
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (running == NULL) return;
+    esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+    if (esp_ota_get_state_partition(running, &state) != ESP_OK) return;
+    if (state == ESP_OTA_IMG_PENDING_VERIFY) {
+        esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "OTA image marked valid; rollback canceled");
+        } else {
+            ESP_LOGW(TAG, "mark-valid failed: %s — rollback may fire on next reboot",
+                     esp_err_to_name(err));
+        }
+    }
+}
+
 static esp_err_t summary_post_handler(httpd_req_t *req)
 {
     int content_len = req->content_len;
@@ -516,6 +556,12 @@ static esp_err_t summary_post_handler(httpd_req_t *req)
     case SNAPSHOT_PUT_OK:
         ESP_LOGI(TAG, "snapshot accepted: agent=%s sessions=%d",
                  snap.agent, snap.session_count);
+        /* Strongest evidence the firmware is healthy: we accepted an
+         * authorized snapshot end-to-end (radio + http + parser +
+         * snapshot store). Cancel any pending rollback so a freshly-
+         * flashed OTA image survives the next reboot. No-op once
+         * already validated, and a no-op on every non-OTA boot. */
+        maybe_mark_ota_valid();
         httpd_resp_set_status(req, "204 No Content");
         httpd_resp_send(req, NULL, 0);
         return ESP_OK;
@@ -805,6 +851,233 @@ static esp_err_t health_get_handler(httpd_req_t *req)
 }
 
 /* --------------------------------------------------------------------- */
+/* POST /ota                                                              */
+/* --------------------------------------------------------------------- */
+
+/*
+ * /ota authorization: stricter than /summary. We never bind a slot
+ * here (no TOFU) — flashing arbitrary firmware on a freshly-booted
+ * device just because someone POSTed first would be a trivially-
+ * exploitable LAN attack. The caller must present an
+ * `X-BurnScope-Client-Id` that already matches a populated slot.
+ * Returns true → continue; false → 401/500 already sent on `req`.
+ */
+static bool authorize_ota(httpd_req_t *req)
+{
+    char slots[KNOWN_AGENT_COUNT][BURNSCOPE_CLIENT_ID_MAX];
+    memset(slots, 0, sizeof(slots));
+    bool slot_filled[KNOWN_AGENT_COUNT] = { false };
+    int  filled_count = 0;
+    for (size_t i = 0; i < KNOWN_AGENT_COUNT; ++i) {
+        esp_err_t err = nvs_store_load_client_id(KNOWN_AGENTS[i], slots[i], sizeof(slots[i]));
+        if (err == ESP_OK) {
+            slot_filled[i] = true;
+            filled_count++;
+        } else if (err == ESP_ERR_NVS_NOT_FOUND) {
+            /* Empty slot — leave slot_filled[i] = false. */
+        } else {
+            ESP_LOGE(TAG, "/ota: NVS read failed for %s: %s — failing closed",
+                     KNOWN_AGENTS[i], esp_err_to_name(err));
+            httpd_resp_send_500(req);
+            return false;
+        }
+    }
+    if (filled_count == 0) {
+        ESP_LOGW(TAG, "/ota refused: device is not paired (no populated slots)");
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_set_type(req, "application/json");
+        const char *body = "{\"error\":\"device not paired; OTA requires an existing pairing\"}";
+        httpd_resp_send(req, body, strlen(body));
+        return false;
+    }
+
+    char header[BURNSCOPE_CLIENT_ID_MAX];
+    memset(header, 0, sizeof(header));
+    if (read_client_id_header(req, header, sizeof(header)) != 0 || header[0] == '\0') {
+        ESP_LOGW(TAG, "/ota missing or oversized X-BurnScope-Client-Id");
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_set_type(req, "application/json");
+        const char *body = "{\"error\":\"client id required\"}";
+        httpd_resp_send(req, body, strlen(body));
+        return false;
+    }
+
+    /* Same constant-time match as /health: fixed-length XOR-compare
+     * over zero-padded buffers, volatile accumulator so the compiler
+     * can't short-circuit later iterations once a hit has been seen. */
+    volatile unsigned int matched_acc = 0;
+    for (size_t i = 0; i < KNOWN_AGENT_COUNT; ++i) {
+        unsigned int slot_diff = 0;
+        for (size_t k = 0; k < BURNSCOPE_CLIENT_ID_MAX; ++k) {
+            slot_diff |= (unsigned char)slots[i][k] ^ (unsigned char)header[k];
+        }
+        unsigned int hit = (slot_diff == 0u) && slot_filled[i];
+        matched_acc |= hit;
+    }
+    if (matched_acc) return true;
+
+    ESP_LOGW(TAG, "/ota client-id matches no populated slot");
+    httpd_resp_set_status(req, "401 Unauthorized");
+    httpd_resp_set_type(req, "application/json");
+    const char *body = "{\"error\":\"client id mismatch\"}";
+    httpd_resp_send(req, body, strlen(body));
+    return false;
+}
+
+/* esp_timer callback that triggers a soft reboot. Used to flush the
+ * 202 response before the radio + filesystem go down. */
+static void ota_reboot_cb(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "OTA committed; rebooting into the new image");
+    esp_restart();
+}
+
+static esp_err_t ota_post_handler(httpd_req_t *req)
+{
+    if (!authorize_ota(req)) {
+        return ESP_OK;
+    }
+
+    int content_len = req->content_len;
+    if (content_len <= 0) {
+        return reject_400(req, "Content-Length required and > 0");
+    }
+    if (content_len > OTA_MAX_BODY) {
+        ESP_LOGW(TAG, "/ota body too large (%d bytes)", content_len);
+        httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE, "image too large");
+        return ESP_OK;
+    }
+
+    /* Non-blocking mutex grab — if another upload is in flight, fail
+     * fast with 409 rather than pile up two long-running uploads on
+     * the httpd task pool. */
+    if (xSemaphoreTake(s_ota_mutex, 0) != pdTRUE) {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "application/json");
+        const char *body = "{\"error\":\"another OTA already in progress\"}";
+        httpd_resp_send(req, body, strlen(body));
+        return ESP_OK;
+    }
+
+    const esp_partition_t *target = esp_ota_get_next_update_partition(NULL);
+    if (target == NULL) {
+        ESP_LOGE(TAG, "/ota: no inactive OTA partition found");
+        xSemaphoreGive(s_ota_mutex);
+        return httpd_resp_send_500(req);
+    }
+    if ((size_t)content_len > target->size) {
+        ESP_LOGW(TAG, "/ota: image (%d B) exceeds slot size (%lu B)",
+                 content_len, (unsigned long)target->size);
+        xSemaphoreGive(s_ota_mutex);
+        httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE,
+                            "image larger than OTA slot");
+        return ESP_OK;
+    }
+
+    esp_ota_handle_t handle = 0;
+    esp_err_t err = esp_ota_begin(target, content_len, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_begin failed: %s", esp_err_to_name(err));
+        xSemaphoreGive(s_ota_mutex);
+        return httpd_resp_send_500(req);
+    }
+
+    char *buf = malloc(OTA_RECV_CHUNK);
+    if (buf == NULL) {
+        esp_ota_abort(handle);
+        xSemaphoreGive(s_ota_mutex);
+        return httpd_resp_send_500(req);
+    }
+
+    int written = 0;
+    while (written < content_len) {
+        int want = content_len - written;
+        if (want > OTA_RECV_CHUNK) want = OTA_RECV_CHUNK;
+        int got = httpd_req_recv(req, buf, want);
+        if (got <= 0) {
+            if (got == HTTPD_SOCK_ERR_TIMEOUT) continue;
+            ESP_LOGE(TAG, "/ota recv aborted after %d/%d bytes",
+                     written, content_len);
+            esp_ota_abort(handle);
+            free(buf);
+            xSemaphoreGive(s_ota_mutex);
+            return ESP_FAIL;
+        }
+        err = esp_ota_write(handle, buf, got);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_ota_write failed at %d B: %s",
+                     written, esp_err_to_name(err));
+            esp_ota_abort(handle);
+            free(buf);
+            xSemaphoreGive(s_ota_mutex);
+            /* esp_ota_write performs magic-byte + header validation
+             * on the first chunk. A bad image is the client's fault,
+             * not ours — return 400 so the daemon doesn't retry it. */
+            if (err == ESP_ERR_OTA_VALIDATE_FAILED) {
+                return reject_400(req, "image rejected by bootloader");
+            }
+            return httpd_resp_send_500(req);
+        }
+        written += got;
+    }
+    free(buf);
+
+    err = esp_ota_end(handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_end failed: %s — image rejected", esp_err_to_name(err));
+        xSemaphoreGive(s_ota_mutex);
+        /* esp_ota_end rejects images that fail the magic-byte check or
+         * sha256 verification. A 400 reads more honest than 500 here:
+         * the *server* is fine, the *image* the client sent isn't. */
+        return reject_400(req, "image rejected by bootloader");
+    }
+
+    err = esp_ota_set_boot_partition(target);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_set_boot_partition failed: %s", esp_err_to_name(err));
+        xSemaphoreGive(s_ota_mutex);
+        return httpd_resp_send_500(req);
+    }
+
+    /* Tell the client what's about to happen before the radio dies.
+     * We don't release s_ota_mutex on the success path on purpose —
+     * the next reboot reinitialises it, and holding it during the
+     * ~1 s grace period prevents a racing second uploader from
+     * starting an OTA into a partition we just sealed. */
+    ESP_LOGI(TAG, "OTA accepted: %d B written to %s; reboot in ~1 s",
+             written, target->label);
+    httpd_resp_set_status(req, "202 Accepted");
+    httpd_resp_set_type(req, "application/json");
+    char resp[128];
+    int rn = snprintf(resp, sizeof(resp),
+                      "{\"status\":\"flashing\",\"bytes\":%d,\"next_boot\":\"%s\"}",
+                      written, target->label);
+    if (rn < 0 || (size_t)rn >= sizeof(resp)) {
+        httpd_resp_send(req, "{\"status\":\"flashing\"}", strlen("{\"status\":\"flashing\"}"));
+    } else {
+        httpd_resp_send(req, resp, rn);
+    }
+
+    /* Schedule the reboot ~1 s out so the 202 has time to flush
+     * through the socket. esp_timer runs on its own task so it
+     * isn't blocked by the httpd handler returning. */
+    const esp_timer_create_args_t targs = {
+        .callback = ota_reboot_cb,
+        .name     = "ota_reboot",
+    };
+    esp_timer_handle_t t = NULL;
+    if (esp_timer_create(&targs, &t) == ESP_OK) {
+        esp_timer_start_once(t, 1000 * 1000);
+    } else {
+        /* Timer creation shouldn't fail; if it does, reboot immediately
+         * rather than leaving the device in a half-committed state. */
+        esp_restart();
+    }
+    return ESP_OK;
+}
+
+/* --------------------------------------------------------------------- */
 /* Startup                                                                */
 /* --------------------------------------------------------------------- */
 
@@ -820,9 +1093,20 @@ void http_server_start(void)
         return;
     }
 
+    if (s_ota_mutex == NULL) {
+        s_ota_mutex = xSemaphoreCreateMutex();
+        /* Failure to create the mutex would leave /ota racing on its
+         * own — refuse to bring the server up rather than ship that. */
+        ESP_ERROR_CHECK(s_ota_mutex != NULL ? ESP_OK : ESP_ERR_NO_MEM);
+    }
+
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
     config.uri_match_fn = httpd_uri_match_wildcard;
+    /* /ota uploads a full firmware image (multi-MB). The default
+     * recv_wait_timeout is 5 s which is fine per-chunk, but extend
+     * the overall send timeout so the 202 response has time to flush
+     * before we trip a write timeout right before the reboot. */
 
     ESP_ERROR_CHECK(httpd_start(&s_server, &config));
 
@@ -835,6 +1119,11 @@ void http_server_start(void)
         .uri = "/health", .method = HTTP_GET, .handler = health_get_handler,
     };
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &health));
+
+    const httpd_uri_t ota = {
+        .uri = "/ota", .method = HTTP_POST, .handler = ota_post_handler,
+    };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &ota));
 
     ESP_LOGI(TAG, "HTTP server listening on :80");
 }

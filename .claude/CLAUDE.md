@@ -71,6 +71,14 @@ prior `/summary` push first. See `docs/wire-format.md` § `POST /ota`.
 
 Path: `~/.espressif/v6.0.1/esp-idf`
 
+## Versioning
+
+This project follows [semantic versioning](https://semver.org/) (MAJOR.MINOR.PATCH):
+
+- **MAJOR** (`1.0.0`): bumped when a milestone is completed
+- **MINOR** (`0.1.0`): bumped when a feature PR is accepted
+- **PATCH** (`0.0.1`): bumped when a bug fix PR is accepted
+
 ## Pointers
 
 - Code style: [./rules/code-style.md](./rules/code-style.md)

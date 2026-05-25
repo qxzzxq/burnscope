@@ -411,15 +411,21 @@ static void render_snapshot_locked(const agent_snapshot_t *snap)
         lv_obj_clear_flag(r->card, LV_OBJ_FLAG_HIDDEN);
 
         const session_snapshot_t *s = &snap->sessions[i];
+        /* Synthesise the reset time locally for rolling windows at idle
+         * (codex). The pushed `resets_at` would otherwise be stale —
+         * see _anchor_resets_at in the codex daemon and the helper in
+         * snapshot.h. For fixed-window agents (claude) this is a no-op. */
+        int64_t reset_at = effective_resets_at(s, now);
         float pct = s->used_pct;
         if (pct < 0.0f) pct = 0.0f;
         if (pct > 1.0f) pct = 1.0f;
-        /* Post-reset auto-zero: once the wall clock crosses resets_at the
-         * old window is logically gone. Keep the bar at 0 until the next
-         * push delivers the new window's used_pct + resets_at. The store
-         * is intentionally not mutated — /health still reports what the
-         * daemon last sent, so its drift-detection stays meaningful. */
-        if (clock_synced && now >= s->resets_at) {
+        /* Post-reset auto-zero: once the wall clock crosses the
+         * effective reset boundary the old window is logically gone.
+         * Keep the bar at 0 until the next push delivers the new
+         * window's used_pct + resets_at. The store is intentionally not
+         * mutated — /health still reports what the daemon last sent,
+         * so its drift-detection stays meaningful. */
+        if (clock_synced && now >= reset_at) {
             pct = 0.0f;
         }
 
@@ -432,7 +438,7 @@ static void render_snapshot_locked(const agent_snapshot_t *snap)
 
         char buf[32];
         if (clock_synced) {
-            format_countdown(s->resets_at - now, buf, sizeof(buf));
+            format_countdown(reset_at - now, buf, sizeof(buf));
         } else {
             snprintf(buf, sizeof(buf), "syncing...");
         }

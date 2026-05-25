@@ -18,9 +18,42 @@
 
 typedef struct {
     char    type[SNAPSHOT_TYPE_MAX];
-    float   used_pct;     /* [0.0, 1.0] */
-    int64_t resets_at;    /* unix seconds (UTC) */
+    float   used_pct;             /* [0.0, 1.0] */
+    int64_t resets_at;            /* unix seconds (UTC) */
+    bool    rolling;              /* see docs/wire-format.md */
+    int32_t window_duration_mins; /* total window length, 0 → unknown */
 } session_snapshot_t;
+
+/* Threshold below which a rolling window is treated as "essentially
+ * idle" and the firmware synthesises the countdown locally rather than
+ * trusting the pushed `resets_at`. Picked to include the codex case
+ * where `usedPercent=1` (the integer-percent representation), which
+ * arrives as exactly 0.01 after the daemon-side division. */
+#define SNAPSHOT_ROLLING_IDLE_THRESHOLD  0.01f
+
+/**
+ * Reset timestamp to actually render, given the current wall-clock.
+ *
+ * For a rolling window at essentially-zero usage, the daemon stops
+ * pushing drift updates (see `_anchor_resets_at` in the codex daemon),
+ * so the stored `resets_at` would slowly go stale and the countdown
+ * would tick to zero. Synthesising `now + window_duration_mins * 60`
+ * keeps the displayed countdown sensible without requiring wake-up
+ * pushes that would defeat the burn-in idle state machine.
+ *
+ * Returns `s->resets_at` verbatim when synthesis doesn't apply
+ * (fixed-window agent, real usage in the window, or unknown duration).
+ */
+static inline int64_t effective_resets_at(const session_snapshot_t *s,
+                                          int64_t now)
+{
+    if (s->rolling
+        && s->used_pct <= SNAPSHOT_ROLLING_IDLE_THRESHOLD
+        && s->window_duration_mins > 0) {
+        return now + (int64_t)s->window_duration_mins * 60;
+    }
+    return s->resets_at;
+}
 
 typedef struct {
     char    agent[SNAPSHOT_AGENT_MAX];     /* "" => slot empty */

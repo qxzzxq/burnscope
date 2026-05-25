@@ -458,10 +458,14 @@ static void render_stack_locked(bool visible,
     show_obj(cd_label, visible);
     if (!visible) return;
 
+    /* Synthesise the reset time locally for rolling windows at idle
+     * (codex). For fixed-window agents (claude) this is a no-op. See
+     * effective_resets_at() in snapshot.h. */
+    int64_t reset_at = effective_resets_at(s, now);
     float pct = s->used_pct;
     if (pct < 0.0f) pct = 0.0f;
     if (pct > 1.0f) pct = 1.0f;
-    if (clock_synced && now >= s->resets_at) {
+    if (clock_synced && now >= reset_at) {
         pct = 0.0f;
     }
 
@@ -470,7 +474,7 @@ static void render_stack_locked(bool visible,
 
     char cd_buf[16];
     if (clock_synced) {
-        format_countdown(s->resets_at - now, cd_buf, sizeof(cd_buf));
+        format_countdown(reset_at - now, cd_buf, sizeof(cd_buf));
     } else {
         snprintf(cd_buf, sizeof(cd_buf), "syncing...");
     }
@@ -520,10 +524,11 @@ static void render_snapshot_locked(const agent_snapshot_t *snap)
         lv_obj_clear_flag(r->arc, LV_OBJ_FLAG_HIDDEN);
 
         const session_snapshot_t *s = &snap->sessions[i];
+        int64_t reset_at = effective_resets_at(s, now);
         float pct = s->used_pct;
         if (pct < 0.0f) pct = 0.0f;
         if (pct > 1.0f) pct = 1.0f;
-        if (clock_synced && now >= s->resets_at) {
+        if (clock_synced && now >= reset_at) {
             pct = 0.0f;
         }
         lv_arc_set_value(r->arc, (int32_t)lroundf(pct * AMOLED_ARC_VALUE_RANGE));

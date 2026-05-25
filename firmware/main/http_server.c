@@ -308,8 +308,11 @@ static bool authorize_summary(httpd_req_t *req, const char *agent)
     return true;
 }
 
-/* Parse one {"type":..,"used_pct":..,"resets_at":..} object. Accepts the
- * three keys in any order. */
+/* Parse one session object. Accepts the keys in any order. The three
+ * required keys (type, used_pct, resets_at) must be present; `rolling`
+ * and `window_duration_mins` are optional and default to (false, 0) —
+ * the conservative "fixed window, no synthesis" interpretation that
+ * matches the wire-format contract for older daemons. */
 static bool parse_session(cursor_t *c, session_snapshot_t *out)
 {
     if (!eat(c, '{')) return false;
@@ -320,7 +323,9 @@ static bool parse_session(cursor_t *c, session_snapshot_t *out)
         skip_ws(c);
         if (c->p < c->end && *c->p == '}') { c->p++; break; }
 
-        char key[16];
+        /* Buffer sized to hold the longest current key
+         * (`window_duration_mins` = 20 chars) plus future headroom. */
+        char key[32];
         if (!peek_key(c, key, sizeof(key))) return false;
 
         if (strcmp(key, "type") == 0) {
@@ -337,6 +342,27 @@ static bool parse_session(cursor_t *c, session_snapshot_t *out)
             if (!read_number(c, &v)) return false;
             out->resets_at = (int64_t)v;
             have_reset = true;
+        } else if (strcmp(key, "rolling") == 0) {
+            skip_ws(c);
+            if (c->p + 4 <= c->end && memcmp(c->p, "true", 4) == 0) {
+                out->rolling = true;
+                c->p += 4;
+            } else if (c->p + 5 <= c->end && memcmp(c->p, "false", 5) == 0) {
+                out->rolling = false;
+                c->p += 5;
+            } else {
+                c->err = true;
+                return false;
+            }
+        } else if (strcmp(key, "window_duration_mins") == 0) {
+            double v;
+            if (!read_number(c, &v)) return false;
+            /* Negative durations are nonsensical; clamp to 0 (meaning
+             * "unknown / no synthesis"). Cap at INT32_MAX defensively
+             * against pathological inputs. */
+            if (v < 0.0) v = 0.0;
+            if (v > (double)INT32_MAX) v = (double)INT32_MAX;
+            out->window_duration_mins = (int32_t)v;
         } else {
             /* Unknown key — skip the value and continue. Forward-compat
              * for daemon-side wire-format additions; required keys above
@@ -603,9 +629,12 @@ static void append_agent(const agent_snapshot_t *snap, void *user)
         w->off += n;
         if (!json_escape_append(w, s->type)) goto overflow;
         n = snprintf(w->body + w->off, w->cap - w->off,
-                     "\",\"used_pct\":%.6g,\"resets_at\":%lld}",
+                     "\",\"used_pct\":%.6g,\"resets_at\":%lld,"
+                     "\"rolling\":%s,\"window_duration_mins\":%ld}",
                      (double)s->used_pct,
-                     (long long)s->resets_at);
+                     (long long)s->resets_at,
+                     s->rolling ? "true" : "false",
+                     (long)s->window_duration_mins);
         if (n <= 0 || (size_t)n >= w->cap - w->off) goto overflow;
         w->off += n;
     }

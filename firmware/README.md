@@ -103,6 +103,17 @@ component, hence the profile name. It shares the wire format and
 snapshot store with the CYD profile; only the rendering changes
 (concentric arcs vs. linear bars).
 
+The Waveshare vendor demo bundle (LVGL source, Waveshare demos, and
+Espressif reference components) is **not vendored** in this repo —
+it's 346 MB and the bits we actually use are trimmed into
+`main/displays/amoled_sh8601/` with attribution preserved. The repo
+references specific subpaths under `docs/ESP32-S3-AMOLED-1.43-Demo/`
+(notably `03_I2C_QMI8658/`, `08_LVGL_SDIMG/`, `09_FactoryProgram/`)
+for human reference during bring-up; to follow those references,
+download the bundle from
+[Waveshare's product page](https://files.waveshare.com/wiki/ESP32-S3-Touch-AMOLED-1.43/ESP32-S3-AMOLED-1.43-Demo-V3.zip)
+and unzip it into `docs/`. The directory is gitignored wholesale.
+
 The UI layout for the AMOLED profile is dialled in via the
 configurator at `firmware/scripts/amoled-preview.html` (open in any
 browser). It mirrors the role of `font-preview.html` for the CYD

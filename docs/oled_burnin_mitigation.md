@@ -222,9 +222,15 @@ Defaults (Kconfig options under `BurnScope display → AMOLED burn-in`):
 - `IDLE_OFF_MINUTES`   = **30**
 - Motion threshold     = **0.05 g** (per-sample delta magnitude)
 
-Any wake source returns the state machine to *Active* and restores
-`DEFAULT_BRIGHTNESS` immediately — no fade-up, instant response feels
-better when the user picks the device up.
+Any wake source returns the state machine to *Active* and ramps the
+panel back to `DEFAULT_BRIGHTNESS` via a short fade (default 300 ms
+for waking-direction transitions, 1500 ms for dimming-direction
+transitions). The original design called for an instant snap on
+wake; the fade was added later in the AMOLED adapter because it
+reads visibly smoother on hardware without compromising
+responsiveness — the leading edge of the ramp is still in the
+≤ 200 ms wake-latency budget (NFR-2.1). Set the Kconfig duration
+to 0 for the legacy instant behaviour.
 
 #### Client side: active poll + dedupe in the Codex daemon
 

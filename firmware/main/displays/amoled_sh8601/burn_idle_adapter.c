@@ -238,7 +238,8 @@ static void fade_step_cb(void *arg)
 static void start_fade(uint8_t target_pct, int64_t duration_us, bool pending_off)
 {
     bool short_circuit;
-    bool need_start = false;
+    bool need_start         = false;
+    bool brightness_changed = false;
 
     portENTER_CRITICAL(&s_fade_mux);
     /* Short-circuit when the ramp would have zero duration *or* zero
@@ -247,8 +248,10 @@ static void start_fade(uint8_t target_pct, int64_t duration_us, bool pending_off
      * spend SLEEP_FADE_MS writing 0→0 before issuing the DISPOFF,
      * delaying the panel-off by the full fade duration for no
      * visible benefit. */
-    short_circuit = (duration_us <= 0) || (s_fade.current_pct == target_pct);
+    const uint8_t old_current = s_fade.current_pct;
+    short_circuit = (duration_us <= 0) || (old_current == target_pct);
     if (short_circuit) {
+        brightness_changed       = (old_current != target_pct);
         s_fade.current_pct       = target_pct;
         s_fade.active            = false;
         s_fade.pending_panel_off = false;
@@ -260,7 +263,7 @@ static void start_fade(uint8_t target_pct, int64_t duration_us, bool pending_off
         /* Anchor the new ramp at the current interpolated value so a
          * preempting event blends from wherever the in-flight fade
          * had reached — no visible jump back to the previous start. */
-        s_fade.start_pct         = s_fade.current_pct;
+        s_fade.start_pct         = old_current;
         s_fade.target_pct        = target_pct;
         s_fade.start_us          = esp_timer_get_time();
         s_fade.duration_us       = duration_us;
@@ -275,9 +278,12 @@ static void start_fade(uint8_t target_pct, int64_t duration_us, bool pending_off
 
     if (short_circuit) {
         (void)esp_timer_stop(s_fade_timer);
-        /* Only write brightness if it actually changed — saves a
-         * QSPI command when the SM emits the same target twice. */
-        if (duration_us <= 0) {
+        /* Only write 0x51 when the value would actually change —
+         * skips a redundant QSPI command in the legacy snap path
+         * (duration=0) when the SM's target already matches the
+         * current brightness (e.g. transitions that change only
+         * `panel_on`, not `brightness_pct`). */
+        if (brightness_changed) {
             amoled_sh8601_set_brightness_pct(target_pct);
         }
         if (pending_off) {

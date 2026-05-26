@@ -111,8 +111,18 @@ void snapshot_store_foreach(snapshot_listener_t cb, void *user);
 int64_t snapshot_store_age_s(const char *agent);
 
 /**
- * Register a listener called whenever any agent's slot is written. Pass
- * NULL to clear. Invoked from the HTTP-server task; the listener must not
- * block long.
+ * Maximum number of listeners that can be registered concurrently. Sized
+ * for the current consumers (UI redraw, burn-in adapter) plus headroom.
+ */
+#define SNAPSHOT_MAX_LISTENERS 4
+
+/**
+ * Register a listener called whenever any agent's slot is written.
+ * Listeners are invoked in registration order from the HTTP-server task;
+ * each listener must not block long.
+ *
+ * Asserts on overflow (more than SNAPSHOT_MAX_LISTENERS registrations).
+ * Asserts on NULL `cb` — there is no unregister path; registration is
+ * one-shot at module bring-up.
  */
 void snapshot_store_register_listener(snapshot_listener_t cb, void *user);

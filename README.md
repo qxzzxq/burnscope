@@ -95,9 +95,13 @@ Full details, re-provisioning, and on-device smoke tests in
 After the initial USB flash, subsequent updates can ship over the LAN
 via `burnscope ota <bin> --device <device_id>` (see `POST /ota` in
 [`docs/wire-format.md`](./docs/wire-format.md)). The AMOLED uses a
-16 MB layout with two 5 MB OTA slots and a ~5.8 MB LittleFS volume at
-`/storage` (room for the future pixel-aging map); the CYD stays on
-its 4 MB layout and accepts USB-only updates.
+16 MB layout with two 5 MB OTA slots, a ~5.8 MB LittleFS volume at
+`/storage` (room for the future pixel-aging map), and bootloader
+rollback enabled — a bad image is reverted automatically if it fails
+to mark itself valid on first boot. The CYD stays on its 4 MB layout
+with two ~1.875 MB OTA slots; it accepts the same `burnscope ota`
+push but does not run the rollback safety net (a corrupted image
+requires a USB re-flash to recover).
 
 ## Repository layout
 

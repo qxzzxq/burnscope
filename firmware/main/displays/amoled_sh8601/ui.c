@@ -33,9 +33,11 @@
 #include "lvgl.h"
 #include "nvs.h"
 
+#include "burn_idle_adapter.h"
 #include "driver.h"
 #include "nvs_store.h"
 #include "snapshot.h"
+#include "touch.h"
 #include "version.h"
 
 /* Per-agent brand icons. 70×70 ARGB8888 assets dedicated to the AMOLED
@@ -622,6 +624,31 @@ static void tick_lvgl_cb(lv_timer_t *t)
 
 /* ===== Public profile interface ===================================== */
 
+/* LVGL touch indev callback. Polls the FT3168 every LVGL tick and, on
+ * a fresh-press (released → pressed) transition, notifies the burn-in
+ * adapter so the panel wakes from any idle state. The LVGL coordinates
+ * fed in let any future touch-aware UI work transparently — the burn-in
+ * wake is the same code path that drives UI input. */
+static void touch_indev_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
+{
+    (void)indev;
+    static bool prev_pressed = false;
+    uint16_t x = 0;
+    uint16_t y = 0;
+    const bool pressed = touch_read(&x, &y);
+    if (pressed && !prev_pressed) {
+        burn_idle_adapter_notify_touch();
+    }
+    prev_pressed = pressed;
+    if (pressed) {
+        data->state   = LV_INDEV_STATE_PRESSED;
+        data->point.x = x;
+        data->point.y = y;
+    } else {
+        data->state = LV_INDEV_STATE_RELEASED;
+    }
+}
+
 void display_profile_init(void)
 {
     /* Idempotency guard (deep-review M-1). The header documents this
@@ -632,6 +659,7 @@ void display_profile_init(void)
     if (s_initialized) return;
 
     lv_display_t *disp = amoled_sh8601_driver_init();
+    touch_init();
 
     if (!lvgl_port_lock(0)) {
         ESP_LOGE(TAG, "lvgl_port_lock failed during init");
@@ -640,7 +668,15 @@ void display_profile_init(void)
     build_splash(disp);
     build_agent_screen();
     lv_timer_create(tick_lvgl_cb, 1000, NULL);
+
+    lv_indev_t *touch_indev = lv_indev_create();
+    lv_indev_set_type(touch_indev, LV_INDEV_TYPE_POINTER);
+    lv_indev_set_read_cb(touch_indev, touch_indev_read_cb);
+    lv_indev_set_display(touch_indev, disp);
+
     lvgl_port_unlock();
+
+    burn_idle_adapter_start();
     s_initialized = true;
 }
 

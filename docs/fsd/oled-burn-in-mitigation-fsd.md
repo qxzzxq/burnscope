@@ -190,7 +190,7 @@ client:
 | MCU                | ESP32-S3 (Waveshare ESP32-S3-Touch-AMOLED-1.43 module)                                        |
 | Panel              | 466×466 round AMOLED, SH8601 / CO5300 controller, QSPI                                        |
 | IMU                | QMI8658 6-axis (only the accelerometer is used for this feature)                              |
-| Touch              | Capacitive touch controller, CST816-class, INT line wired to GPIO                             |
+| Touch              | FT3168 capacitive touch over I²C (no INT line routed on this board); polled via an LVGL pointer input device. |
 | Button             | Onboard pushbutton (board-specific GPIO; reuse the BOOT-button long-press wiring conceptually) |
 | Bus                | I²C for IMU and touch; QSPI for panel                                                         |
 | Brightness control | SH8601 brightness register via `esp_lcd_panel_io_tx_param`                                    |
@@ -263,9 +263,10 @@ genuinely meaningful when they do happen.
 **Deliverables.**
 
 - `burn_idle_adapter.c`: IMU sampler (with motion thresholding),
-  touch IRQ binding, button IRQ binding, 1 Hz `esp_timer` for
-  `EV_TIME`, snapshot listener hooked to `EV_PUSH`, brightness +
-  panel sleep/wake actions on SM output.
+  touch wake (driven by the LVGL touch indev's read callback in
+  `ui.c` on a rising-edge press), button IRQ binding, 1 Hz
+  `esp_timer` for `EV_TIME`, snapshot listener hooked to `EV_PUSH`,
+  brightness + panel sleep/wake actions on SM output.
 
 **Exit criteria.** Phase 2 hardware tests in § 8.2 pass: manual
 dim/off timing, all four wake sources, push-with-no-change does
@@ -405,8 +406,15 @@ no-push rate when usage is unchanged.
   rate defined by FR-1.1, compute per-sample delta-magnitude against
   the previous sample, and emit `EV_MOTION` when the magnitude
   exceeds the configured motion threshold (default: 50 mg).
-- **FR-3.2** [Must]: The adapter shall bind the capacitive-touch
-  controller's interrupt line to a handler that emits `EV_TOUCH`.
+- **FR-3.2** [Must]: The adapter shall expose an entry point
+  (`burn_idle_adapter_notify_touch`) that emits `EV_TOUCH`. The LVGL
+  touch input-device read callback (registered against the FT3168
+  in the AMOLED `ui.c`) calls it on a rising-edge press —
+  released → pressed — so a continuously-held finger does not
+  re-post. The Waveshare 1.43" board exposes no INT line on the
+  FT3168, so polling via the LVGL indev tick is the only available
+  mechanism; LVGL's input timer keeps running while the panel is
+  asleep, so touch wake remains functional in `BURN_IDLE_OFF`.
 - **FR-3.3** [Must]: The adapter shall bind the on-board button to
   a handler that emits `EV_BUTTON` on press.
 - **FR-3.4** [Must]: The adapter shall register a snapshot listener
@@ -550,9 +558,12 @@ no-push rate when usage is unchanged.
   radio sleep.
 - **C-2** Touch must be able to wake the host from the panel-off
   state without re-initialising the panel from scratch. The
-  CST816-class controller's IRQ remains active across SH8601 sleep.
-  If this is later disproven, the SM contract still holds — the
-  adapter just loses the touch wake source.
+  Waveshare 1.43" board does not route the FT3168 INT line to a
+  GPIO, so we cannot drive touch wake via an interrupt; the LVGL
+  indev callback polls the controller at ~30 Hz from LVGL's input
+  timer, which keeps ticking independently of panel state. If LVGL
+  ever stops ticking while the panel is off, the SM contract still
+  holds — the adapter just loses the touch wake source.
 - **C-3** The SH8601 brightness register has a finite resolution
   (typically 0–255). `brightness_pct` shall be converted to the
   device-specific range inside the driver, not inside the SM.
@@ -567,7 +578,7 @@ no-push rate when usage is unchanged.
 |------|------------|--------|------------|
 | QMI8658 accel sampling at 21 Hz produces too much jitter at the motion threshold (false `EV_MOTION` storms) | Medium | High — would keep the panel pinned awake | Filter via per-axis low-pass before delta computation; expose threshold as Kconfig (FR-3.8) |
 | `lv_disp_set_rotation` is not honoured by the SH8601 driver path | Medium | Medium | Fall back to manual orientation transform in the LVGL flush callback; gated by Kconfig FR-1.6 |
-| Touch IRQ does not fire while panel is in sleep (C-2) | Medium | Low — motion / push still wake | Disable touch as a wake source; document the deviation |
+| LVGL indev callback stops being scheduled while panel is in `BURN_IDLE_OFF`, breaking touch wake (C-2) | Low | Low — motion / push still wake | Confirmed during bring-up that LVGL's input timer is independent of panel state; if a future refactor changes this, disable touch as a wake source and document the deviation |
 | Codex CLI changes the on-disk rate-limit storage format, or `rateLimits/read` against a long-lived app-server stops re-reading from disk | Low | Medium — poll would return stale values forever | Verify in CI / on bring-up against each `codex-cli` upgrade. Fallback design: periodically `_terminate()` the app-server subprocess so the next `_run_once` iteration's bootstrap re-reads from disk. |
 | Existing colour tokens already violate FR-5 | Medium | Low | Phase 4 acceptance includes a one-time palette audit; treat violations as bugs and fix |
 
@@ -946,8 +957,16 @@ Unchanged. The idle SM starts in `BURN_IDLE_ACTIVE` at boot.
 
 ### 8.6 Live Verification Log
 
-(To be populated on first AMOLED bring-up. Use the same ✅ / ⏳ / ❌
-convention as `docs/fsd/firmware-fsd.md` § 8.4.)
+| Date       | Build                | Board        | Test     | Result | Notes |
+|------------|----------------------|--------------|----------|--------|-------|
+| 2026-05-26 | `9687070` (PR #48)   | AMOLED-1.43  | DIM-001  | ✅     | Compressed thresholds (`IDLE_DIM_MINUTES=1`); panel dropped from 70 % to 20 % at ~1 min idle. |
+| 2026-05-26 | `9687070` (PR #48)   | AMOLED-1.43  | DIM-002  | ✅     | Compressed thresholds (`IDLE_OFF_MINUTES=2`); panel turned off at ~2 min idle. |
+| 2026-05-26 | `9687070` (PR #48)   | AMOLED-1.43  | WAKE-002 | ✅     | Tap from OFF → wake within target window. Held finger does not re-post (rising-edge detection in `ui.c` indev callback). |
+| 2026-05-26 | `9687070` (PR #48)   | AMOLED-1.43  | WAKE-003 | ✅     | Short BOOT button press from OFF → wake. GPIO 0 ISR coexists with `factory_reset.c` polling on the same pin. |
+| 2026-05-26 | `9687070` (PR #48)   | AMOLED-1.43  | WAKE-004 | ✅     | Real `POST /summary` arrival while in OFF wakes the panel; verified during a live Claude Code statusline / Codex daemon push cycle. |
+| —          | —                    | —            | WAKE-001 | ⏳     | Motion wake — implemented in PR-2 (not yet shipped). |
+| —          | —                    | —            | WAKE-005 | ⏳     | "Non-qualifying poll does not wake" — depends on PR-2 sitting alongside the existing Codex dedupe to confirm a 5 min steady state stays in OFF. |
+| —          | —                    | —            | AT-1     | ⏳     | 24 h soak — pending after PR-2 lands. |
 
 ### 8.7 Traceability Matrix
 

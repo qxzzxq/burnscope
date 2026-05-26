@@ -26,10 +26,16 @@ static const char *TAG = "factory";
 static void task(void *arg)
 {
     (void)arg;
+    /* intr_type = NEGEDGE so a co-resident ISR consumer (the AMOLED
+     * burn-in adapter, which uses the same button as a wake source) can
+     * call gpio_isr_handler_add without us silently disabling its
+     * interrupt here. factory_reset itself doesn't use interrupts —
+     * it polls below — so the intr_type setting is inert for our path. */
     const gpio_config_t cfg = {
         .pin_bit_mask = 1ULL << BUTTON_GPIO,
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
+        .intr_type = GPIO_INTR_NEGEDGE,
     };
     ESP_ERROR_CHECK(gpio_config(&cfg));
 

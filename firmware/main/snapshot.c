@@ -16,10 +16,15 @@ static const char *TAG = "snapshot";
 
 #define MAX_AGENTS 2
 
+typedef struct {
+    snapshot_listener_t cb;
+    void               *user;
+} listener_slot_t;
+
 static agent_snapshot_t s_slots[MAX_AGENTS];
 static SemaphoreHandle_t s_mutex = NULL;
-static snapshot_listener_t s_listener = NULL;
-static void *s_listener_user = NULL;
+static listener_slot_t s_listeners[SNAPSHOT_MAX_LISTENERS];
+static size_t          s_listener_count = 0;
 
 static void lock(void)
 {
@@ -85,16 +90,20 @@ snapshot_put_result_t snapshot_store_put(const agent_snapshot_t *snap)
     s_slots[slot] = *snap;
     s_slots[slot].received_at_us = esp_timer_get_time();
 
-    /* Copy for the listener invocation outside the lock — listeners may
-     * touch other modules (LVGL) that can be expensive. */
+    /* Copy for the listener invocations outside the lock — listeners may
+     * touch other modules (LVGL, burn-in adapter event queue) that can be
+     * expensive. */
     agent_snapshot_t copy = s_slots[slot];
-    snapshot_listener_t cb = s_listener;
-    void *cb_user = s_listener_user;
+    listener_slot_t fanout[SNAPSHOT_MAX_LISTENERS];
+    size_t n = s_listener_count;
+    for (size_t i = 0; i < n; ++i) {
+        fanout[i] = s_listeners[i];
+    }
 
     unlock();
 
-    if (cb != NULL) {
-        cb(&copy, cb_user);
+    for (size_t i = 0; i < n; ++i) {
+        fanout[i].cb(&copy, fanout[i].user);
     }
     return SNAPSHOT_PUT_OK;
 }
@@ -167,8 +176,11 @@ int64_t snapshot_store_age_s(const char *agent)
 
 void snapshot_store_register_listener(snapshot_listener_t cb, void *user)
 {
+    configASSERT(cb != NULL);
     lock();
-    s_listener = cb;
-    s_listener_user = user;
+    configASSERT(s_listener_count < SNAPSHOT_MAX_LISTENERS);
+    s_listeners[s_listener_count].cb   = cb;
+    s_listeners[s_listener_count].user = user;
+    s_listener_count++;
     unlock();
 }

@@ -501,8 +501,9 @@ static void maybe_mark_ota_valid(void)
     esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
     if (esp_ota_get_state_partition(running, &state) != ESP_OK) return;
     if (state != ESP_OTA_IMG_PENDING_VERIFY) {
-        /* Nothing to do this boot — latch so we don't keep peeking
-         * at NVS on every successful snapshot. */
+        /* Nothing to do this boot — latch so we don't keep querying the
+         * otadata partition (via esp_ota_get_state_partition) on every
+         * successful snapshot. */
         s_done = true;
         return;
     }

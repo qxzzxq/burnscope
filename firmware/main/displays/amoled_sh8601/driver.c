@@ -122,7 +122,17 @@ static const sh8601_lcd_init_cmd_t s_co5300_init_cmds[] = {
     { 0x51, (uint8_t[]){ SH8601_DEFAULT_BRIGHTNESS }, 1, 0 }, /* ramp to 70 % */
 };
 
-static lv_display_t *s_display = NULL;
+static lv_display_t              *s_display      = NULL;
+static esp_lcd_panel_handle_t     s_panel_handle = NULL;
+static esp_lcd_panel_io_handle_t  s_io_handle    = NULL;
+
+/* SH8601 QSPI command framing: the managed component wraps each command
+ * as (LCD_OPCODE_WRITE_CMD << 24) | (cmd << 8) before tx_param. The
+ * component does this internally for the init table, but exposes no
+ * public brightness helper, so we replicate the framing for runtime
+ * writes. See esp_lcd_sh8601.c:142 (`tx_param`). */
+#define SH8601_QSPI_TX_CMD(cmd)  (((uint32_t)0x02 << 24) | ((uint32_t)(cmd) << 8))
+#define SH8601_CMD_BRIGHTNESS    0x51
 
 lv_display_t *amoled_sh8601_driver_init(void)
 {
@@ -147,12 +157,15 @@ lv_display_t *amoled_sh8601_driver_init(void)
     ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO));
 
     /* Panel IO over QSPI — the SH8601 component knows how to wrap each
-     * command in the cmd=0x02 / addr=(cmd<<8) framing the panel expects. */
+     * command in the cmd=0x02 / addr=(cmd<<8) framing the panel expects.
+     * Stashed in s_io_handle for runtime brightness writes via
+     * amoled_sh8601_set_brightness_pct (which replicates the framing). */
     esp_lcd_panel_io_handle_t io_handle = NULL;
     const esp_lcd_panel_io_spi_config_t io_config =
         SH8601_PANEL_IO_QSPI_CONFIG(PIN_NUM_LCD_CS, NULL, NULL);
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(
         (esp_lcd_spi_bus_handle_t)LCD_HOST, &io_config, &io_handle));
+    s_io_handle = io_handle;
 
     /* Panel — vendor_config carries the init register table + QSPI flag.
      * Pick the SH8601 or CO5300 sequence based on the RDID1 read. */
@@ -173,6 +186,7 @@ lv_display_t *amoled_sh8601_driver_init(void)
     };
     esp_lcd_panel_handle_t panel_handle = NULL;
     ESP_ERROR_CHECK(esp_lcd_new_panel_sh8601(io_handle, &panel_config, &panel_handle));
+    s_panel_handle = panel_handle;
 
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
@@ -231,4 +245,33 @@ lv_display_t *amoled_sh8601_driver_init(void)
         lvgl_port_unlock();
     }
     return s_display;
+}
+
+void amoled_sh8601_set_brightness_pct(uint8_t pct)
+{
+    if (s_io_handle == NULL) {
+        return;
+    }
+    if (pct > 100) {
+        pct = 100;
+    }
+    const uint8_t reg = (uint8_t)((uint32_t)pct * 255u / 100u);
+    const uint32_t framed = SH8601_QSPI_TX_CMD(SH8601_CMD_BRIGHTNESS);
+    esp_err_t err = esp_lcd_panel_io_tx_param(s_io_handle, framed, &reg, 1);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "set_brightness_pct(%u): tx_param failed: %s",
+                 (unsigned)pct, esp_err_to_name(err));
+    }
+}
+
+void amoled_sh8601_set_display_on(bool on)
+{
+    if (s_panel_handle == NULL) {
+        return;
+    }
+    esp_err_t err = esp_lcd_panel_disp_on_off(s_panel_handle, on);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "set_display_on(%d): disp_on_off failed: %s",
+                 (int)on, esp_err_to_name(err));
+    }
 }

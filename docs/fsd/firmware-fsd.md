@@ -161,7 +161,12 @@ profile and partition layout.
   dual-sources the silicon between SH8601 and CO5300 — both speak the
   same protocol — using Espressif's `esp_lcd_sh8601` managed component.
   Brightness ramps to ~70 % at boot per the OLED burn-in FSD.
-- **Touch:** CST816 capacitive controller present but unused in MVP.
+- **Touch:** FT3168 capacitive controller over I²C, polled via an LVGL
+  pointer input device. Used as a wake source for the OLED burn-in
+  idle adapter (see `docs/oled_burnin_mitigation.md` § A2 for the
+  AMOLED-specific design decisions, and
+  `docs/fsd/oled-burn-in-mitigation-fsd.md` FR-3.2 for the
+  requirement).
 
 **Common to both:**
 
@@ -202,9 +207,11 @@ Two CSVs ship in `firmware/`; the target picks which one via
 | ota_0    | app  | ota_0   | `0x20000` | `0x1E0000`|
 | ota_1    | app  | ota_1   | `0x200000`| `0x1E0000`|
 
-Dual OTA slots are reserved but USB-only updates today — there's no
-data partition to mount as a filesystem, so `/storage`-backed
-features are unavailable on the CYD.
+Dual OTA slots accept `burnscope ota` pushes, but the CYD build does
+not enable bootloader rollback (`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`
+is set only on the esp32s3 target), so a bad image must be recovered
+by USB re-flash. There's no data partition to mount as a filesystem,
+so `/storage`-backed features are unavailable on the CYD.
 
 **`partitions-16mb.csv` — AMOLED (`esp32s3`):**
 
@@ -747,9 +754,12 @@ needed. A successful flash + boot yields the "Setup mode — connect to
   `POST /factory-reset`) → re-provision via captive portal.
 - **Firmware upgrade:** initial bring-up over USB
   (`idf.py -p <PORT> flash monitor`). Subsequent updates can ship over
-  the LAN via `burnscope ota <bin> --device <device_id>` on boards
-  whose partition layout reserves OTA slots (AMOLED today; the CYD's
-  4 MB layout is USB-only).
+  the LAN via `burnscope ota <bin> --device <device_id>`; both boards
+  reserve OTA slots in their partition tables and run the same /ota
+  handler. The AMOLED target additionally enables bootloader rollback
+  (a bad image is reverted on next boot if the firmware fails to mark
+  itself valid); the CYD does not, so a bad image on CYD requires a
+  USB re-flash to recover.
 - **Free-heap monitoring:** `GET /health` returns `free_heap_b`; a drop
   below 64 KiB at steady state should be investigated (NFR-3.1).
 

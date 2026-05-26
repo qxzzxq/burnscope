@@ -18,8 +18,11 @@
 
 #include "burn_idle_adapter.h"
 
+#include <string.h>
+
 #include "burn_protection/burn_idle.h"
 #include "driver.h"
+#include "qmi8658.h"
 #include "snapshot.h"
 
 #include "driver/gpio.h"
@@ -39,6 +42,10 @@ static const char *TAG = "burn_idle_ad";
 #define BUTTON_DEBOUNCE_US      100000       /* 100 ms */
 #define DRAIN_TASK_STACK        4096
 #define DRAIN_TASK_PRIORITY     5
+#define IMU_SAMPLE_PERIOD_MS    48           /* ~21 Hz, matches Qmi8658AccOdr_LowPower_21Hz */
+#define IMU_POST_DEBOUNCE_US    200000       /* 200 ms between consecutive EV_MOTION posts */
+#define IMU_TASK_STACK          2560
+#define IMU_TASK_PRIORITY       3            /* below drain task */
 
 static burn_idle_t        s_sm;
 static QueueHandle_t      s_queue       = NULL;
@@ -46,6 +53,18 @@ static esp_timer_handle_t s_tick_timer  = NULL;
 static volatile int64_t   s_last_button_us = 0;
 static bool               s_prev_panel_on = true;  /* matches SM init baseline */
 static bool               s_started        = false;
+
+/* IMU state. `s_imu_threshold_mg` is cached from cfg at start so the
+ * sampler task doesn't reach into the SM's internal config copy. The
+ * debounce compares against the *last posted* sample, not the previous
+ * raw sample, so a slow continuous drift (e.g. picking the device up)
+ * doesn't fire EV_MOTION on every tick — only when the cumulative
+ * displacement crosses the threshold and 200 ms have elapsed since the
+ * last post. */
+static int16_t            s_imu_last_posted_mg[3] = { 0, 0, 0 };
+static int64_t            s_imu_last_posted_us    = INT64_MIN;
+static bool               s_imu_baseline_set      = false;
+static int16_t            s_imu_threshold_mg      = 0;
 
 static void post_event(burn_idle_event_t ev)
 {
@@ -131,6 +150,55 @@ static void drain_task(void *arg)
     }
 }
 
+static int16_t abs_i16(int16_t v) { return v < 0 ? (int16_t)-v : v; }
+
+static void imu_sampler_task(void *arg)
+{
+    (void)arg;
+    /* xTaskDelayUntil keeps the sample cadence anchored to an absolute
+     * tick reference, so the I²C read + threshold work below doesn't
+     * accumulate phase drift across iterations. The motion detector
+     * only cares about deltas (not phase), but the steady cadence also
+     * keeps the average sample rate aligned with the QMI8658's ODR so
+     * we don't quietly fall behind it under load. */
+    const TickType_t period = pdMS_TO_TICKS(IMU_SAMPLE_PERIOD_MS);
+    TickType_t last_wake = xTaskGetTickCount();
+    int16_t samp[3];
+    for (;;) {
+        xTaskDelayUntil(&last_wake, period);
+        if (!qmi8658_read_accel_mg(samp)) {
+            continue;
+        }
+        if (!s_imu_baseline_set) {
+            /* First successful read becomes the baseline so the
+             * initial ~1 g gravity vector doesn't fire a spurious
+             * EV_MOTION at startup. */
+            memcpy(s_imu_last_posted_mg, samp, sizeof samp);
+            s_imu_last_posted_us = esp_timer_get_time();
+            s_imu_baseline_set = true;
+            continue;
+        }
+        const int64_t now = esp_timer_get_time();
+        if (now - s_imu_last_posted_us < IMU_POST_DEBOUNCE_US) {
+            /* Within debounce window — keep reading but don't post.
+             * Intentionally skip the threshold check so we don't
+             * advance the baseline; that would let a slow drift
+             * through unnoticed. */
+            continue;
+        }
+        const int16_t dx = abs_i16(samp[0] - s_imu_last_posted_mg[0]);
+        const int16_t dy = abs_i16(samp[1] - s_imu_last_posted_mg[1]);
+        const int16_t dz = abs_i16(samp[2] - s_imu_last_posted_mg[2]);
+        int16_t max_delta = dx > dy ? dx : dy;
+        if (dz > max_delta) max_delta = dz;
+        if (max_delta > s_imu_threshold_mg) {
+            post_event(BURN_IDLE_EV_MOTION);
+            memcpy(s_imu_last_posted_mg, samp, sizeof samp);
+            s_imu_last_posted_us = now;
+        }
+    }
+}
+
 static void install_button_isr(void)
 {
     /* Configure the pin ourselves. factory_reset.c also configures it
@@ -203,6 +271,22 @@ void burn_idle_adapter_start(void)
     snapshot_store_register_listener(on_snapshot_push, NULL);
 
     install_button_isr();
+
+    /* Bring up the QMI8658 accel for motion-wake. Failure is
+     * non-fatal — the adapter just loses one of four wake sources.
+     * The other three (push, button, touch) still keep the panel
+     * responsive. */
+    s_imu_threshold_mg = cfg.motion_threshold_mg;
+    if (qmi8658_init()) {
+        BaseType_t imu_ok = xTaskCreate(imu_sampler_task, "burn_idle_imu",
+                                        IMU_TASK_STACK, NULL,
+                                        IMU_TASK_PRIORITY, NULL);
+        if (imu_ok != pdPASS) {
+            ESP_LOGW(TAG, "IMU sampler task spawn failed — motion wake disabled");
+        }
+    } else {
+        ESP_LOGW(TAG, "QMI8658 init failed — motion wake disabled");
+    }
 
     const esp_timer_create_args_t tick_args = {
         .callback        = tick_timer_cb,

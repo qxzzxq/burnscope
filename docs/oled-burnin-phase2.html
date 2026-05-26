@@ -151,8 +151,10 @@
 
 <h1>OLED burn-in mitigation — Phase 2 plan &amp; status</h1>
 <p class="meta-line">
-  Branch: <code>feat/oled-burnin-phase2</code> ·
-  PR-1: <a href="https://github.com/qxzzxq/burnscope/pull/48">#48</a> (open) ·
+  Branches: <code>feat/oled-burnin-phase2</code> (PR-1) →
+  <code>feat/oled-burnin-phase2-imu</code> (PR-2, stacked) ·
+  PR-1: <a href="https://github.com/qxzzxq/burnscope/pull/48">#48</a> ·
+  PR-2: <a href="https://github.com/qxzzxq/burnscope/pull/49">#49</a> ·
   Tracking spec: <a href="fsd/oled-burn-in-mitigation-fsd.md"><code>docs/fsd/oled-burn-in-mitigation-fsd.md</code></a>
 </p>
 
@@ -166,11 +168,14 @@
   </p>
   <p>
     <strong>Current state:</strong>
-    PR-1 (adapter scaffold + push/button/touch wakes) is built, host-tested,
-    hardware-verified on AMOLED-1.43 (2026-05-26), and pushed as
-    <a href="https://github.com/qxzzxq/burnscope/pull/48">PR #48</a> —
-    ready for merge after 3 Copilot review passes. PR-2 (QMI8658 IMU port +
-    motion wake) is up next on a stacked branch.
+    Both PRs are built, host-tested, and hardware-verified on AMOLED-1.43
+    (2026-05-26). PR-1 (adapter scaffold + push/button/touch wakes) is
+    <a href="https://github.com/qxzzxq/burnscope/pull/48">PR #48</a>; PR-2
+    (QMI8658 motion wake on a stacked branch) is
+    <a href="https://github.com/qxzzxq/burnscope/pull/49">PR #49</a>. All
+    five FSD § 8.2 acceptance tests for Phase 2 (DIM-001, DIM-002,
+    WAKE-001..005) have passed; only the 24 h soak (AT-1) is still
+    outstanding.
   </p>
 </div>
 
@@ -222,8 +227,11 @@
     </tr>
     <tr>
       <td>Phase 2 (PR-2) — QMI8658 IMU port + motion wake</td>
-      <td>—</td>
-      <td><span class="status status-planned">◻︎ Planned</span></td>
+      <td><code>firmware/main/displays/amoled_sh8601/qmi8658.{c,h}</code>,
+          IMU sampler task in <code>burn_idle_adapter.c</code></td>
+      <td><span class="status status-done">✅ Done</span>
+          (PR <a href="https://github.com/qxzzxq/burnscope/pull/49">#49</a>,
+          hardware-verified 2026-05-26)</td>
     </tr>
   </tbody>
 </table>
@@ -369,7 +377,7 @@
       <td>Motion (QMI8658 accel)</td>
       <td><code>EV_MOTION</code></td>
       <td>—</td>
-      <td><span class="status status-planned">◻︎ PR-2</span></td>
+      <td><span class="status status-done">✅ PR-2 (#49)</span></td>
     </tr>
   </tbody>
 </table>
@@ -411,11 +419,11 @@
 
 <div class="pr-header">
   <h3>Status</h3>
-  <span class="status status-planned">◻︎ Planned</span>
-  <span class="meta-line">Queued on <code>feat/oled-burnin-phase2</code>, lands after PR-1 is verified on-hardware.</span>
+  <span class="status status-done">✅ Verified on hardware</span>
+  <span class="meta-line">PR <a href="https://github.com/qxzzxq/burnscope/pull/49">#49</a> · branch <code>feat/oled-burnin-phase2-imu</code> (stacked on <code>feat/oled-burnin-phase2</code>) · head <code>f5064b1</code> (2 Copilot review passes + hardware verification 2026-05-26)</span>
 </div>
 
-<h3>Files to add / modify</h3>
+<h3>Files added / modified</h3>
 
 <table>
   <thead>
@@ -427,27 +435,34 @@
       <td>New. Minimal port of
           <code>docs/ESP32-S3-AMOLED-1.43-Demo/03_I2C_QMI8658/components/qmi8658c/</code>.
           Attaches to the I²C0 bus already installed by <code>touch.c</code> in
-          PR-1 (addr 0x6A). Exposes <code>qmi8658_init()</code> and
+          PR-1. Probes <strong>both 0x6A and 0x6B</strong> (this board responds
+          at 0x6B — SA0 wiring differs between revs). Exposes
+          <code>qmi8658_init()</code> and
           <code>qmi8658_read_accel_mg(int16_t out[3])</code>. Accelerometer
-          only — gyro paths in the vendor demo are dropped (FR-1.5). Default
-          ODR <code>Qmi8658AccOdr_LowPower_21Hz</code>, ±2 g range. Vendor
-          attribution preserved (Waveshare + Espressif).</td>
-      <td><span class="status status-planned">◻︎ Planned</span></td>
+          only — gyro paths in the vendor demo are dropped (FR-1.5). ODR
+          <code>Qmi8658AccOdr_LowPower_21Hz</code>, ±2 g range, LPF disabled.
+          Vendor attribution preserved (Waveshare + Espressif).</td>
+      <td><span class="status status-done">✅ Done</span></td>
     </tr>
     <tr>
       <td class="mono">firmware/main/displays/amoled_sh8601/burn_idle_adapter.c</td>
-      <td>Add an IMU sampler — dedicated task at 21 Hz, computes per-axis
-          <code>|new − prev|</code> in mg against the Kconfig
-          <code>MOTION_THRESHOLD_MG</code>, posts <code>EV_MOTION</code> on
-          cross with 200 ms per-event debounce (recompute against the last
-          <em>posted</em> sample, not the previous raw, so a slow drag doesn't
-          fire continuously).</td>
-      <td><span class="status status-planned">◻︎ Planned</span></td>
+      <td>IMU sampler task at ~21 Hz using <code>xTaskDelayUntil</code> (steady
+          cadence anchored to an absolute tick reference). Computes per-axis
+          <code>|new − last_posted|</code> in mg; on cross of
+          <code>MOTION_THRESHOLD_MG</code>, posts <code>EV_MOTION</code> with
+          a 200 ms per-event debounce. Compares against the
+          <em>last-posted</em> sample (not the previous raw) so a slow drag
+          doesn't fire continuously. Baseline is set from the first successful
+          read so the ~1 g gravity vector doesn't trigger a spurious
+          <code>EV_MOTION</code> at startup. Failure of <code>qmi8658_init</code>
+          or the sampler task spawn is non-fatal — the adapter falls back to
+          three wake sources.</td>
+      <td><span class="status status-done">✅ Done</span></td>
     </tr>
     <tr>
       <td class="mono">firmware/main/displays/amoled_sh8601/sources.cmake</td>
-      <td>Add <code>qmi8658.c</code> to the AMOLED profile build.</td>
-      <td><span class="status status-planned">◻︎ Planned</span></td>
+      <td>Added <code>qmi8658.c</code> to the AMOLED profile build.</td>
+      <td><span class="status status-done">✅ Done</span></td>
     </tr>
   </tbody>
 </table>
@@ -462,22 +477,36 @@
     <tr>
       <td>Motion (QMI8658 accel)</td>
       <td><code>EV_MOTION</code></td>
-      <td><span class="status status-planned">◻︎ Planned</span></td>
+      <td><span class="status status-done">✅ Done</span></td>
     </tr>
   </tbody>
 </table>
 
-<h3>Verification (on-target, AMOLED-1.43)</h3>
+<h3>Verification (on-target, AMOLED-1.43) — done 2026-05-26</h3>
 <ul class="check-list">
-  <li class="planned">WAKE-001 — tap the device on the desk while OFF →
-      panel wakes within ~200 ms.</li>
-  <li class="planned">DIM-001 sanity — leaving the device perfectly still for
-      5 min reaches DIMMED (motion detector not falsely triggering).</li>
-  <li class="planned">WAKE-005 — leave on a desk for 5 min with no upstream
-      change; daemon issues no pushes, panel stays OFF.</li>
-  <li class="planned">If false wakes are persistent, raise Kconfig
-      <code>MOTION_THRESHOLD_MG</code> from 50 mg in 10 mg increments and
-      retest. (Risk row 1 of FSD § 5.1.)</li>
+  <li class="done">WAKE-001 — picking the device up from rest while OFF
+      restored the panel within target window.</li>
+  <li class="done">WAKE-005 — device left untouched on a desk for 5 min:
+      Codex daemon issued no pushes (per <code>_anchor_resets_at</code> +
+      <code>semantically_equal</code> dedupe), no spurious motion fires,
+      panel stayed OFF.</li>
+  <li class="done">No retuning needed — default
+      <code>MOTION_THRESHOLD_MG=50</code> distinguishes pick-up motion from
+      desk-rest noise reliably.</li>
+</ul>
+
+<h3>Copilot review passes</h3>
+<ul class="check-list">
+  <li class="done"><strong>Pass 1</strong> (commit <code>02c3833</code>):
+      <code>qmi8658.h</code> doc said the driver probed only 0x6A but the
+      implementation probed both; <code>qmi8658.c</code> conversion comment
+      used unexplained "ssvt" wording. Both reworded.</li>
+  <li class="done"><strong>Pass 2</strong> (commit <code>f5064b1</code>):
+      <code>qmi8658.h</code> said "without aborting the build" for a runtime
+      probe failure (wrong scope — reworded to "non-fatal at runtime");
+      IMU sampler used <code>vTaskDelay</code> which drifts (switched to
+      <code>xTaskDelayUntil</code> for a steady cadence anchored to an
+      absolute tick reference).</li>
 </ul>
 
 <!-- ============================= Out of scope ============================ -->
@@ -522,15 +551,13 @@
     <tr><td>WAKE-002</td><td>Touch wake from OFF.</td><td>PR-1</td><td><span class="status status-done">✅ Done</span></td></tr>
     <tr><td>WAKE-003</td><td>Button wake from OFF.</td><td>PR-1</td><td><span class="status status-done">✅ Done</span></td></tr>
     <tr><td>WAKE-004</td><td>Qualifying push wake from OFF.</td><td>PR-1</td><td><span class="status status-done">✅ Done</span></td></tr>
-    <tr><td>WAKE-001</td><td>Motion wake from OFF.</td><td>PR-2</td><td><span class="status status-planned">◻︎ Planned</span></td></tr>
-    <tr><td>WAKE-005</td><td>Non-qualifying poll does NOT wake (5 min steady).</td><td>PR-2</td><td><span class="status status-planned">◻︎ Planned</span></td></tr>
-    <tr><td>AT-1 (24 h soak)</td><td>Brightness states cycle correctly; no spurious wakes; no leaks.</td><td>After PR-2</td><td><span class="status status-planned">◻︎ Planned</span></td></tr>
+    <tr><td>WAKE-001</td><td>Motion wake from OFF.</td><td>PR-2</td><td><span class="status status-done">✅ Done</span></td></tr>
+    <tr><td>WAKE-005</td><td>Non-qualifying poll does NOT wake (5 min steady).</td><td>PR-2</td><td><span class="status status-done">✅ Done</span></td></tr>
+    <tr><td>AT-1 (24 h soak)</td><td>Brightness states cycle correctly; no spurious wakes; no leaks.</td><td>After PR-2</td><td><span class="status status-pending">⏳ Pending</span></td></tr>
   </tbody>
 </table>
 
 <p class="meta-line">
-  Source plan (private working file):
-  <code>~/.claude/plans/let-s-implement-oled-burn-spicy-acorn.md</code> ·
   Last updated 2026-05-26.
 </p>
 

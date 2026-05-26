@@ -152,6 +152,7 @@
         <li><a href="#host-cache"><code>host_cache.py</code></a> <span class="tag tag-new">new</span></li>
         <li><a href="#discovery"><code>discovery.py</code></a></li>
         <li><a href="#pusher"><code>pusher.py</code></a></li>
+        <li><a href="#ota-pusher"><code>ota_pusher.py</code></a> <span class="tag tag-new">new</span></li>
         <li><a href="#claude-collector"><code>claude_statusline.py</code></a> <span class="tag tag-new">new</span></li>
         <li><a href="#codex-collector"><code>codex_daemon.py</code></a> <span class="tag tag-new">new</span></li>
         <li><a href="#cli"><code>cli.py</code></a></li>
@@ -220,6 +221,7 @@
   <tr><td class="mono">codex_daemon.py</td><td>Long-lived process owning the <code>codex app-server</code> subprocess.</td></tr>
   <tr><td class="mono">identity.py</td><td>Returns Claude's plaintext identifier (<code>oauthAccount.emailAddress</code> from <code>~/.claude.json</code>, or <code>userID</code> fallback) for the <code>X-BurnScope-Client-Id</code> header.</td></tr>
   <tr><td class="mono">host_cache.py</td><td>Atomic file-backed cache of per-agent paired devices and last-push state.</td></tr>
+  <tr><td class="mono">ota_pusher.py</td><td>HTTP client for the firmware's <code>POST /ota</code> endpoint. Streams a <code>.bin</code> image to a paired device with the same <code>X-BurnScope-Client-Id</code> header and 401-vs-other split as <code>pusher.push()</code>. Exposed via the <code>burnscope ota &lt;bin&gt; --device &lt;id&gt;</code> CLI subcommand. The device must have been TOFU-bound by a prior <code>/summary</code> push; <code>/ota</code> never binds.</td></tr>
 </table>
 
 <h4>What's preserved</h4>
@@ -711,6 +713,46 @@ flowchart LR
   decides per device: <code>kind="auth"</code> → drop from paired list;
   <code>kind="transport"</code> → keep, mark per-device failure;
   <code>kind="ok"</code> → record success.
+</p>
+
+<div class="module-header">
+  <h3 id="ota-pusher"><code>ota_pusher.py</code> <span class="tag tag-new">new</span></h3>
+  <span class="path">client/src/burnscope_client/ota_pusher.py</span>
+</div>
+
+<table>
+  <tr><th>Symbol</th><th>Signature</th></tr>
+  <tr>
+    <td class="mono">push_ota</td>
+    <td><code>(image: bytes, host: str, client_id: str, client: httpx.AsyncClient) → dict</code></td>
+  </tr>
+  <tr>
+    <td class="mono">OTA_CONTENT_TYPE</td>
+    <td><code>"application/octet-stream"</code></td>
+  </tr>
+</table>
+
+<p>
+  HTTP client for the firmware's <code>POST /ota</code> endpoint
+  (see <a href="wire-format.md">wire-format § <code>POST /ota</code></a>).
+  Streams a <code>.bin</code> firmware image to a paired device's inactive
+  OTA slot. Auth mirrors <code>pusher.push()</code> exactly — same
+  <code>X-BurnScope-Client-Id</code> header, same 401-vs-other split
+  via the re-exported <code>PushAuthError</code> /
+  <code>PushError</code>. The OTA request runs with a 120 s timeout
+  (multi-MB image at flash speeds plus a ~1 s reboot grace).
+</p>
+
+<p>
+  Unlike <code>POST /summary</code>, <code>POST /ota</code> never
+  TOFU-binds the client to a slot — the device must already have
+  been bound by a prior successful <code>/summary</code> push for
+  the same agent slot. Exposed end-to-end as the
+  <code>burnscope ota &lt;bin&gt; --device &lt;id&gt;</code> CLI
+  subcommand. Only the AMOLED profile enables
+  <code>CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE</code>, so a bad OTA
+  on the AMOLED board can be rolled back automatically; the CYD
+  board has OTA partitions but no rollback safety net.
 </p>
 
 <div class="module-header">

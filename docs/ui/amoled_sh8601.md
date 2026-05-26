@@ -162,7 +162,7 @@ not perceptible at panel-viewing distance.
     .                             .
     .    Waiting for daemon...    .   ← y=233, M24, #F9F2DF
     .                             .
-    .            v0.4.1           .   ← y=410, M14, #808080
+    .            vX.Y.Z           .   ← y=410, M14, #808080 (BURNSCOPE_FW_VERSION at build time)
      .                           .
       .                         .
         .                     .

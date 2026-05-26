@@ -25,9 +25,9 @@
  * 0x6B is necessary in practice. On success, configure Ctrl1
  * (auto-increment for multi-byte reads), Ctrl2 (range + ODR), Ctrl5
  * (LPF disabled), and Ctrl7 (enable accel only). Returns true on
- * full success. Returns false (without aborting the build) on any
- * I²C or signature failure, leaving the adapter free to continue
- * without motion wake.
+ * full success. Returns false (non-fatal at runtime — does not
+ * abort startup) on any I²C or signature failure, leaving the
+ * adapter free to continue without motion wake.
  */
 bool qmi8658_init(void);
 

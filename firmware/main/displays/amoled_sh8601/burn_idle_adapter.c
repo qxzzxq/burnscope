@@ -155,10 +155,17 @@ static int16_t abs_i16(int16_t v) { return v < 0 ? (int16_t)-v : v; }
 static void imu_sampler_task(void *arg)
 {
     (void)arg;
+    /* xTaskDelayUntil keeps the sample cadence anchored to an absolute
+     * tick reference, so the I²C read + threshold work below doesn't
+     * accumulate phase drift across iterations. The motion detector
+     * only cares about deltas (not phase), but the steady cadence also
+     * keeps the average sample rate aligned with the QMI8658's ODR so
+     * we don't quietly fall behind it under load. */
     const TickType_t period = pdMS_TO_TICKS(IMU_SAMPLE_PERIOD_MS);
+    TickType_t last_wake = xTaskGetTickCount();
     int16_t samp[3];
     for (;;) {
-        vTaskDelay(period);
+        xTaskDelayUntil(&last_wake, period);
         if (!qmi8658_read_accel_mg(samp)) {
             continue;
         }

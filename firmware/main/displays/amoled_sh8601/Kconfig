@@ -18,3 +18,60 @@ config BURNSCOPE_AMOLED_DEMO
         markers + centre crosshair) on the AMOLED. Use this to verify
         the SH8601/CO5300 panel driver: SLPOUT/DISPON, RGB565 byte order,
         and the CASET/RASET column/row offsets. Disable for normal builds.
+
+menu "AMOLED burn-in mitigation"
+    depends on BURNSCOPE_DISPLAY_AMOLED_SH8601
+
+    config BURNSCOPE_AMOLED_IDLE_DIM_MINUTES
+        int "Minutes of idle before dimming the panel"
+        default 5
+        range 1 60
+        help
+            After this many minutes with no activity event (motion,
+            touch, button, or qualifying POST /summary push) the
+            burn-in adapter dims the panel from
+            BURNSCOPE_AMOLED_ACTIVE_BRIGHTNESS_PCT down to
+            BURNSCOPE_AMOLED_DIMMED_BRIGHTNESS_PCT. See
+            docs/fsd/oled-burn-in-mitigation-fsd.md § A2.
+
+    config BURNSCOPE_AMOLED_IDLE_OFF_MINUTES
+        int "Minutes of idle before turning the panel off"
+        default 30
+        range 1 240
+        help
+            After this many minutes idle the burn-in adapter issues
+            DISPOFF (MIPI DCS 0x28). The HTTP server keeps running so
+            an incoming push wakes the panel within ~200 ms. Must be
+            >= BURNSCOPE_AMOLED_IDLE_DIM_MINUTES; equal values mean
+            "no dim phase, jump straight to off."
+
+    config BURNSCOPE_AMOLED_ACTIVE_BRIGHTNESS_PCT
+        int "Active-state brightness, % of panel maximum"
+        default 70
+        range 0 100
+        help
+            Brightness used in the ACTIVE state, as a percentage of
+            the SH8601 / CO5300 0x51 register's 8-bit range. The 70 %
+            default matches the catalog's recommended luminance cap.
+
+    config BURNSCOPE_AMOLED_DIMMED_BRIGHTNESS_PCT
+        int "Dimmed-state brightness, % of panel maximum"
+        default 20
+        range 0 100
+        help
+            Brightness used in the DIMMED state. Should be <=
+            BURNSCOPE_AMOLED_ACTIVE_BRIGHTNESS_PCT. Set to 0 to make
+            the dim phase visually identical to off (panel still
+            powered).
+
+    config BURNSCOPE_AMOLED_MOTION_THRESHOLD_MG
+        int "Motion-wake threshold (milli-g)"
+        default 50
+        range 1 2000
+        help
+            Per-sample accelerometer delta-magnitude (mg) that the
+            QMI8658 sampler treats as motion. Consumed by the PR-2
+            IMU adapter; carried in the burn_idle config struct so
+            the SM and adapter share one configuration record.
+
+endmenu

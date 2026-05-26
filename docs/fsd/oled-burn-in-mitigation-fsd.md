@@ -103,9 +103,15 @@ Five concrete problems, each addressed by one of the five mitigations:
   int` per session so the firmware can synthesise its countdown
   during idle without waking on a refresh push.
 - The AMOLED profile dims at 5 min idle and turns off at 30 min idle
-  (defaults; both Kconfig-configurable). Any of accelerometer
-  motion, touch, button, or qualifying `POST /summary` wakes the
-  panel immediately (FR-2.x, FR-3.x).
+  (defaults; both Kconfig-configurable). Direct user interactions
+  (accelerometer motion, touch, button) wake the panel immediately to
+  ACTIVE. A qualifying `POST /summary` is a *soft* wake — from OFF or
+  DIMMED it lifts the panel only to DIMMED, extending the dim-to-off
+  countdown by `(off_after_us − dim_after_us)`; from ACTIVE it
+  refreshes the idle timer without changing state. The rationale is
+  that pushes reflect upstream activity, not direct user attention,
+  so they should not commit the panel to full brightness on their own
+  (FR-2.3, FR-3.x).
 - The UI rotates in 90° steps to follow the device's orientation
   (FR-1.x).
 - No static UI element renders as `#FFFFFF`-grade white or as
@@ -868,7 +874,10 @@ Unchanged. The idle SM starts in `BURN_IDLE_ACTIVE` at boot.
 
 - Idle SM ticks at 1 Hz; transitions to Dimmed at 5 min, Off at
   30 min (defaults).
-- Any of motion, touch, button, or qualifying push wakes the panel.
+- Direct user interactions (motion, touch, button) lift the panel
+  to ACTIVE. A qualifying push *soft-wakes* the panel — from OFF or
+  DIMMED it lands in DIMMED only; from ACTIVE it refreshes the idle
+  timer without changing state (FR-2.3).
 - Codex daemon polls `account/rateLimits/read` every 60 s and
   pushes only when the result differs from `_last_pushed_snapshot`.
   Steady state with no token usage = zero pushes, panel can sleep.
@@ -1094,8 +1103,11 @@ t=60 s    EV_TIME                   → ACTIVE, br=70, panel=on, changed=0
 t=5 min   EV_TIME                   → DIMMED, br=20, panel=on, changed=1
 t=10 min  EV_TIME                   → DIMMED, br=20, panel=on, changed=0
 t=30 min  EV_TIME                   → OFF,    br=0,  panel=off, changed=1
-t=30:05   EV_PUSH                   → ACTIVE, br=70, panel=on, changed=1
-t=30:06   EV_TIME                   → ACTIVE, br=70, panel=on, changed=0
+t=30:05   EV_PUSH                   → DIMMED, br=20, panel=on, changed=1
+                                      (soft-wake: last_activity_us = t=30:05 − 5 min = t=25:05)
+t=30:06   EV_TIME                   → DIMMED, br=20, panel=on, changed=0
+t=55:05   EV_TIME                   → OFF,    br=0,  panel=off, changed=1
+                                      (= last_activity_us + off_after_us = t=25:05 + 30 min)
 ```
 
 `burn_idle_init` returns `void` — it records `{ACTIVE, br=70, panel=on}`

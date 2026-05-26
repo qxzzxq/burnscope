@@ -119,6 +119,59 @@ succeeds. Mismatches return `401 Unauthorized`.
 
 ---
 
+## `POST /ota`
+
+Operator → ESP32. Pushes a new firmware image to the device's
+inactive OTA slot, sets it as the next boot partition, and reboots
+into it. Both partition layouts reserve two `ota_X` app slots, but
+the slot size differs by target: 5 MB on the AMOLED 16 MB layout,
+1.875 MB on the CYD 4 MB layout. Images larger than the inactive
+slot are rejected with `413 Content Too Large`. Note that only the
+AMOLED profile sets `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` in its
+sdkconfig defaults — `/ota` works on the CYD, but the rollback
+safety net described below does not arm there.
+
+**Request body:** the raw `burnscope.bin` image — no JSON
+envelope, no length prefix. Content-Length is required so the
+firmware can pre-size the OTA write and reject pathologically
+large uploads up front.
+
+### Headers
+
+| Header                  | Value                                | Notes |
+|-------------------------|--------------------------------------|-------|
+| `X-BurnScope-Client-Id` | The plaintext identifier (no hashing) | Must match an **already populated** slot. Unlike `/summary`, `/ota` never TOFU-binds a slot — a freshly-booted unpaired device returns 401. |
+| `Content-Type`          | `application/octet-stream`           | |
+| `Content-Length`        | Image byte count                     | Required. Negative / missing / zero returns 400. |
+
+### Responses
+
+| Status                  | Body | Notes |
+|-------------------------|------|-------|
+| `202 Accepted`          | `{"status":"flashing","bytes":N,"next_boot":"ota_X"}` | Image was written, sealed, and committed as the next boot partition. Device reboots ~1 s after the response flushes. |
+| `400 Bad Request`       | text/plain | Content-Length missing or ≤0; or `esp_ota_write` / `esp_ota_end` rejected the image (bad magic byte, sha256 mismatch, header invalid). |
+| `401 Unauthorized`      | `{"error":"…"}` | Device is not paired yet, header is absent / oversized, or client_id matches no populated slot. |
+| `409 Conflict`          | `{"error":"another OTA already in progress"}` | A concurrent upload is mid-stream. Retry after a few seconds. |
+| `413 Content Too Large` | text/plain | Either > 6 MB body cap or larger than the inactive OTA slot (5 MB on the AMOLED 16 MB layout, 1.875 MB on the CYD 4 MB layout). |
+
+### Rollback safety
+
+When `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y` is in the bootloader
+build (the AMOLED profile turns this on by default), a newly-flashed
+image boots in `ESP_OTA_IMG_PENDING_VERIFY` state. The firmware
+calls `esp_ota_mark_app_valid_cancel_rollback()` once the first
+authorized `/summary` push succeeds end-to-end — strongest evidence
+that radio + HTTP + parser + snapshot store are all healthy. An
+image that boots but never reaches that point is rolled back to the
+previous slot on the next reboot, so a bad OTA can't brick the device.
+
+The verification trigger is intentionally `/summary` rather than
+`/health` or `/ota` itself: `/summary` is the only path that
+exercises the agent-pairing match, the snapshot parser, and the
+display pipeline together.
+
+---
+
 ## mDNS advertisement
 
 The firmware advertises one service on the LAN:

@@ -7,6 +7,7 @@ set(srcs
     "watchdog.c"
     "nvs_store.c"
     "snapshot.c"
+    "storage.c"
     "burn_protection/burn_idle.c"
     "factory_reset.c"
     "provisioning.c"
@@ -45,4 +46,8 @@ idf_component_register(
         esp_lvgl_port lvgl__lvgl espressif__mdns
         # FreeRTOS primitives + GPIO + watchdog APIs.
         driver esp_system freertos
+        # OTA + filesystem. `app_update` provides esp_ota_*; the
+        # joltwallet/littlefs managed component mounts the `storage`
+        # partition declared in partitions-16mb.csv.
+        app_update joltwallet__littlefs
 )

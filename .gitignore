@@ -57,3 +57,4 @@ local.toml
 local.yaml
 *.code-workspace
 *Demo
+build*/

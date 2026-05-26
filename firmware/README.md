@@ -20,13 +20,20 @@ provisioning + snapshot rendering — corresponds to FSD § 3.2.
 ## Build, flash, monitor
 
 ```sh
-idf.py set-target esp32        # CYD (cyd2usb) — default
-# or
-idf.py set-target esp32s3      # Waveshare AMOLED-1.43
+. ~/.espressif/v6.0.1/esp-idf/export.sh   # once per shell
+cd firmware                                # all commands below run from here
 
-idf.py build
-idf.py -p <PORT> flash monitor
+idf.py set-target esp32                    # CYD (cyd2usb) — default
+# or
+idf.py set-target esp32s3                  # Waveshare AMOLED-1.43
+
+idf.py -p <PORT> flash monitor             # builds, writes, then tails serial
 ```
+
+`idf.py flash` auto-builds, so a separate `idf.py build` step isn't
+needed. The AMOLED's USB CDC port typically shows up as
+`/dev/cu.usbmodemNNNN` on macOS; the CYD shows up as
+`/dev/cu.usbserial-XXXX` (CH340).
 
 The target chip drives the default display profile via the
 `sdkconfig.defaults.<target>` overlay (esp32 → cyd2usb_st7789;

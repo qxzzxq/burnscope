@@ -9,3 +9,10 @@ dependencies:
   # Used by the amoled_sh8601 profile only — pulled in unconditionally so
   # the manifest stays simple; harmless when the cyd2usb profile is active.
   espressif/esp_lcd_sh8601: "^2.0"
+  # LittleFS — mounts the `storage` partition declared in
+  # partitions-16mb.csv. Currently used as the substrate for the
+  # future pixel-aging map; the volume comes up at boot whether
+  # there's a writer or not, so persistence is a drop-in away. Only
+  # the AMOLED profile reserves a storage partition; on the CYD
+  # (4 MB layout) the mount call no-ops.
+  joltwallet/littlefs: "^1.20"

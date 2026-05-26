@@ -7,11 +7,24 @@
 #   idf.py set-target esp32s3
 #   idf.py menuconfig  → BurnScope display → Waveshare AMOLED-1.43
 
-# Waveshare AMOLED-1.43 has 8 MB of flash and 8 MB Octal PSRAM.
+# Waveshare AMOLED-1.43 ships a 16 MB Winbond flash + 8 MB Octal PSRAM.
+# We use the full 16 MB: 5 MB per OTA slot (3.3× current app, leaves
+# room to grow without another flash-size migration) plus a ~5.8 MB
+# LittleFS storage volume for the pixel-aging map and future assets.
+# NVS / otadata / phy_init offsets are unchanged from partitions-8mb.csv
+# so the TOFU pairing slot survives the layout migration without a
+# `erase-flash`.
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=
-CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
-CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions-8mb.csv"
-CONFIG_PARTITION_TABLE_FILENAME="partitions-8mb.csv"
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions-16mb.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions-16mb.csv"
+
+# Bootloader-driven rollback so a failed OTA can't brick the device.
+# Pairs with `esp_ota_mark_app_valid_cancel_rollback()` called from
+# the firmware after its first healthy /summary push — anything that
+# boots but never proves itself is reverted on the next reboot.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 
 # Enable PSRAM (Octal SPI). The AMOLED profile uses a stripe-buffered
 # LVGL pipeline so PSRAM is not strictly required for the framebuffer,

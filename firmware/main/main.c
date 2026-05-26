@@ -19,6 +19,7 @@
 #include "nvs_store.h"
 #include "provisioning.h"
 #include "snapshot.h"
+#include "storage.h"
 #include "version.h"
 #include "watchdog.h"
 #include "wifi.h"
@@ -152,6 +153,11 @@ void app_main(void)
 #endif
 
     init_nvs();
+    /* Mount the LittleFS `storage` volume. Best-effort: the CYD layout
+     * has no such partition (returns ESP_ERR_NOT_FOUND) and we boot
+     * fine without it — no current feature has the filesystem on its
+     * critical path. */
+    (void)storage_mount();
     display_profile_init();
     display_profile_show_status("Booting...");
 

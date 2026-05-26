@@ -4,7 +4,7 @@
 ([wiki](https://www.waveshare.com/wiki/ESP32-S3-Touch-AMOLED-1.43)).
 466×466 round AMOLED, SH8601 *or* CO5300 over QSPI (Waveshare
 dual-sources the panel; both speak the same protocol), CST820 over I2C
-(touch **unused** in MVP), ESP32-S3 with 8 MB PSRAM + 8 MB flash.
+(touch **unused** in MVP), ESP32-S3 with 8 MB Octal PSRAM + 16 MB flash.
 LVGL 9.x — same as the existing cyd2usb profile.
 
 **Design concept.** Concentric-arc dial with a stacked core. Each

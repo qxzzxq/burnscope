@@ -94,7 +94,9 @@ under `main/displays/<name>/`. The active profile is chosen via Kconfig
 | `CONFIG_BURNSCOPE_DISPLAY_AMOLED_SH8601`  | esp32s3     | `main/displays/amoled_sh8601/`     |
 
 The AMOLED profile targets the Waveshare ESP32-S3-Touch-AMOLED-1.43
-(466×466 round AMOLED via QSPI; no touch wired in MVP). The board
+(466×466 round AMOLED via QSPI; FT3168 capacitive touch wired as a
+wake source for the OLED burn-in idle state machine — polled via an
+LVGL pointer indev, no INT line on this board). The board
 ships with either an SH8601 or a CO5300 driver IC — same QSPI
 protocol — and we link against Espressif's `esp_lcd_sh8601` managed
 component, hence the profile name. It shares the wire format and

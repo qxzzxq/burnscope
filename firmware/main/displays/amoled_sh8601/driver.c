@@ -10,7 +10,8 @@
  * Pin assignments verified against the Waveshare 1.43 schematic
  * (GPIO/AMOLED column): see #define block below.
  *
- * Touch: CST820 (I2C on IO47/IO48) — NOT used in MVP.
+ * Touch: FT3168 (I²C on IO47/IO48), polled — see touch.c. Wired as
+ * a burn-in wake source via the LVGL indev callback in ui.c.
  */
 
 #include "driver.h"

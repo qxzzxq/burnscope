@@ -179,9 +179,9 @@ client:
 |--------------------------------|-----------------------------------------------|------|
 | **Idle state machine**         | `firmware/main/burn_protection/burn_idle.{h,c}` | Pure-logic SM. Inputs: events + monotonic time. Outputs: `{state, brightness_pct, panel_on, changed}`. Zero ESP-IDF deps. |
 | **AMOLED idle adapter**        | `firmware/main/displays/amoled_sh8601/burn_idle_adapter.c` | Wires IMU sampling, touch IRQ, button IRQ, `POST /summary` callback, and a 1 Hz `esp_timer` into the SM; applies SM outputs to the SH8601 driver. |
-| **Orientation detector**       | `firmware/main/displays/amoled_sh8601/orientation.c` | Reads accelerometer gravity vector, picks quadrant with hysteresis + debounce, drives `lv_disp_set_rotation`. |
+| **Orientation detector** *(Phase 3 — not yet shipped)* | `firmware/main/displays/amoled_sh8601/orientation.c` | Reads accelerometer gravity vector, picks quadrant with hysteresis + debounce, drives `lv_disp_set_rotation`. |
 | **Codex active poll + dedupe** | `client/src/burnscope_client/codex_daemon.py` (modified) + `client/src/burnscope_client/schema.py` (helper) | `AgentSnapshot.semantically_equal(other)` plus a new `_poll_loop` that calls `account/rateLimits/read` every `POLL_INTERVAL_S` and only enqueues when the result differs from `_last_pushed_snapshot`. |
-| **Palette validator**          | `firmware/main/displays/amoled_sh8601/palette_check.c` (or CMake-time script) | Static check that all colour tokens used by the AMOLED UI satisfy A4. |
+| **Palette validator** *(Phase 4 — not yet shipped)* | `firmware/main/displays/amoled_sh8601/palette_check.c` (or CMake-time script) | Static check that all colour tokens used by the AMOLED UI satisfy A4. |
 
 ### 2.2 Hardware / Platform Architecture
 
@@ -208,10 +208,12 @@ firmware/main/
 │       └── CMakeLists.txt     # host-only target
 └── displays/amoled_sh8601/
     ├── driver.c               # existing — SH8601 bring-up
-    ├── ui.c                   # existing — LVGL layout
-    ├── orientation.c          # NEW — accel → quadrant → lv_disp_set_rotation
-    ├── burn_idle_adapter.c    # NEW — events + outputs ↔ hardware
-    └── palette_check.c        # NEW (or build-time .py) — token validator
+    ├── ui.c                   # existing — LVGL layout (now also hosts the touch indev callback)
+    ├── touch.c                # SHIPPED (Phase 2 PR-1) — polled FT3168 reader for the LVGL indev
+    ├── qmi8658.c              # SHIPPED (Phase 2 PR-2) — accel-only QMI8658 driver (motion wake)
+    ├── burn_idle_adapter.c    # SHIPPED (Phase 2 PR-1 + PR-2) — events + outputs ↔ hardware
+    ├── orientation.c          # PLANNED (Phase 3) — accel → quadrant → lv_disp_set_rotation
+    └── palette_check.c        # PLANNED (Phase 4) — token validator (or build-time .py)
 
 client/src/burnscope_client/
 ├── schema.py                  # +AgentSnapshot.semantically_equal()
@@ -587,9 +589,14 @@ no-push rate when usage is unchanged.
 - **A-1** The QMI8658 is wired on the AMOLED-1.43 board exactly as
   shown in the Waveshare `03_I2C_QMI8658` reference demo. The
   driver in that demo is directly reusable.
-- **A-2** The capacitive-touch controller IRQ is wired to a GPIO
-  with INTR capability and is supported by the ESP-IDF GPIO ISR
-  service.
+- **A-2** The capacitive-touch controller (FT3168 on the Waveshare
+  1.43" board) has **no INT line** routed to the ESP32-S3 — the
+  vendor schematic ties it to `-1`. Touch is therefore polled via
+  an LVGL pointer input device whose read callback also notifies
+  the burn-in adapter on a rising-edge press. The constraint is
+  that LVGL's input timer keeps ticking while the panel is in
+  `BURN_IDLE_OFF` (confirmed during bring-up — LVGL's timer is
+  independent of panel state). See FR-3.2 / C-2.
 - **A-3** A board-level pushbutton exists and can drive a GPIO IRQ.
   If the only available button is the BOOT button (already used
   for factory reset in `factory_reset.c`), the adapter shall share
@@ -706,13 +713,13 @@ HTTP semantics, error codes, and response body are inherited from
 |-------------------------------------|-------|
 | QMI8658 init                        | Follows Waveshare demo. Sets accel ODR to `LowPower_21Hz`, ±2 g range. |
 | QMI8658 accel sample (3× int16)     | Polled at ~21 Hz from a FreeRTOS task; converted to mg. |
-| Touch IRQ                           | Edge-triggered GPIO interrupt; ISR dispatches to a task that emits `EV_TOUCH`. |
+| FT3168 touch poll (I²C, 0x38)       | Polled via an LVGL pointer input device (no INT line on this board). On a rising-edge press the indev read callback calls `burn_idle_adapter_notify_touch()`, which posts `EV_TOUCH`. |
 
 #### 6.1.3 GPIO (Button)
 
 | Pin                              | Notes |
 |----------------------------------|-------|
-| Onboard button (board-specific)  | Falling-edge interrupt → task → `EV_BUTTON`. |
+| Onboard button (GPIO 0 / BOOT)   | Negedge ISR posts `EV_BUTTON` directly to the adapter's FreeRTOS event queue, with a 100 ms in-ISR debounce against `esp_timer_get_time()`. Coexists with `factory_reset.c`'s polling on the same pin. |
 
 ### 6.2 Internal Interfaces
 
@@ -964,9 +971,9 @@ Unchanged. The idle SM starts in `BURN_IDLE_ACTIVE` at boot.
 | 2026-05-26 | `9687070` (PR #48)   | AMOLED-1.43  | WAKE-002 | ✅     | Tap from OFF → wake within target window. Held finger does not re-post (rising-edge detection in `ui.c` indev callback). |
 | 2026-05-26 | `9687070` (PR #48)   | AMOLED-1.43  | WAKE-003 | ✅     | Short BOOT button press from OFF → wake. GPIO 0 ISR coexists with `factory_reset.c` polling on the same pin. |
 | 2026-05-26 | `9687070` (PR #48)   | AMOLED-1.43  | WAKE-004 | ✅     | Real `POST /summary` arrival while in OFF wakes the panel; verified during a live Claude Code statusline / Codex daemon push cycle. |
-| —          | —                    | —            | WAKE-001 | ⏳     | Motion wake — implemented in PR-2 (not yet shipped). |
-| —          | —                    | —            | WAKE-005 | ⏳     | "Non-qualifying poll does not wake" — depends on PR-2 sitting alongside the existing Codex dedupe to confirm a 5 min steady state stays in OFF. |
-| —          | —                    | —            | AT-1     | ⏳     | 24 h soak — pending after PR-2 lands. |
+| 2026-05-26 | `1b4f9c7` (PR #49)   | AMOLED-1.43  | WAKE-001 | ✅     | Motion wake — picking the device up from rest while OFF restored the panel within target window. The QMI8658 driver probes both 0x6A and 0x6B; this board responded at 0x6B. |
+| 2026-05-26 | `1b4f9c7` (PR #49)   | AMOLED-1.43  | WAKE-005 | ✅     | Device left untouched on a desk for 5 min with no upstream change: Codex daemon issued no pushes (per `_anchor_resets_at` + `semantically_equal` dedupe), no spurious motion fires, panel stayed in OFF. |
+| —          | —                    | —            | AT-1     | ⏳     | 24 h soak — pending. |
 
 ### 8.7 Traceability Matrix
 
@@ -978,30 +985,30 @@ Unchanged. The idle SM starts in `BURN_IDLE_ACTIVE` at boot.
 | FR-1.4      | Must     | IMU-ROT-003                                           | Planned |
 | FR-1.5      | Should   | Code inspection during IMU-ROT-001                    | Planned |
 | FR-1.6      | May      | IMU-ROT-004                                           | Planned |
-| FR-2.1      | Must     | SM-070, SM-071, AT-2                                  | Planned |
-| FR-2.2      | Must     | SM-001, SM-002, SM-003                                | Planned |
-| FR-2.3      | Must     | SM-010, SM-011, SM-012, SM-013, SM-014                | Planned |
-| FR-2.4      | Must     | SM-002, SM-003, SM-041                                | Planned |
-| FR-2.5      | Must     | SM-030, SM-031                                        | Planned |
-| FR-2.6      | Must     | SM-020, SM-021                                        | Planned |
-| FR-2.7      | Should   | SM-001                                                | Planned |
-| FR-3.1      | Must     | WAKE-001, DIM-001 (motion path absence keeps idle)    | Planned |
-| FR-3.2      | Must     | WAKE-002                                              | Planned |
-| FR-3.3      | Must     | WAKE-003                                              | Planned |
-| FR-3.4      | Must     | WAKE-004                                              | Planned |
-| FR-3.5      | Must     | DIM-001, DIM-002                                      | Planned |
-| FR-3.6      | Must     | WAKE-001, DIM-002                                     | Planned |
-| FR-3.7      | Must     | WAKE-004, AT-3 (HTTP keeps running)                   | Planned |
-| FR-3.8      | Should   | Build-config inspection during DIM-001                | Planned |
-| FR-4.1      | Must     | DEDUPE-001                                            | Planned |
-| FR-4.2      | Must     | POLL-001, POLL-002, POLL-003                          | Planned |
-| FR-4.3      | Must     | DEDUPE-002, DEDUPE-003                                | Planned |
-| FR-4.4      | Must     | DEDUPE-003 (byte-exact, no tolerance)                 | Planned |
-| FR-4.5      | Must     | DEDUPE-004, DEDUPE-005                                | Planned |
-| FR-4.6      | Must     | DEDUPE-006                                            | Planned |
-| FR-4.7      | Should   | POLL-001 (cadence patchable via constant)             | Planned |
-| FR-4.8      | Should   | Code inspection — `_dispatch` notification path retained | Planned |
-| FR-4.9      | May     | DEDUPE-007 (helper is agent-agnostic)                 | Planned |
+| FR-2.1      | Must     | SM-070, SM-071, AT-2                                  | Verified (host tests, commit `e163ecf`) |
+| FR-2.2      | Must     | SM-001, SM-002, SM-003                                | Verified (host tests, commit `e163ecf`) |
+| FR-2.3      | Must     | SM-010, SM-011, SM-012, SM-013, SM-014                | Verified (host tests, commit `e163ecf`) |
+| FR-2.4      | Must     | SM-002, SM-003, SM-041                                | Verified (host tests, commit `e163ecf`) |
+| FR-2.5      | Must     | SM-030, SM-031                                        | Verified (host tests, commit `e163ecf`) |
+| FR-2.6      | Must     | SM-020, SM-021                                        | Verified (host tests, commit `e163ecf`) |
+| FR-2.7      | Should   | SM-001                                                | Verified (host tests, commit `e163ecf`) |
+| FR-3.1      | Must     | WAKE-001, DIM-001 (motion path absence keeps idle)    | Verified (WAKE-001 on `1b4f9c7`, DIM-001 on `9687070`) |
+| FR-3.2      | Must     | WAKE-002                                              | Verified (`9687070`) |
+| FR-3.3      | Must     | WAKE-003                                              | Verified (`9687070`) |
+| FR-3.4      | Must     | WAKE-004                                              | Verified (`9687070`) |
+| FR-3.5      | Must     | DIM-001, DIM-002                                      | Verified (`9687070`) |
+| FR-3.6      | Must     | WAKE-001, DIM-002                                     | Verified (motion path on `1b4f9c7`, off-transition on `9687070`) |
+| FR-3.7      | Must     | WAKE-004, AT-3 (HTTP keeps running)                   | Verified end-to-end via WAKE-004 (`9687070`); AT-3 pending soak |
+| FR-3.8      | Should   | Build-config inspection during DIM-001                | Verified (Kconfig defaults reachable via `idf.py menuconfig`) |
+| FR-4.1      | Must     | DEDUPE-001                                            | Verified (commits `9a5a443`, `b7b2492`, PRs #41 + #46) |
+| FR-4.2      | Must     | POLL-001, POLL-002, POLL-003                          | Verified (`b7b2492`) |
+| FR-4.3      | Must     | DEDUPE-002, DEDUPE-003                                | Verified (`b7b2492`) |
+| FR-4.4      | Must     | DEDUPE-003 (byte-exact, no tolerance)                 | Verified (`semantically_equal`, `b7b2492`) |
+| FR-4.5      | Must     | DEDUPE-004, DEDUPE-005                                | Verified (`_anchor_resets_at`, `b7b2492`) |
+| FR-4.6      | Must     | DEDUPE-006                                            | Verified (`b7b2492`) |
+| FR-4.7      | Should   | POLL-001 (cadence patchable via constant)             | Verified (POLL_INTERVAL_S constant in `codex_daemon.py`) |
+| FR-4.8      | Should   | Code inspection — `_dispatch` notification path retained | Verified (`b7b2492`) |
+| FR-4.9      | May     | DEDUPE-007 (helper is agent-agnostic)                 | Verified (`semantically_equal` lives in `schema.py`, agent-agnostic) |
 | FR-5.1      | Must     | PALETTE-001, PALETTE-003                              | Planned |
 | FR-5.2      | Must     | PALETTE-002, PALETTE-004                              | Planned |
 | FR-5.3      | Should   | PALETTE-001 (build fail proves enforcement)           | Planned |
@@ -1010,13 +1017,13 @@ Unchanged. The idle SM starts in `BURN_IDLE_ACTIVE` at boot.
 | FR-6.3      | Should   | AA-003                                                | Planned |
 | NFR-1.1     | Must     | SM-002 with cycle-count instrumentation (host or target) | Planned |
 | NFR-1.2     | Should   | CPU profiler measurement during AT-1                  | Planned |
-| NFR-2.1     | Must     | WAKE-001 / WAKE-004 with stopwatch / oscilloscope     | Planned |
-| NFR-2.2     | Should   | Visual inspection during DIM-001/DIM-002              | Planned |
-| NFR-3.1     | Must     | AT-3                                                  | Planned |
+| NFR-2.1     | Must     | WAKE-001 / WAKE-004 with stopwatch / oscilloscope     | Verified qualitatively (`1b4f9c7` / `9687070`); stopwatch/scope measurement pending |
+| NFR-2.2     | Should   | Visual inspection during DIM-001/DIM-002              | Verified (`9687070`) |
+| NFR-3.1     | Must     | AT-3                                                  | Planned (AT-3 soak still pending) |
 | NFR-3.2     | Should   | Microbenchmark during DEDUPE-007                      | Planned |
-| NFR-4.1     | Must     | SM-071                                                | Planned |
+| NFR-4.1     | Must     | SM-071                                                | Verified (host purity check, commit `e163ecf`) |
 | NFR-5.1     | Should   | Coverage report from SM-* host tests                  | Planned |
-| NFR-6.1     | Should   | AT-2                                                  | Planned |
+| NFR-6.1     | Should   | AT-2                                                  | Verified (host harness builds `burn_idle.c` without profile-specific changes, `e163ecf`) |
 
 ---
 

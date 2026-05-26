@@ -580,8 +580,9 @@ no-push rate when usage is unchanged.
   ~30 Hz between the panel's current 0x51 value and the SM's
   target, driven by a dedicated `esp_timer` that only runs while a
   ramp is in flight. Ramp durations are split by direction so a
-  wake feels responsive (`WAKE_FADE_MS`, default 300 ms) while a
-  dim feels gentle (`SLEEP_FADE_MS`, default 1500 ms). The fade
+  wake feels responsive (`BURNSCOPE_AMOLED_WAKE_FADE_MS`, default
+  300 ms) while a dim feels gentle
+  (`BURNSCOPE_AMOLED_SLEEP_FADE_MS`, default 1500 ms). The fade
   lives entirely in the adapter; the SM remains pure and emits
   step targets only.
 - **NFR-3.1** [Must]: In steady-state operation where upstream
@@ -976,10 +977,10 @@ Unchanged. The idle SM starts in `BURN_IDLE_ACTIVE` at boot.
 |------------|----------------------------------|---------------------------------------------------------------------------|------------------|
 | DIM-001    | Dim at 5 min                     | Set defaults; leave device untouched; observe.                            | Brightness drops to 20 % at 5 min ± 5 s. |
 | DIM-002    | Off at 30 min                    | Continue from DIM-001.                                                    | Panel goes dark at 30 min ± 5 s. |
-| WAKE-001   | Motion wake                      | Tap / lift device while OFF.                                              | Panel begins ramping toward 70 % within 200 ms and reaches it after the configured `WAKE_FADE_MS` (default 300 ms → fully bright by ~500 ms total). |
-| WAKE-002   | Touch wake                       | Tap screen while OFF.                                                     | Same fade profile as WAKE-001 — ramp begins within 200 ms, completes after `WAKE_FADE_MS`. |
-| WAKE-003   | Button wake                      | Press button while OFF.                                                   | Same fade profile as WAKE-001 — ramp begins within 200 ms, completes after `WAKE_FADE_MS`. |
-| WAKE-004   | Qualifying push soft-wake        | While OFF, run a Codex prompt that burns ≥ 1 % of a window.               | Within ≤ 60 s of activity, push fires and the panel begins ramping toward `dimmed_brightness_pct` within 200 ms of the push, reaching it after `WAKE_FADE_MS`. State remains DIMMED until a direct interaction (motion / touch / button) lifts to ACTIVE, or `(off_after_us − dim_after_us)` of silence falls back to OFF. |
+| WAKE-001   | Motion wake                      | Tap / lift device while OFF.                                              | Panel begins ramping toward 70 % within 200 ms and reaches it after the configured `BURNSCOPE_AMOLED_WAKE_FADE_MS` (default 300 ms → fully bright by ~500 ms total). |
+| WAKE-002   | Touch wake                       | Tap screen while OFF.                                                     | Same fade profile as WAKE-001 — ramp begins within 200 ms, completes after `BURNSCOPE_AMOLED_WAKE_FADE_MS`. |
+| WAKE-003   | Button wake                      | Press button while OFF.                                                   | Same fade profile as WAKE-001 — ramp begins within 200 ms, completes after `BURNSCOPE_AMOLED_WAKE_FADE_MS`. |
+| WAKE-004   | Qualifying push soft-wake        | While OFF, run a Codex prompt that burns ≥ 1 % of a window.               | Within ≤ 60 s of activity, push fires and the panel begins ramping toward `dimmed_brightness_pct` within 200 ms of the push, reaching it after `BURNSCOPE_AMOLED_WAKE_FADE_MS`. State remains DIMMED until a direct interaction (motion / touch / button) lifts to ACTIVE, or `(off_after_us − dim_after_us)` of silence falls back to OFF. |
 | FADE-001   | Mid-fade preemption              | Let the panel begin a dim-down (ACTIVE → DIMMED at the 5-min mark); within the first second of the fade, press the button. | The brightness ramp reverses direction smoothly from the in-flight value back up to `active_brightness_pct` — no visible jump back to full first. |
 | WAKE-005   | Non-qualifying poll does NOT wake| While OFF, leave upstream untouched for 5 min.                            | Codex daemon issues no pushes; panel stays OFF. |
 | POLL-001   | Poll fires on cadence             | Run daemon with `BURNSCOPE_LOG_LEVEL=DEBUG`; tail the log for 70 s with no upstream activity. | At least one "codex poll: rate limits unchanged; skipping push" debug line in the window. |

@@ -229,8 +229,10 @@ transitions). The original design called for an instant snap on
 wake; the fade was added later in the AMOLED adapter because it
 reads visibly smoother on hardware without compromising
 responsiveness — the leading edge of the ramp is still in the
-≤ 200 ms wake-latency budget (NFR-2.1). Set the Kconfig duration
-to 0 for the legacy instant behaviour.
+≤ 200 ms wake-latency budget (NFR-2.1). The two durations are
+independent Kconfig knobs: set `BURNSCOPE_AMOLED_WAKE_FADE_MS=0`
+for instant wake-ups, `BURNSCOPE_AMOLED_SLEEP_FADE_MS=0` for
+instant dim/off, or both to 0 for fully legacy snap behaviour.
 
 #### Client side: active poll + dedupe in the Codex daemon
 

@@ -957,8 +957,16 @@ Unchanged. The idle SM starts in `BURN_IDLE_ACTIVE` at boot.
 
 ### 8.6 Live Verification Log
 
-(To be populated on first AMOLED bring-up. Use the same ✅ / ⏳ / ❌
-convention as `docs/fsd/firmware-fsd.md` § 8.4.)
+| Date       | Build                | Board        | Test     | Result | Notes |
+|------------|----------------------|--------------|----------|--------|-------|
+| 2026-05-26 | `9687070` (PR #48)   | AMOLED-1.43  | DIM-001  | ✅     | Compressed thresholds (`IDLE_DIM_MINUTES=1`); panel dropped from 70 % to 20 % at ~1 min idle. |
+| 2026-05-26 | `9687070` (PR #48)   | AMOLED-1.43  | DIM-002  | ✅     | Compressed thresholds (`IDLE_OFF_MINUTES=2`); panel turned off at ~2 min idle. |
+| 2026-05-26 | `9687070` (PR #48)   | AMOLED-1.43  | WAKE-002 | ✅     | Tap from OFF → wake within target window. Held finger does not re-post (rising-edge detection in `ui.c` indev callback). |
+| 2026-05-26 | `9687070` (PR #48)   | AMOLED-1.43  | WAKE-003 | ✅     | Short BOOT button press from OFF → wake. GPIO 0 ISR coexists with `factory_reset.c` polling on the same pin. |
+| 2026-05-26 | `9687070` (PR #48)   | AMOLED-1.43  | WAKE-004 | ✅     | Real `POST /summary` arrival while in OFF wakes the panel; verified during a live Claude Code statusline / Codex daemon push cycle. |
+| —          | —                    | —            | WAKE-001 | ⏳     | Motion wake — implemented in PR-2 (not yet shipped). |
+| —          | —                    | —            | WAKE-005 | ⏳     | "Non-qualifying poll does not wake" — depends on PR-2 sitting alongside the existing Codex dedupe to confirm a 5 min steady state stays in OFF. |
+| —          | —                    | —            | AT-1     | ⏳     | 24 h soak — pending after PR-2 lands. |
 
 ### 8.7 Traceability Matrix
 

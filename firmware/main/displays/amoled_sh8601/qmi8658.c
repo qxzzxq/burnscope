@@ -123,8 +123,10 @@ bool qmi8658_read_accel_mg(int16_t out[3])
     if (read_regs(REG_ACCEL_DATA_START, buf, sizeof buf) != ESP_OK) {
         return false;
     }
-    /* int16_t LSB-first per Ctrl1=0x60. Cast intermediate via int32 to
-     * avoid the (raw * 1000) overflow on the 16384 ssvt division. */
+    /* int16_t LSB-first per Ctrl1=0x60. Cast the intermediate to
+     * int32 because `raw * 1000` (range ±2,000,000) overflows int16
+     * before the divide by ACCEL_LSB_PER_G (16384 LSB/g sensitivity)
+     * brings it back into the mg range. */
     for (int axis = 0; axis < 3; ++axis) {
         const int16_t raw = (int16_t)((uint16_t)buf[axis * 2] |
                                       ((uint16_t)buf[axis * 2 + 1] << 8));

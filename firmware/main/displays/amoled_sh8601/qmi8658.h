@@ -19,12 +19,15 @@
  */
 
 /**
- * Probe the WHO_AM_I register at I²C address 0x6A; expect 0x05. On
- * success, configure Ctrl1 (auto-increment for multi-byte reads),
- * Ctrl2 (range + ODR), and Ctrl7 (enable accel only). Returns true on
- * full success. Returns false (without aborting the build) on any I²C
- * or signature failure, leaving the adapter free to continue without
- * motion wake.
+ * Probe the WHO_AM_I register at both candidate I²C addresses (0x6A
+ * and 0x6B) and expect 0x05 from one of them. The Waveshare 1.43"
+ * board wires SA0 high on some revisions, so the alternate address
+ * 0x6B is necessary in practice. On success, configure Ctrl1
+ * (auto-increment for multi-byte reads), Ctrl2 (range + ODR), Ctrl5
+ * (LPF disabled), and Ctrl7 (enable accel only). Returns true on
+ * full success. Returns false (without aborting the build) on any
+ * I²C or signature failure, leaving the adapter free to continue
+ * without motion wake.
  */
 bool qmi8658_init(void);
 

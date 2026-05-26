@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OLED burn-in mitigation — Phase 2 plan &amp; status</title>
+<style>
+  :root {
+    --accent: #2c5aa0;
+    --accent-soft: #eef3fa;
+    --border: #e1e4e8;
+    --bg-soft: #fafbfc;
+    --bg-code: #f4f4f7;
+    --text: #24292f;
+    --muted: #57606a;
+    --done: #1f7a3f;
+    --done-bg: #e8f5ee;
+    --pending: #b46100;
+    --pending-bg: #fff4e3;
+    --planned: #545d65;
+    --planned-bg: #eef0f3;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    max-width: 1040px;
+    margin: 2em auto;
+    padding: 0 1.5em;
+    color: var(--text);
+    line-height: 1.55;
+  }
+  h1 { border-bottom: 2px solid var(--accent); padding-bottom: .35em; }
+  h2 { border-bottom: 1px solid var(--border); padding-bottom: .25em; margin-top: 2.2em; }
+  h3 { color: var(--accent); margin-top: 1.8em; }
+  h4 { margin-top: 1.4em; margin-bottom: .4em; color: var(--muted); text-transform: uppercase;
+       font-size: .82em; letter-spacing: .05em; }
+  p { margin: .6em 0; }
+  code, pre { font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace; }
+  code {
+    background: var(--bg-code);
+    padding: .1em .35em;
+    border-radius: 3px;
+    font-size: .92em;
+  }
+  pre {
+    background: var(--bg-code);
+    padding: 1em 1.2em;
+    border-radius: 6px;
+    overflow-x: auto;
+    border-left: 3px solid var(--accent);
+    font-size: .87em;
+    line-height: 1.5;
+  }
+  pre code { background: transparent; padding: 0; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 1em 0;
+    font-size: .92em;
+  }
+  th, td {
+    border: 1px solid var(--border);
+    padding: .55em .8em;
+    text-align: left;
+    vertical-align: top;
+  }
+  th { background: var(--bg-soft); font-weight: 600; }
+  td.mono, table.mono td:first-child {
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: .9em;
+    white-space: nowrap;
+  }
+  .toc {
+    background: var(--bg-soft);
+    border: 1px solid var(--border);
+    padding: 1em 1.5em;
+    border-radius: 6px;
+  }
+  .toc ul { margin: .3em 0; padding-left: 1.4em; }
+  .toc li { margin: .15em 0; }
+  .summary-card {
+    background: var(--accent-soft);
+    border-left: 4px solid var(--accent);
+    padding: .9em 1.2em;
+    border-radius: 4px;
+    margin: 1.4em 0;
+  }
+  .summary-card p:first-child { margin-top: 0; }
+  .summary-card p:last-child { margin-bottom: 0; }
+  .status {
+    display: inline-block;
+    padding: .1em .55em;
+    border-radius: 4px;
+    font-size: .82em;
+    font-weight: 600;
+    letter-spacing: .02em;
+    white-space: nowrap;
+    border: 1px solid transparent;
+  }
+  .status-done    { background: var(--done-bg);    color: var(--done);    border-color: #c5e6d2; }
+  .status-pending { background: var(--pending-bg); color: var(--pending); border-color: #f4d8a8; }
+  .status-planned { background: var(--planned-bg); color: var(--planned); border-color: #d6d9dd; }
+  .legend {
+    display: flex;
+    gap: .8em;
+    flex-wrap: wrap;
+    align-items: center;
+    margin: .6em 0 1.2em 0;
+    font-size: .9em;
+  }
+  .legend .status { font-size: .78em; }
+  .check-list { list-style: none; padding-left: 0; }
+  .check-list li {
+    margin: .35em 0;
+    padding-left: 1.7em;
+    position: relative;
+  }
+  .check-list li.done::before    { content: "✅"; position: absolute; left: 0; }
+  .check-list li.pending::before { content: "⏳"; position: absolute; left: 0; }
+  .check-list li.planned::before { content: "◻︎"; position: absolute; left: 0; color: var(--muted); }
+  .meta-line {
+    font-size: .9em;
+    color: var(--muted);
+    margin-top: .2em;
+  }
+  .pr-header {
+    display: flex;
+    align-items: center;
+    gap: .7em;
+    flex-wrap: wrap;
+    margin-bottom: .2em;
+  }
+  .pr-header h3 { margin: 0; }
+  .scope-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1em;
+    margin: 1em 0;
+  }
+  @media (max-width: 720px) { .scope-grid { grid-template-columns: 1fr; } }
+  .scope-grid > div {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: .9em 1.1em;
+    background: var(--bg-soft);
+  }
+  .scope-grid h4 { margin-top: 0; }
+</style>
+</head>
+<body>
+
+<h1>OLED burn-in mitigation — Phase 2 plan &amp; status</h1>
+<p class="meta-line">
+  Branch: <code>feat/oled-burnin-phase2</code> ·
+  PR-1: <a href="https://github.com/qxzzxq/burnscope/pull/48">#48</a> (open) ·
+  Tracking spec: <a href="fsd/oled-burn-in-mitigation-fsd.md"><code>docs/fsd/oled-burn-in-mitigation-fsd.md</code></a>
+</p>
+
+<div class="summary-card">
+  <p>
+    Phase 2 connects the pure <code>burn_idle</code> state machine (shipped in #42)
+    to the AMOLED hardware so the panel dims at 5 min idle and turns off at 30 min,
+    with the four planned wake sources active (motion, touch, button, push).
+    It splits into two sub-PRs landing in sequence on
+    <code>feat/oled-burnin-phase2</code>.
+  </p>
+  <p>
+    <strong>Current state:</strong>
+    PR-1 (adapter scaffold + push/button/touch wakes) is built, host-tested, and
+    pushed as <a href="https://github.com/qxzzxq/burnscope/pull/48">PR #48</a>.
+    Hardware verification is pending. PR-2 (QMI8658 IMU port + motion wake) is
+    queued and has not started.
+  </p>
+</div>
+
+<div class="legend">
+  <span><span class="status status-done">✅ Done</span> shipped + verified</span>
+  <span><span class="status status-pending">⏳ Pending</span> built, awaiting on-target verification</span>
+  <span><span class="status status-planned">◻︎ Planned</span> not started</span>
+</div>
+
+<div class="toc">
+  <strong>Contents</strong>
+  <ul>
+    <li><a href="#context">1. Context &amp; what already shipped</a></li>
+    <li><a href="#pr1">2. PR-1 — adapter scaffold + push / button / touch wakes</a></li>
+    <li><a href="#pr2">3. PR-2 — QMI8658 IMU port + motion wake</a></li>
+    <li><a href="#out-of-scope">4. Out of scope for Phase 2</a></li>
+    <li><a href="#verification">5. Verification tracker</a></li>
+  </ul>
+</div>
+
+<h2 id="context">1. Context &amp; what already shipped</h2>
+
+<table>
+  <thead>
+    <tr><th>Phase / piece</th><th>Where</th><th>Status</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Phase 1 — pure <code>burn_idle</code> SM + FSD</td>
+      <td><code>firmware/main/burn_protection/burn_idle.{h,c}</code>, FSD at
+          <code>docs/fsd/oled-burn-in-mitigation-fsd.md</code></td>
+      <td><span class="status status-done">✅ Done</span> (commit <code>e163ecf</code>, #42)</td>
+    </tr>
+    <tr>
+      <td>Phase 2a — Codex daemon active-poll + dedupe + <code>_anchor_resets_at</code></td>
+      <td><code>client/src/burnscope_client/codex_daemon.py</code>,
+          <code>schema.py::semantically_equal</code></td>
+      <td><span class="status status-done">✅ Done</span> (commits <code>9a5a443</code>, <code>b7b2492</code>, #41 + #46)</td>
+    </tr>
+    <tr>
+      <td>Firmware-side <code>effective_resets_at</code> synthesis (rolling idle compensation)</td>
+      <td><code>firmware/main/snapshot.h</code></td>
+      <td><span class="status status-done">✅ Done</span> (shipped with #46)</td>
+    </tr>
+    <tr>
+      <td>Phase 2 (PR-1) — adapter scaffold + push / button / touch wakes</td>
+      <td>This PR</td>
+      <td><span class="status status-pending">⏳ Pending</span> (open as #48, awaiting on-target verification)</td>
+    </tr>
+    <tr>
+      <td>Phase 2 (PR-2) — QMI8658 IMU port + motion wake</td>
+      <td>—</td>
+      <td><span class="status status-planned">◻︎ Planned</span></td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+  The combination of Phase 1 (the SM) and Phase 2a (the client-side dedupe) is
+  what makes Phase 2 actually shippable: with Phase 2a in place, an arriving
+  <code>POST /summary</code> means a real change in upstream usage, so the
+  firmware can use it as an idle-wake trigger without thrashing the panel
+  every minute.
+</p>
+
+<!-- ================================ PR-1 ================================ -->
+
+<h2 id="pr1">2. PR-1 — adapter scaffold + push / button / touch wakes</h2>
+
+<div class="pr-header">
+  <h3>Status</h3>
+  <span class="status status-pending">⏳ Pending verification</span>
+  <span class="meta-line">PR <a href="https://github.com/qxzzxq/burnscope/pull/48">#48</a> · branch <code>feat/oled-burnin-phase2</code> · head <code>986c0ed</code> (after 3 Copilot review passes)</span>
+</div>
+
+<p>
+  Wires the SM into the AMOLED display profile end-to-end with three of the four
+  planned wake sources (push, button, touch). Motion wake ships in PR-2 alongside
+  the QMI8658 driver port. Touch wake is included via polling — the FT3168 INT
+  line is not routed on the Waveshare 1.43&Prime; board, and the vendor LVGL
+  demo (<code>08_LVGL_SDIMG</code>) confirms the working pattern is to read the
+  controller from an LVGL input-device callback at ~30 Hz, which keeps ticking
+  when the panel is asleep.
+</p>
+
+<h3>Files (12 changed, 4 new)</h3>
+
+<table>
+  <thead>
+    <tr><th>File</th><th>Change</th><th>Status</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td class="mono">firmware/main/snapshot.{h,c}</td>
+      <td>Multi-listener fan-out — single listener slot → array of
+          <code>SNAPSHOT_MAX_LISTENERS = 4</code>; both the UI and the
+          burn_idle adapter can subscribe.</td>
+      <td><span class="status status-done">✅ Done</span></td>
+    </tr>
+    <tr>
+      <td class="mono">firmware/main/displays/amoled_sh8601/driver.{h,c}</td>
+      <td>Runtime <code>amoled_sh8601_set_brightness_pct(uint8_t)</code>
+          (writes MIPI DCS 0x51 with the SH8601 / CO5300 QSPI cmd=0x02 framing)
+          and <code>amoled_sh8601_set_display_on(bool)</code>
+          (wraps <code>esp_lcd_panel_disp_on_off</code>). Panel and IO handles
+          stay file-static.</td>
+      <td><span class="status status-done">✅ Done</span></td>
+    </tr>
+    <tr>
+      <td class="mono">firmware/main/displays/amoled_sh8601/touch.{c,h}</td>
+      <td>New. FT3168 polling driver — trim of the Waveshare
+          <code>08_LVGL_SDIMG/components/touch_bsp/</code>. Owns the I²C0
+          install at 300 kHz (SDA=GPIO 47, SCL=GPIO 48); PR-2's IMU attaches
+          to the same bus.</td>
+      <td><span class="status status-done">✅ Done</span></td>
+    </tr>
+    <tr>
+      <td class="mono">firmware/main/displays/amoled_sh8601/burn_idle_adapter.{c,h}</td>
+      <td>New. Owns the SM instance, FreeRTOS event queue (8 deep), single
+          drain task, 1 Hz <code>esp_timer</code> for <code>EV_TIME</code>,
+          snapshot listener for <code>EV_PUSH</code>, GPIO0 negedge ISR for
+          <code>EV_BUTTON</code>, exported <code>notify_touch()</code> entry
+          for <code>EV_TOUCH</code>. Output application is wake-first
+          (panel-on before brightness) and sleep-last so a transitioning
+          frame never flashes black or full-bright.</td>
+      <td><span class="status status-done">✅ Done</span></td>
+    </tr>
+    <tr>
+      <td class="mono">firmware/main/displays/amoled_sh8601/ui.c</td>
+      <td><code>display_profile_init</code> now calls <code>touch_init()</code>,
+          registers an LVGL pointer indev whose read callback drives both
+          LVGL touch input and a rising-edge <code>burn_idle_adapter_notify_touch()</code>
+          call, then calls <code>burn_idle_adapter_start()</code>.</td>
+      <td><span class="status status-done">✅ Done</span></td>
+    </tr>
+    <tr>
+      <td class="mono">firmware/main/factory_reset.c</td>
+      <td>GPIO0 config now sets <code>intr_type = GPIO_INTR_NEGEDGE</code> so
+          the adapter ISR is not silently disabled if factory_reset's task
+          re-runs <code>gpio_config</code> after ours. factory_reset still
+          polls — the intr_type is inert for its path.</td>
+      <td><span class="status status-done">✅ Done</span></td>
+    </tr>
+    <tr>
+      <td class="mono">firmware/main/displays/amoled_sh8601/Kconfig</td>
+      <td>New "AMOLED burn-in mitigation" submenu —
+          <code>IDLE_DIM_MINUTES=5</code>, <code>IDLE_OFF_MINUTES=30</code>,
+          <code>ACTIVE_BRIGHTNESS_PCT=70</code>,
+          <code>DIMMED_BRIGHTNESS_PCT=20</code>,
+          <code>MOTION_THRESHOLD_MG=50</code>
+          (last one consumed in PR-2).</td>
+      <td><span class="status status-done">✅ Done</span></td>
+    </tr>
+    <tr>
+      <td class="mono">firmware/main/displays/amoled_sh8601/sources.cmake</td>
+      <td>Adds the adapter and touch files to the AMOLED profile build.</td>
+      <td><span class="status status-done">✅ Done</span></td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>Wake-source coverage in PR-1</h3>
+
+<table>
+  <thead>
+    <tr><th>Wake source</th><th>SM event</th><th>Implementation</th><th>Status</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>1 Hz tick (re-evaluate idle)</td>
+      <td><code>EV_TIME</code></td>
+      <td><code>esp_timer</code> periodic at 1 Hz, posts to event queue.</td>
+      <td><span class="status status-done">✅ Done</span></td>
+    </tr>
+    <tr>
+      <td>Push (<code>POST /summary</code>)</td>
+      <td><code>EV_PUSH</code></td>
+      <td>Snapshot listener registered via <code>snapshot_store_register_listener</code>.</td>
+      <td><span class="status status-done">✅ Done</span></td>
+    </tr>
+    <tr>
+      <td>Button (BOOT, GPIO 0)</td>
+      <td><code>EV_BUTTON</code></td>
+      <td>Negedge ISR with 100 ms in-ISR debounce; coexists with
+          <code>factory_reset</code> polling on the same pin.</td>
+      <td><span class="status status-done">✅ Done</span></td>
+    </tr>
+    <tr>
+      <td>Touch (FT3168)</td>
+      <td><code>EV_TOUCH</code></td>
+      <td>LVGL indev callback in <code>ui.c</code> polls the controller and
+          notifies the adapter on a fresh press (released → pressed).</td>
+      <td><span class="status status-done">✅ Done</span></td>
+    </tr>
+    <tr>
+      <td>Motion (QMI8658 accel)</td>
+      <td><code>EV_MOTION</code></td>
+      <td>—</td>
+      <td><span class="status status-planned">◻︎ PR-2</span></td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>Verification</h3>
+
+<h4>Host / build</h4>
+<ul class="check-list">
+  <li class="done"><code>idf.py -B build-s3 build</code> succeeds for the
+      esp32s3 target. Binary 1.58 MB / 5 MB OTA slot (70 % free).</li>
+  <li class="done"><code>burn_idle</code> host unit tests pass
+      (<code>ctest --test-dir firmware/build/burn_idle_host</code>); purity
+      check still green.</li>
+</ul>
+
+<h4>On-target (AMOLED-1.43) — pending</h4>
+<p>
+  Compress Kconfig to <code>IDLE_DIM_MINUTES=1</code>,
+  <code>IDLE_OFF_MINUTES=2</code> for fast iteration; restore defaults before
+  merging. Reference: FSD § 8.2.
+</p>
+<ul class="check-list">
+  <li class="pending">DIM-001 — panel dims from 70 % → 20 % at 1 min idle.</li>
+  <li class="pending">DIM-002 — panel goes dark at 2 min idle.</li>
+  <li class="pending">WAKE-002 — tap screen while OFF wakes within ~200 ms;
+      held press does not retrigger.</li>
+  <li class="pending">WAKE-003 — short BOOT press while OFF wakes within ~200 ms.</li>
+  <li class="pending">WAKE-004 — Codex <code>account/rateLimits</code> change
+      while OFF: push arrives, panel wakes within ~200 ms of arrival.</li>
+  <li class="pending">Kconfig restored to defaults (5 / 30) before merge.</li>
+</ul>
+
+<!-- ================================ PR-2 ================================ -->
+
+<h2 id="pr2">3. PR-2 — QMI8658 IMU port + motion wake</h2>
+
+<div class="pr-header">
+  <h3>Status</h3>
+  <span class="status status-planned">◻︎ Planned</span>
+  <span class="meta-line">Queued on <code>feat/oled-burnin-phase2</code>, lands after PR-1 is verified on-hardware.</span>
+</div>
+
+<h3>Files to add / modify</h3>
+
+<table>
+  <thead>
+    <tr><th>File</th><th>Change</th><th>Status</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td class="mono">firmware/main/displays/amoled_sh8601/qmi8658.{c,h}</td>
+      <td>New. Minimal port of
+          <code>docs/ESP32-S3-AMOLED-1.43-Demo/03_I2C_QMI8658/components/qmi8658c/</code>.
+          Attaches to the I²C0 bus already installed by <code>touch.c</code> in
+          PR-1 (addr 0x6A). Exposes <code>qmi8658_init()</code> and
+          <code>qmi8658_read_accel_mg(int16_t out[3])</code>. Accelerometer
+          only — gyro paths in the vendor demo are dropped (FR-1.5). Default
+          ODR <code>Qmi8658AccOdr_LowPower_21Hz</code>, ±2 g range. Vendor
+          attribution preserved (Waveshare + Espressif).</td>
+      <td><span class="status status-planned">◻︎ Planned</span></td>
+    </tr>
+    <tr>
+      <td class="mono">firmware/main/displays/amoled_sh8601/burn_idle_adapter.c</td>
+      <td>Add an IMU sampler — dedicated task at 21 Hz, computes per-axis
+          <code>|new − prev|</code> in mg against the Kconfig
+          <code>MOTION_THRESHOLD_MG</code>, posts <code>EV_MOTION</code> on
+          cross with 200 ms per-event debounce (recompute against the last
+          <em>posted</em> sample, not the previous raw, so a slow drag doesn't
+          fire continuously).</td>
+      <td><span class="status status-planned">◻︎ Planned</span></td>
+    </tr>
+    <tr>
+      <td class="mono">firmware/main/displays/amoled_sh8601/sources.cmake</td>
+      <td>Add <code>qmi8658.c</code> to the AMOLED profile build.</td>
+      <td><span class="status status-planned">◻︎ Planned</span></td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>Wake-source coverage delta from PR-1</h3>
+
+<table>
+  <thead>
+    <tr><th>Wake source</th><th>SM event</th><th>Status after PR-2</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Motion (QMI8658 accel)</td>
+      <td><code>EV_MOTION</code></td>
+      <td><span class="status status-planned">◻︎ Planned</span></td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>Verification (on-target, AMOLED-1.43)</h3>
+<ul class="check-list">
+  <li class="planned">WAKE-001 — tap the device on the desk while OFF →
+      panel wakes within ~200 ms.</li>
+  <li class="planned">DIM-001 sanity — leaving the device perfectly still for
+      5 min reaches DIMMED (motion detector not falsely triggering).</li>
+  <li class="planned">WAKE-005 — leave on a desk for 5 min with no upstream
+      change; daemon issues no pushes, panel stays OFF.</li>
+  <li class="planned">If false wakes are persistent, raise Kconfig
+      <code>MOTION_THRESHOLD_MG</code> from 50 mg in 10 mg increments and
+      retest. (Risk row 1 of FSD § 5.1.)</li>
+</ul>
+
+<!-- ============================= Out of scope ============================ -->
+
+<h2 id="out-of-scope">4. Out of scope for Phase 2</h2>
+
+<p>Cleanly deferred to future phases — not blocked by anything here:</p>
+
+<ul>
+  <li><strong>Orientation rotation</strong> (FSD Phase 3, FR-1.x). Reads the
+      accelerometer gravity vector and rotates the LVGL display in 90° steps.
+      The QMI8658 port shipped in PR-2 is reusable.</li>
+  <li><strong>Palette / soft-edge constraints</strong> (FSD Phase 4, FR-5 / FR-6).
+      Build-time validator for no-pure-white / no-saturated-blue; LVGL
+      anti-aliasing enabled.</li>
+  <li><strong>Telemetry on idle SM transitions</strong> exposed via
+      <code>GET /health</code> (FSD Known Gap G-3).</li>
+  <li><strong>Pixel-shift / orbit</strong> (catalog § 1.1). Coarse spatial
+      diversity comes from orientation rotation; full pixel-shift would be
+      a separate FSD.</li>
+</ul>
+
+<!-- ============================ Verification ============================ -->
+
+<h2 id="verification">5. Verification tracker</h2>
+
+<p>
+  Single rollup so it's easy to see what's left before Phase 2 can be marked
+  complete and a tagged release cut. Test IDs map to
+  <code>docs/fsd/oled-burn-in-mitigation-fsd.md</code> § 8.2 / 8.3 / 8.5.
+</p>
+
+<table>
+  <thead>
+    <tr><th>Test ID</th><th>What it covers</th><th>Owning PR</th><th>Status</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Host build (esp32s3)</td><td><code>idf.py build</code> for AMOLED target.</td><td>PR-1</td><td><span class="status status-done">✅ Done</span></td></tr>
+    <tr><td>Host unit tests</td><td><code>burn_idle</code> SM tests + purity check.</td><td>PR-1</td><td><span class="status status-done">✅ Done</span></td></tr>
+    <tr><td>DIM-001</td><td>Dim transition timing.</td><td>PR-1</td><td><span class="status status-pending">⏳ Pending</span></td></tr>
+    <tr><td>DIM-002</td><td>Off transition timing.</td><td>PR-1</td><td><span class="status status-pending">⏳ Pending</span></td></tr>
+    <tr><td>WAKE-002</td><td>Touch wake from OFF.</td><td>PR-1</td><td><span class="status status-pending">⏳ Pending</span></td></tr>
+    <tr><td>WAKE-003</td><td>Button wake from OFF.</td><td>PR-1</td><td><span class="status status-pending">⏳ Pending</span></td></tr>
+    <tr><td>WAKE-004</td><td>Qualifying push wake from OFF.</td><td>PR-1</td><td><span class="status status-pending">⏳ Pending</span></td></tr>
+    <tr><td>WAKE-001</td><td>Motion wake from OFF.</td><td>PR-2</td><td><span class="status status-planned">◻︎ Planned</span></td></tr>
+    <tr><td>WAKE-005</td><td>Non-qualifying poll does NOT wake (5 min steady).</td><td>PR-2</td><td><span class="status status-planned">◻︎ Planned</span></td></tr>
+    <tr><td>AT-1 (24 h soak)</td><td>Brightness states cycle correctly; no spurious wakes; no leaks.</td><td>After PR-2</td><td><span class="status status-planned">◻︎ Planned</span></td></tr>
+  </tbody>
+</table>
+
+<p class="meta-line">
+  Source plan (private working file):
+  <code>~/.claude/plans/let-s-implement-oled-burn-spicy-acorn.md</code> ·
+  Last updated 2026-05-26.
+</p>
+
+</body>
+</html>

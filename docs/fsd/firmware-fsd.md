@@ -163,7 +163,10 @@ profile and partition layout.
   Brightness ramps to ~70 % at boot per the OLED burn-in FSD.
 - **Touch:** FT3168 capacitive controller over I²C, polled via an LVGL
   pointer input device. Used as a wake source for the OLED burn-in
-  idle adapter (see `docs/fsd/oled-burn-in-mitigation-fsd.md` § A2).
+  idle adapter (see `docs/oled_burnin_mitigation.md` § A2 for the
+  AMOLED-specific design decisions, and
+  `docs/fsd/oled-burn-in-mitigation-fsd.md` FR-3.2 for the
+  requirement).
 
 **Common to both:**
 

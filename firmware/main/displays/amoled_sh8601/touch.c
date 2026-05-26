@@ -19,6 +19,7 @@
 #include "driver/i2c.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"  /* pdMS_TO_TICKS — direct include, not via i2c.h */
 
 static const char *TAG = "touch";
 

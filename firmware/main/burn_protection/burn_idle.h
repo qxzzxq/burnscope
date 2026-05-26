@@ -98,9 +98,17 @@ void burn_idle_init(burn_idle_t *sm, burn_idle_config_t cfg);
 /**
  * Step the SM with event `ev` at monotonic time `now_us`.
  *
- * Wake events (MOTION/TOUCH/BUTTON/PUSH) reset last_activity_us to now
- * and transition the SM to ACTIVE. EV_TIME re-evaluates `now - last`
- * against the configured thresholds.
+ * Direct-interaction wake events (MOTION/TOUCH/BUTTON) reset
+ * last_activity_us to now_us and transition the SM to ACTIVE.
+ *
+ * PUSH is a soft wake — see FR-2.3. From OFF or DIMMED it lands in (or
+ * stays in) DIMMED with last_activity_us = now_us - dim_after_us, so
+ * the SM falls back to OFF after (off_after_us - dim_after_us) more
+ * silence. From ACTIVE it refreshes last_activity_us without changing
+ * state.
+ *
+ * EV_TIME re-evaluates `now - last_activity_us` against the configured
+ * thresholds.
  *
  * Returns the new {state, brightness_pct, panel_on, changed} tuple.
  * `changed` is true iff any non-`changed` field differs from the

@@ -209,9 +209,9 @@ static bool skip_value(cursor_t *c)
 /* POST /summary                                                          */
 /* --------------------------------------------------------------------- */
 
-static esp_err_t reject_400(httpd_req_t *req, const char *reason)
+static esp_err_t reject_400(httpd_req_t *req, const char *route, const char *reason)
 {
-    ESP_LOGW(TAG, "rejecting /summary: %s", reason);
+    ESP_LOGW(TAG, "rejecting %s: %s", route, reason);
     httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, reason);
     return ESP_OK;
 }
@@ -487,24 +487,32 @@ sessions_done:
  * arming itself to roll back on the next reboot. Called from
  * summary_post_handler once a snapshot has been accepted end-to-end —
  * the strongest evidence we have that the firmware is healthy. Cheap:
- * after the first valid-mark per boot, this is a single bool test. */
+ * after the first successful valid-mark per boot, this is a single
+ * bool test. Transient errors (NULL partition, state read failure,
+ * mark-valid failure) leave `s_done` unset so the next accepted
+ * snapshot retries — otherwise a single flaky call would let the
+ * bootloader roll back even though the firmware kept proving itself. */
 static void maybe_mark_ota_valid(void)
 {
     static bool s_done = false;
     if (s_done) return;
-    s_done = true;
     const esp_partition_t *running = esp_ota_get_running_partition();
     if (running == NULL) return;
     esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
     if (esp_ota_get_state_partition(running, &state) != ESP_OK) return;
-    if (state == ESP_OTA_IMG_PENDING_VERIFY) {
-        esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
-        if (err == ESP_OK) {
-            ESP_LOGI(TAG, "OTA image marked valid; rollback canceled");
-        } else {
-            ESP_LOGW(TAG, "mark-valid failed: %s — rollback may fire on next reboot",
-                     esp_err_to_name(err));
-        }
+    if (state != ESP_OTA_IMG_PENDING_VERIFY) {
+        /* Nothing to do this boot — latch so we don't keep peeking
+         * at NVS on every successful snapshot. */
+        s_done = true;
+        return;
+    }
+    esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+    if (err == ESP_OK) {
+        s_done = true;
+        ESP_LOGI(TAG, "OTA image marked valid; rollback canceled");
+    } else {
+        ESP_LOGW(TAG, "mark-valid failed: %s — will retry on next snapshot",
+                 esp_err_to_name(err));
     }
 }
 
@@ -518,7 +526,7 @@ static esp_err_t summary_post_handler(httpd_req_t *req)
         return ESP_OK;
     }
     if (content_len == 0) {
-        return reject_400(req, "empty body");
+        return reject_400(req, "/summary", "empty body");
     }
 
     char *buf = malloc(content_len + 1);
@@ -543,7 +551,7 @@ static esp_err_t summary_post_handler(httpd_req_t *req)
     free(buf);
 
     if (!ok || cur.err) {
-        return reject_400(req, "invalid AgentSnapshot");
+        return reject_400(req, "/summary", "invalid AgentSnapshot");
     }
 
     /* Pairing check runs after parse so we know the agent name; runs
@@ -941,7 +949,7 @@ static esp_err_t ota_post_handler(httpd_req_t *req)
 
     int content_len = req->content_len;
     if (content_len <= 0) {
-        return reject_400(req, "Content-Length required and > 0");
+        return reject_400(req, "/ota", "Content-Length required and > 0");
     }
     if (content_len > OTA_MAX_BODY) {
         ESP_LOGW(TAG, "/ota body too large (%d bytes)", content_len);
@@ -1015,7 +1023,7 @@ static esp_err_t ota_post_handler(httpd_req_t *req)
              * on the first chunk. A bad image is the client's fault,
              * not ours — return 400 so the daemon doesn't retry it. */
             if (err == ESP_ERR_OTA_VALIDATE_FAILED) {
-                return reject_400(req, "image rejected by bootloader");
+                return reject_400(req, "/ota", "image rejected by bootloader");
             }
             return httpd_resp_send_500(req);
         }
@@ -1030,7 +1038,7 @@ static esp_err_t ota_post_handler(httpd_req_t *req)
         /* esp_ota_end rejects images that fail the magic-byte check or
          * sha256 verification. A 400 reads more honest than 500 here:
          * the *server* is fine, the *image* the client sent isn't. */
-        return reject_400(req, "image rejected by bootloader");
+        return reject_400(req, "/ota", "image rejected by bootloader");
     }
 
     err = esp_ota_set_boot_partition(target);
@@ -1103,10 +1111,6 @@ void http_server_start(void)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
     config.uri_match_fn = httpd_uri_match_wildcard;
-    /* /ota uploads a full firmware image (multi-MB). The default
-     * recv_wait_timeout is 5 s which is fine per-chunk, but extend
-     * the overall send timeout so the 202 response has time to flush
-     * before we trip a write timeout right before the reboot. */
 
     ESP_ERROR_CHECK(httpd_start(&s_server, &config));
 

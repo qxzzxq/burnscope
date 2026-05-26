@@ -123,9 +123,13 @@ succeeds. Mismatches return `401 Unauthorized`.
 
 Operator → ESP32. Pushes a new firmware image to the device's
 inactive OTA slot, sets it as the next boot partition, and reboots
-into it. Only available on builds whose partition layout reserves
-two `ota_X` app slots; the 4 MB CYD layout doesn't, so a `POST /ota`
-there returns 500 (no inactive partition found).
+into it. Both partition layouts reserve two `ota_X` app slots, but
+the slot size differs by target: 5 MB on the AMOLED 16 MB layout,
+1.875 MB on the CYD 4 MB layout. Images larger than the inactive
+slot are rejected with `413 Content Too Large`. Note that only the
+AMOLED profile sets `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` in its
+sdkconfig defaults — `/ota` works on the CYD, but the rollback
+safety net described below does not arm there.
 
 **Request body:** the raw `burnscope.bin` image — no JSON
 envelope, no length prefix. Content-Length is required so the
@@ -148,7 +152,7 @@ large uploads up front.
 | `400 Bad Request`       | text/plain | Content-Length missing or ≤0; or `esp_ota_write` / `esp_ota_end` rejected the image (bad magic byte, sha256 mismatch, header invalid). |
 | `401 Unauthorized`      | `{"error":"…"}` | Device is not paired yet, header is absent / oversized, or client_id matches no populated slot. |
 | `409 Conflict`          | `{"error":"another OTA already in progress"}` | A concurrent upload is mid-stream. Retry after a few seconds. |
-| `413 Content Too Large` | text/plain | Either > 6 MB body cap or larger than the inactive OTA slot (5 MB on the AMOLED layout). |
+| `413 Content Too Large` | text/plain | Either > 6 MB body cap or larger than the inactive OTA slot (5 MB on the AMOLED 16 MB layout, 1.875 MB on the CYD 4 MB layout). |
 
 ### Rollback safety
 

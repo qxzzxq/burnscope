@@ -178,6 +178,20 @@ void burn_idle_adapter_start(void)
     }
     burn_idle_init(&s_sm, cfg);
 
+    /* Sync the panel to the SM's ACTIVE baseline before timers/ISRs fire.
+     * The driver's boot sequence sets brightness to a hard-coded constant
+     * (currently SH8601_DEFAULT_BRIGHTNESS = 0xB2, ≈ 70 %) that matches
+     * the Kconfig default by design. If a deployment tunes
+     * BURNSCOPE_AMOLED_ACTIVE_BRIGHTNESS_PCT to a different value, the SM
+     * alone would never write the brightness register at startup —
+     * subsequent EV_TIME ticks return changed=false while the SM stays in
+     * ACTIVE, so the panel would inherit 0xB2 until the first
+     * dim/off/wake transition.  s_prev_panel_on is already true (matches
+     * the panel's post-init state), so apply_output's wake-first guard
+     * stays consistent. */
+    amoled_sh8601_set_display_on(true);
+    amoled_sh8601_set_brightness_pct(cfg.active_brightness_pct);
+
     s_queue = xQueueCreate(EVENT_QUEUE_DEPTH, sizeof(burn_idle_event_t));
     configASSERT(s_queue != NULL);
 

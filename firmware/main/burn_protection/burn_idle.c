@@ -87,7 +87,30 @@ burn_idle_output_t burn_idle_step(burn_idle_t *sm,
 {
     assert(sm != NULL);
 
-    if (is_wake_event(ev)) {
+    if (ev == BURN_IDLE_EV_PUSH) {
+        /* PUSH is a soft wake (FR-2.3). It represents upstream activity
+         * — semantically meaningful per the Codex daemon dedupe — but
+         * not a direct user interaction, so it must not commit the
+         * panel to full ACTIVE.
+         *
+         * From OFF or DIMMED we land in (or stay in) DIMMED, backdating
+         * last_activity_us by exactly dim_after_us so the SM falls back
+         * to OFF after (off_after_us - dim_after_us) more silence —
+         * pushes can extend the DIMMED phase but never grant a fresh
+         * full off_after_us window.
+         *
+         * From ACTIVE we refresh last_activity_us so sustained pushing
+         * during use prevents premature dim. State stays ACTIVE; the
+         * output is unchanged (caller sees `changed == false`). */
+        if (sm->state == BURN_IDLE_OFF || sm->state == BURN_IDLE_DIMMED) {
+            sm->last_activity_us = now_us - sm->cfg.dim_after_us;
+            sm->state = BURN_IDLE_DIMMED;
+        } else {
+            sm->last_activity_us = now_us;
+        }
+    } else if (is_wake_event(ev)) {
+        /* MOTION / TOUCH / BUTTON — direct user interaction. Commit to
+         * ACTIVE regardless of prior state. */
         sm->last_activity_us = now_us;
         sm->state = BURN_IDLE_ACTIVE;
     } else {

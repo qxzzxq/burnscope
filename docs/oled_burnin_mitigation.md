@@ -46,7 +46,10 @@ After N minutes of no state change (or no user interaction), blank the
 panel entirely. Most effective mitigation by far — zero emission means
 zero wear.
 
-- Wake trigger: touch, button, motion sensor, or any new data push.
+- Wake trigger: touch, button, or motion sensor (commit to full
+  brightness). A new data push is a *soft* wake — it lifts the panel
+  from OFF to a dimmed state only, never to full brightness. See
+  `docs/fsd/oled-burn-in-mitigation-fsd.md` FR-2.3.
 - For BurnScope: could blank when no agent activity in the last hour.
 
 ### 2.2 Dimming on idle
@@ -150,7 +153,10 @@ A minimal, effective set for a device like BurnScope:
 3. **Pixel-shift the whole frame** by 1–2 px on a 30–60 s cadence.
 4. **Dim to ~20 %** after 5 minutes of no new data; **blank** after 30
    minutes.
-5. **Wake on next push** (and optionally on touch).
+5. **Soft-wake on next push** (panel rises from OFF only to DIMMED, never
+   to full brightness — sustained pushes extend the dimmed phase but
+   don't commit to ACTIVE); commit to ACTIVE only on a direct
+   interaction (touch / button / motion). See FSD FR-2.3.
 6. **Nightly panel-refresh** if the driver exposes one.
 
 Items 1–5 are entirely in firmware UI code; item 6 depends on the
@@ -299,9 +305,13 @@ needed there for the idle-wake use case.
 
 While the display is dimmed or off, the HTTP server keeps running.
 Any push that *does* arrive (because the upstream gating decided it
-was meaningful) both updates the framebuffer **and** wakes the panel
-— which is exactly what we want: a real change in your usage is the
-one signal that should pull your eye back to the device.
+was meaningful) both updates the framebuffer **and** soft-wakes the
+panel — from OFF or DIMMED it lifts the panel to DIMMED only,
+extending the dim-to-off countdown. A push is upstream activity, not
+direct user attention, so it nudges the panel back to a visible-but-
+dimmed state. To commit to full ACTIVE brightness you have to touch
+the screen, press the button, or pick the device up — those are
+direct presence signals. See FSD FR-2.3.
 
 **Known limitation — multi-machine staleness.** A daemon installed
 on PC A polls PC A's local cache only. Codex activity on PC B
@@ -441,9 +451,12 @@ TEST_CASE("dim after 5 min idle, off after 30, motion wakes") {
 }
 ```
 
-Add tests for: each wake source individually; PUSH-as-wake parity
-with motion; threshold-just-below vs. threshold-just-above; rapid
-event flapping; config edge cases (`dim_after_us == off_after_us`).
+Add tests for: each wake source individually; **PUSH soft-wake
+semantics** (from OFF lands in DIMMED, not ACTIVE; from DIMMED
+extends the dim-to-off countdown; from ACTIVE refreshes the idle
+timer without changing state — see FSD FR-2.3 and SM-014..SM-017);
+threshold-just-below vs. threshold-just-above; rapid event flapping;
+config edge cases (`dim_after_us == off_after_us`).
 
 ### A3. Default brightness: 70 %
 Sets `DEFAULT_BRIGHTNESS = 70 %` of panel max. Matches the §3.1 cap

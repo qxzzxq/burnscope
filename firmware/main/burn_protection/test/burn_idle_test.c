@@ -134,14 +134,97 @@ TEST(test_sm_013_button_wakes_from_off)
 
 /* ----------------------------------------------------------------- SM-014 */
 
-TEST(test_sm_014_push_wakes_from_off)
+TEST(test_sm_014_push_soft_wakes_from_off_to_dimmed)
 {
+    /* PUSH is a soft wake — see FR-2.3. From OFF it lifts the panel to
+     * DIMMED (not ACTIVE). Only direct user interaction (motion / touch /
+     * button) commits to ACTIVE. */
     burn_idle_t sm;
     burn_idle_init(&sm, make_default_cfg());
 
     drive_to(&sm, MIN(30) + SEC(1));  /* → OFF */
     burn_idle_output_t out = burn_idle_step(&sm, BURN_IDLE_EV_PUSH,
                                             MIN(30) + SEC(5));
+    TEST_ASSERT_EQ_INT(out.state, BURN_IDLE_DIMMED);
+    TEST_ASSERT_EQ_BOOL(out.panel_on, true);
+    TEST_ASSERT_EQ_INT(out.brightness_pct, 20);
+    TEST_ASSERT_EQ_BOOL(out.changed, true);
+}
+
+/* ----------------------------------------------------------------- SM-015 */
+
+TEST(test_sm_015_push_from_dimmed_extends_dim_phase)
+{
+    /* A push while already DIMMED keeps the state and resets the
+     * dim-to-off countdown — sustained pushing extends the DIMMED phase
+     * by (off_after_us - dim_after_us) per push. */
+    burn_idle_t sm;
+    burn_idle_init(&sm, make_default_cfg());
+
+    /* Settle into DIMMED. */
+    drive_to(&sm, MIN(5) + SEC(1));
+    burn_idle_output_t out = burn_idle_step(&sm, BURN_IDLE_EV_PUSH, MIN(10));
+    TEST_ASSERT_EQ_INT(out.state, BURN_IDLE_DIMMED);
+    TEST_ASSERT_EQ_INT(out.brightness_pct, 20);
+
+    /* Without the push, EV_TIME at MIN(30)+SEC(1) would have flipped to
+     * OFF. After the push at MIN(10), the new OFF boundary sits at
+     * MIN(10) + (off_after - dim_after) = MIN(10) + MIN(25) = MIN(35).
+     * One second before — still DIMMED. */
+    out = drive_to(&sm, MIN(35) - SEC(1));
+    TEST_ASSERT_EQ_INT(out.state, BURN_IDLE_DIMMED);
+
+    /* One second after — falls to OFF. */
+    out = drive_to(&sm, MIN(35) + SEC(1));
+    TEST_ASSERT_EQ_INT(out.state, BURN_IDLE_OFF);
+}
+
+/* ----------------------------------------------------------------- SM-016 */
+
+TEST(test_sm_016_push_from_off_falls_to_off_after_off_minus_dim_silence)
+{
+    /* Companion to SM-014: once the soft-wake from OFF lands in DIMMED,
+     * the SM must still fall back to OFF after (off_after - dim_after)
+     * more silence — the push doesn't grant a fresh full off_after_us. */
+    burn_idle_t sm;
+    burn_idle_init(&sm, make_default_cfg());
+
+    drive_to(&sm, MIN(30) + SEC(1));  /* → OFF */
+    burn_idle_output_t out = burn_idle_step(&sm, BURN_IDLE_EV_PUSH, MIN(30) + SEC(5));
+    TEST_ASSERT_EQ_INT(out.state, BURN_IDLE_DIMMED);
+
+    /* Push happened at MIN(30)+SEC(5). New OFF boundary at
+     * (MIN(30)+SEC(5)) + (MIN(30) - MIN(5)) = MIN(55)+SEC(5). */
+    out = drive_to(&sm, MIN(55) + SEC(4));
+    TEST_ASSERT_EQ_INT(out.state, BURN_IDLE_DIMMED);
+
+    out = drive_to(&sm, MIN(55) + SEC(6));
+    TEST_ASSERT_EQ_INT(out.state, BURN_IDLE_OFF);
+}
+
+/* ----------------------------------------------------------------- SM-017 */
+
+TEST(test_sm_017_push_from_active_refreshes_idle_timer)
+{
+    /* A push while ACTIVE counts as activity for the dim countdown —
+     * sustained pushing during use prevents premature dim. State stays
+     * ACTIVE (no output change). */
+    burn_idle_t sm;
+    burn_idle_init(&sm, make_default_cfg());
+
+    /* 4 min of silence — still ACTIVE (just under the 5 min dim_after). */
+    drive_to(&sm, MIN(4));
+
+    /* Push at MIN(4)+SEC(30). */
+    burn_idle_output_t out = burn_idle_step(&sm, BURN_IDLE_EV_PUSH,
+                                            MIN(4) + SEC(30));
+    TEST_ASSERT_EQ_INT(out.state, BURN_IDLE_ACTIVE);
+    TEST_ASSERT_EQ_BOOL(out.changed, false);  /* nothing visible changes */
+
+    /* Without the push refresh, EV_TIME at MIN(9)+SEC(0) would be idle
+     * MIN(9) >= dim_after and flip to DIMMED. With the refresh,
+     * last_activity_us = MIN(4)+SEC(30), idle = MIN(4)+SEC(30) < dim. */
+    out = drive_to(&sm, MIN(9));
     TEST_ASSERT_EQ_INT(out.state, BURN_IDLE_ACTIVE);
 }
 
@@ -328,7 +411,10 @@ int main(void)
     RUN_TEST(test_sm_011_motion_wakes_from_off);
     RUN_TEST(test_sm_012_touch_wakes_from_dimmed);
     RUN_TEST(test_sm_013_button_wakes_from_off);
-    RUN_TEST(test_sm_014_push_wakes_from_off);
+    RUN_TEST(test_sm_014_push_soft_wakes_from_off_to_dimmed);
+    RUN_TEST(test_sm_015_push_from_dimmed_extends_dim_phase);
+    RUN_TEST(test_sm_016_push_from_off_falls_to_off_after_off_minus_dim_silence);
+    RUN_TEST(test_sm_017_push_from_active_refreshes_idle_timer);
     RUN_TEST(test_sm_020_brightness_lookup_from_config);
     RUN_TEST(test_sm_021_brightness_changes_when_cfg_differs);
     RUN_TEST(test_sm_030_changed_false_on_repeated_steady_step);

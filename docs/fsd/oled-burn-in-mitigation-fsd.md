@@ -103,9 +103,15 @@ Five concrete problems, each addressed by one of the five mitigations:
   int` per session so the firmware can synthesise its countdown
   during idle without waking on a refresh push.
 - The AMOLED profile dims at 5 min idle and turns off at 30 min idle
-  (defaults; both Kconfig-configurable). Any of accelerometer
-  motion, touch, button, or qualifying `POST /summary` wakes the
-  panel immediately (FR-2.x, FR-3.x).
+  (defaults; both Kconfig-configurable). Direct user interactions
+  (accelerometer motion, touch, button) wake the panel immediately to
+  ACTIVE. A qualifying `POST /summary` is a *soft* wake — from OFF or
+  DIMMED it lifts the panel only to DIMMED, extending the dim-to-off
+  countdown by `(off_after_us − dim_after_us)`; from ACTIVE it
+  refreshes the idle timer without changing state. The rationale is
+  that pushes reflect upstream activity, not direct user attention,
+  so they should not commit the panel to full brightness on their own
+  (FR-2.3, FR-3.x).
 - The UI rotates in 90° steps to follow the device's orientation
   (FR-1.x).
 - No static UI element renders as `#FFFFFF`-grade white or as
@@ -273,7 +279,7 @@ genuinely meaningful when they do happen.
 **Exit criteria.** Phase 2 hardware tests in § 8.2 pass: manual
 dim/off timing, all four wake sources, push-with-no-change does
 not wake (relies on the client-side dedupe already shipped),
-push-with-change does wake.
+push-with-change soft-wakes the panel to DIMMED (FR-2.3).
 
 **Dependencies.** Phase 1. Implicit dependency on the shipped
 Codex poll + dedupe to satisfy the WAKE-005 ("non-qualifying push
@@ -383,9 +389,21 @@ no-push rate when usage is unchanged.
 - **FR-2.2** [Must]: The SM shall expose exactly three states:
   `BURN_IDLE_ACTIVE`, `BURN_IDLE_DIMMED`, `BURN_IDLE_OFF`.
 - **FR-2.3** [Must]: The SM shall accept events
-  `EV_MOTION`, `EV_TOUCH`, `EV_BUTTON`, `EV_PUSH`, and `EV_TIME`.
-  All four non-time events shall reset the `last_activity` timestamp
-  and transition the SM to `BURN_IDLE_ACTIVE`.
+  `EV_MOTION`, `EV_TOUCH`, `EV_BUTTON`, `EV_PUSH`, and `EV_TIME`. The
+  direct-interaction wake events (`EV_MOTION`, `EV_TOUCH`,
+  `EV_BUTTON`) shall reset `last_activity_us` to `now_us` and
+  transition the SM to `BURN_IDLE_ACTIVE`. `EV_PUSH` is a *soft
+  wake*: from `BURN_IDLE_OFF` or `BURN_IDLE_DIMMED` it shall set
+  `last_activity_us = now_us − dim_after_us` and transition to
+  `BURN_IDLE_DIMMED` (so the SM falls back to `BURN_IDLE_OFF` after
+  `(off_after_us − dim_after_us)` more silence — sustained pushes
+  extend the DIMMED phase but never grant a fresh full
+  `off_after_us` window); from `BURN_IDLE_ACTIVE` it shall reset
+  `last_activity_us` to `now_us` without changing state. Rationale:
+  an arriving `POST /summary` reflects upstream activity
+  (semantically meaningful per the FR-4 dedupe) but is not a direct
+  user interaction, so it must not commit the panel to full
+  brightness on its own.
 - **FR-2.4** [Must]: On `EV_TIME`, the SM shall transition to
   `BURN_IDLE_DIMMED` when `now - last_activity ≥ dim_after_us`, and
   to `BURN_IDLE_OFF` when `now - last_activity ≥ off_after_us`. The
@@ -432,8 +450,9 @@ no-push rate when usage is unchanged.
   wake) per the source spec.
 - **FR-3.7** [Must]: While in `BURN_IDLE_OFF`, the HTTP server,
   Wi-Fi, mDNS, and snapshot store shall continue to operate; an
-  incoming `POST /summary` shall both update the framebuffer and
-  emit `EV_PUSH`, restoring the panel.
+  incoming `POST /summary` shall update the framebuffer and emit
+  `EV_PUSH`, soft-waking the panel to `BURN_IDLE_DIMMED` per
+  FR-2.3.
 - **FR-3.8** [Should]: The motion threshold, dim threshold, off
   threshold, default brightness, and dimmed brightness shall be
   exposed as Kconfig options under `BurnScope display → AMOLED
@@ -526,9 +545,15 @@ no-push rate when usage is unchanged.
 - **NFR-1.2** [Should]: The IMU adapter at 21 Hz sampling shall
   consume < 2 % of one CPU core averaged over a 60 s window in
   Active state.
-- **NFR-2.1** [Must]: Wake latency from a wake event (motion,
-  touch, button, or `EV_PUSH`) to brightness restored to
-  `DEFAULT_BRIGHTNESS` shall be ≤ 200 ms at the 95th percentile.
+- **NFR-2.1** [Must]: Wake latency shall be ≤ 200 ms at the 95th
+  percentile, measured per wake class:
+  - Direct-interaction wakes (`EV_MOTION`, `EV_TOUCH`,
+    `EV_BUTTON`): event → brightness restored to
+    `active_brightness_pct`.
+  - Soft wakes (`EV_PUSH`): event → brightness restored to
+    `dimmed_brightness_pct` if the panel was in `BURN_IDLE_OFF`
+    or `BURN_IDLE_DIMMED`; no panel write if the panel was in
+    `BURN_IDLE_ACTIVE` (output unchanged per FR-2.3).
 - **NFR-2.2** [Should]: Dim-to-Off transition shall be visually
   noticeable but not abrupt; the SH8601 brightness register write
   is the only required action (no fade ramp). If a smoother visual
@@ -703,8 +728,11 @@ no-push rate when usage is unchanged.
 
 `POST /summary` is unchanged at the wire level. The firmware adds an
 internal side effect: every successful put emits `EV_PUSH` into the
-idle SM, which restores `BURN_IDLE_ACTIVE` and full brightness. The
-HTTP semantics, error codes, and response body are inherited from
+idle SM, which soft-wakes the panel — from `BURN_IDLE_OFF` or
+`BURN_IDLE_DIMMED` it lands in `BURN_IDLE_DIMMED`; from
+`BURN_IDLE_ACTIVE` it refreshes the idle timer without changing
+state (see FR-2.3 for the full transition rule). The HTTP
+semantics, error codes, and response body are inherited from
 `docs/fsd/firmware-fsd.md` § 6.1.
 
 #### 6.1.2 I²C (IMU + Touch)
@@ -846,7 +874,10 @@ Unchanged. The idle SM starts in `BURN_IDLE_ACTIVE` at boot.
 
 - Idle SM ticks at 1 Hz; transitions to Dimmed at 5 min, Off at
   30 min (defaults).
-- Any of motion, touch, button, or qualifying push wakes the panel.
+- Direct user interactions (motion, touch, button) lift the panel
+  to ACTIVE. A qualifying push *soft-wakes* the panel — from OFF or
+  DIMMED it lands in DIMMED only; from ACTIVE it refreshes the idle
+  timer without changing state (FR-2.3).
 - Codex daemon polls `account/rateLimits/read` every 60 s and
   pushes only when the result differs from `_last_pushed_snapshot`.
   Steady state with no token usage = zero pushes, panel can sleep.
@@ -897,7 +928,10 @@ Unchanged. The idle SM starts in `BURN_IDLE_ACTIVE` at boot.
 | SM-011     | Motion wakes from OFF            | Drive to OFF, then `EV_MOTION`.                                           | State returns to ACTIVE; `panel_on == true`. |
 | SM-012     | Touch wakes from DIMMED          | Drive to DIMMED, then `EV_TOUCH`.                                         | Wakes to ACTIVE. |
 | SM-013     | Button wakes from OFF            | Drive to OFF, then `EV_BUTTON`.                                           | Wakes to ACTIVE. |
-| SM-014     | Push wakes from OFF              | Drive to OFF, then `EV_PUSH`.                                             | Wakes to ACTIVE. |
+| SM-014     | Push soft-wakes from OFF to DIMMED | Drive to OFF, then `EV_PUSH`.                                           | State transitions to DIMMED; `brightness_pct == dimmed`; `panel_on == true`; `changed == true`. |
+| SM-015     | Push from DIMMED extends dim phase | Drive to DIMMED, then `EV_PUSH` at `MIN(10)`. Then `EV_TIME` at `MIN(35) − SEC(1)` and `MIN(35) + SEC(1)`. | Push leaves state DIMMED. Pre-boundary tick still DIMMED. Post-boundary tick falls to OFF — `(off − dim)` later than the original OFF boundary. |
+| SM-016     | Push from OFF falls to OFF after `(off − dim)` more silence | Drive to OFF, `EV_PUSH` at `MIN(30)+SEC(5)`. Then `EV_TIME` at `MIN(55)+SEC(4)` and `MIN(55)+SEC(6)`. | Push lands in DIMMED. Pre-boundary tick still DIMMED. Post-boundary tick falls to OFF. |
+| SM-017     | Push from ACTIVE refreshes idle timer | At `MIN(4)`, drive to ACTIVE-still. `EV_PUSH` at `MIN(4)+SEC(30)`. Then `EV_TIME` at `MIN(9)`. | Push leaves state ACTIVE with `changed == false`. Subsequent tick at `MIN(9)` still ACTIVE (without the refresh, would be DIMMED). |
 | SM-020     | Brightness lookup from config    | Configure `active=70, dimmed=20`; drive ACTIVE / DIMMED / OFF.            | Output brightness matches table; OFF → 0. |
 | SM-021     | Brightness changes when cfg differs | Same as SM-020 with `active=50`.                                       | `brightness_pct == 50` in ACTIVE. |
 | SM-030     | `changed` is true only on change | Two `EV_TIME` calls inside ACTIVE, well below `dim_after_us`.             | Both calls report `changed == false`. The SM records its post-init output as the baseline in `burn_idle_init`, so a steady-state step does not spuriously report change. |
@@ -919,7 +953,7 @@ Unchanged. The idle SM starts in `BURN_IDLE_ACTIVE` at boot.
 | WAKE-001   | Motion wake                      | Tap / lift device while OFF.                                              | Panel restores to 70 % within 200 ms. |
 | WAKE-002   | Touch wake                       | Tap screen while OFF.                                                     | Panel restores within 200 ms. |
 | WAKE-003   | Button wake                      | Press button while OFF.                                                   | Panel restores within 200 ms. |
-| WAKE-004   | Qualifying push wake             | While OFF, run a Codex prompt that burns ≥ 1 % of a window.               | Within ≤ 60 s of activity, push fires and panel restores within 200 ms of the push. |
+| WAKE-004   | Qualifying push soft-wake        | While OFF, run a Codex prompt that burns ≥ 1 % of a window.               | Within ≤ 60 s of activity, push fires and panel soft-wakes to DIMMED (≈ `dimmed_brightness_pct`) within 200 ms of the push. State remains DIMMED until a direct interaction (motion / touch / button) lifts to ACTIVE, or `(off_after_us − dim_after_us)` of silence falls back to OFF. |
 | WAKE-005   | Non-qualifying poll does NOT wake| While OFF, leave upstream untouched for 5 min.                            | Codex daemon issues no pushes; panel stays OFF. |
 | POLL-001   | Poll fires on cadence             | Run daemon with `BURNSCOPE_LOG_LEVEL=DEBUG`; tail the log for 70 s with no upstream activity. | At least one "codex poll: rate limits unchanged; skipping push" debug line in the window. |
 | POLL-002   | Poll no-ops before bootstrap     | Force `_client_id = None`; let `_poll_loop` run a few iterations.         | Zero calls to `_request`; queue stays empty. |
@@ -970,7 +1004,9 @@ Unchanged. The idle SM starts in `BURN_IDLE_ACTIVE` at boot.
 | 2026-05-26 | `9687070` (PR #48)   | AMOLED-1.43  | DIM-002  | ✅     | Compressed thresholds (`IDLE_OFF_MINUTES=2`); panel turned off at ~2 min idle. |
 | 2026-05-26 | `9687070` (PR #48)   | AMOLED-1.43  | WAKE-002 | ✅     | Tap from OFF → wake within target window. Held finger does not re-post (rising-edge detection in `ui.c` indev callback). |
 | 2026-05-26 | `9687070` (PR #48)   | AMOLED-1.43  | WAKE-003 | ✅     | Short BOOT button press from OFF → wake. GPIO 0 ISR coexists with `factory_reset.c` polling on the same pin. |
-| 2026-05-26 | `9687070` (PR #48)   | AMOLED-1.43  | WAKE-004 | ✅     | Real `POST /summary` arrival while in OFF wakes the panel; verified during a live Claude Code statusline / Codex daemon push cycle. |
+| 2026-05-26 | `9687070` (PR #48)   | AMOLED-1.43  | WAKE-004 | ⚠ supersed. | Verified under the old "PUSH wakes to ACTIVE" contract. Behavior changed to soft-wake-to-DIMMED in PR #50; see the next row for re-verification under the new contract. |
+| 2026-05-26 | `7133687` (PR #50)   | AMOLED-1.43  | WAKE-004 | ✅     | New soft-wake contract verified on AMOLED-1.43: with compressed thresholds (`IDLE_DIM_MINUTES=1`, `IDLE_OFF_MINUTES=2`), the panel reached OFF, then a real `POST /summary` arrival lifted the panel to DIMMED (≈ 20 %), **not** ACTIVE (70 %). State remains DIMMED until a direct interaction lifts to ACTIVE or `(off_after_us − dim_after_us)` of silence falls back to OFF. Matches the FR-2.3 soft-wake contract. |
+| 2026-05-26 | `7133687` (PR #50)   | AMOLED-1.43  | SM-015   | ✅     | Push-from-DIMMED extends the dim phase, verified on-hardware. With the panel sitting in DIMMED at 20 %, sustained `POST /summary` arrivals every <1 min kept the panel pinned at DIMMED (the SM emits no `output.changed` events because DIMMED → DIMMED is steady-state; verified visually by absence of dim-to-off transition for as long as pushes kept arriving). When pushes stopped, the panel fell to OFF ~1 min later (= `off_after_us − dim_after_us` from the last push), matching the FR-2.3 backdating math. |
 | 2026-05-26 | `1b4f9c7` (PR #49)   | AMOLED-1.43  | WAKE-001 | ✅     | Motion wake — picking the device up from rest while OFF restored the panel within target window. The QMI8658 driver probes both 0x6A and 0x6B; this board responded at 0x6B. |
 | 2026-05-26 | `1b4f9c7` (PR #49)   | AMOLED-1.43  | WAKE-005 | ✅     | Device left untouched on a desk for 5 min with no upstream change: Codex daemon issued no pushes (per `_anchor_resets_at` + `semantically_equal` dedupe), no spurious motion fires, panel stayed in OFF. |
 | —          | —                    | —            | AT-1     | ⏳     | 24 h soak — pending. |
@@ -987,7 +1023,7 @@ Unchanged. The idle SM starts in `BURN_IDLE_ACTIVE` at boot.
 | FR-1.6      | May      | IMU-ROT-004                                           | Planned |
 | FR-2.1      | Must     | SM-070, SM-071, AT-2                                  | Verified (host tests, commit `e163ecf`) |
 | FR-2.2      | Must     | SM-001, SM-002, SM-003                                | Verified (host tests, commit `e163ecf`) |
-| FR-2.3      | Must     | SM-010, SM-011, SM-012, SM-013, SM-014                | Verified (host tests, commit `e163ecf`) |
+| FR-2.3      | Must     | SM-010, SM-011, SM-012, SM-013, SM-014, SM-015, SM-016, SM-017 | Verified (host tests; soft-wake semantics added on `feat/push-soft-wake`) |
 | FR-2.4      | Must     | SM-002, SM-003, SM-041                                | Verified (host tests, commit `e163ecf`) |
 | FR-2.5      | Must     | SM-030, SM-031                                        | Verified (host tests, commit `e163ecf`) |
 | FR-2.6      | Must     | SM-020, SM-021                                        | Verified (host tests, commit `e163ecf`) |
@@ -1067,8 +1103,11 @@ t=60 s    EV_TIME                   → ACTIVE, br=70, panel=on, changed=0
 t=5 min   EV_TIME                   → DIMMED, br=20, panel=on, changed=1
 t=10 min  EV_TIME                   → DIMMED, br=20, panel=on, changed=0
 t=30 min  EV_TIME                   → OFF,    br=0,  panel=off, changed=1
-t=30:05   EV_PUSH                   → ACTIVE, br=70, panel=on, changed=1
-t=30:06   EV_TIME                   → ACTIVE, br=70, panel=on, changed=0
+t=30:05   EV_PUSH                   → DIMMED, br=20, panel=on, changed=1
+                                      (soft-wake: last_activity_us = t=30:05 − 5 min = t=25:05)
+t=30:06   EV_TIME                   → DIMMED, br=20, panel=on, changed=0
+t=55:05   EV_TIME                   → OFF,    br=0,  panel=off, changed=1
+                                      (= last_activity_us + off_after_us = t=25:05 + 30 min)
 ```
 
 `burn_idle_init` returns `void` — it records `{ACTIVE, br=70, panel=on}`

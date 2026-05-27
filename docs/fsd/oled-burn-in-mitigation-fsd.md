@@ -185,7 +185,7 @@ client:
 |--------------------------------|-----------------------------------------------|------|
 | **Idle state machine**         | `firmware/main/burn_protection/burn_idle.{h,c}` | Pure-logic SM. Inputs: events + monotonic time. Outputs: `{state, brightness_pct, panel_on, changed}`. Zero ESP-IDF deps. |
 | **AMOLED idle adapter**        | `firmware/main/displays/amoled_sh8601/burn_idle_adapter.c` | Wires IMU sampling, touch IRQ, button IRQ, `POST /summary` callback, and a 1 Hz `esp_timer` into the SM; applies SM outputs to the SH8601 driver. |
-| **Orientation detector** *(Phase 3 — landed; IMU-ROT-* hardware tests pending)* | `firmware/main/displays/amoled_sh8601/orientation.c` | Reads accelerometer gravity vector, picks quadrant with hysteresis + debounce, drives `lv_disp_set_rotation`. |
+| **Orientation detector** *(Phase 3 — landed; IMU-ROT-* hardware tests pending)* | `firmware/main/displays/amoled_sh8601/orientation.c` | Reads accelerometer gravity vector, picks quadrant with hysteresis + debounce, drives `lv_display_set_rotation`. |
 | **Codex active poll + dedupe** | `client/src/burnscope_client/codex_daemon.py` (modified) + `client/src/burnscope_client/schema.py` (helper) | `AgentSnapshot.semantically_equal(other)` plus a new `_poll_loop` that calls `account/rateLimits/read` every `POLL_INTERVAL_S` and only enqueues when the result differs from `_last_pushed_snapshot`. |
 | **Palette validator** *(Phase 4 — not yet shipped)* | `firmware/main/displays/amoled_sh8601/palette_check.c` (or CMake-time script) | Static check that all colour tokens used by the AMOLED UI satisfy A4. |
 
@@ -218,7 +218,7 @@ firmware/main/
     ├── touch.c                # SHIPPED (Phase 2 PR-1) — polled FT3168 reader for the LVGL indev
     ├── qmi8658.c              # SHIPPED (Phase 2 PR-2) — accel-only QMI8658 driver (motion wake)
     ├── burn_idle_adapter.c    # SHIPPED (Phase 2 PR-1 + PR-2) — events + outputs ↔ hardware
-    ├── orientation.c          # SHIPPED (Phase 3) — accel → quadrant → lv_disp_set_rotation (IMU-ROT-* pending hardware verification)
+    ├── orientation.c          # SHIPPED (Phase 3) — accel → quadrant → lv_display_set_rotation (IMU-ROT-* pending hardware verification)
     └── palette_check.c        # PLANNED (Phase 4) — token validator (or build-time .py)
 
 client/src/burnscope_client/
@@ -313,7 +313,7 @@ quadrants with hysteresis + debounce.
 - `orientation.c`: low-power accel sampling, dominant-axis selector
   with ±0.2 g hysteresis band, 500 ms debounce, calls into LVGL's
   rotation API and into the framebuffer flush pipeline (verify
-  `lv_disp_set_rotation` is sufficient for the SH8601 driver — fall
+  `lv_display_set_rotation` is sufficient for the SH8601 driver — fall
   back to manual rotation if not).
 - New Kconfig option to disable rotation for diagnostic builds.
 
@@ -631,7 +631,7 @@ no-push rate when usage is unchanged.
 | Risk | Likelihood | Impact | Mitigation |
 |------|------------|--------|------------|
 | QMI8658 accel sampling at 21 Hz produces too much jitter at the motion threshold (false `EV_MOTION` storms) | Medium | High — would keep the panel pinned awake | Filter via per-axis low-pass before delta computation; expose threshold as Kconfig (FR-3.8) |
-| `lv_disp_set_rotation` is not honoured by the SH8601 driver path | Medium | Medium | Fall back to manual orientation transform in the LVGL flush callback; gated by Kconfig FR-1.6 |
+| `lv_display_set_rotation` is not honoured by the SH8601 driver path | Medium | Medium | Fall back to manual orientation transform in the LVGL flush callback; gated by Kconfig FR-1.6 |
 | LVGL indev callback stops being scheduled while panel is in `BURN_IDLE_OFF`, breaking touch wake (C-2) | Low | Low — motion / push still wake | Confirmed during bring-up that LVGL's input timer is independent of panel state; if a future refactor changes this, disable touch as a wake source and document the deviation |
 | Codex CLI changes the on-disk rate-limit storage format, or `rateLimits/read` against a long-lived app-server stops re-reading from disk | Low | Medium — poll would return stale values forever | Verify in CI / on bring-up against each `codex-cli` upgrade. Fallback design: periodically `_terminate()` the app-server subprocess so the next `_run_once` iteration's bootstrap re-reads from disk. |
 | Existing colour tokens already violate FR-5 | Medium | Low | Phase 4 acceptance includes a one-time palette audit; treat violations as bugs and fix |

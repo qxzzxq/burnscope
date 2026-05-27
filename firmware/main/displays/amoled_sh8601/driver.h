@@ -31,15 +31,16 @@ lv_display_t *amoled_sh8601_driver_init(void);
  * (`pct * 255 / 100`). No-op if the panel has not been initialised.
  *
  * Locking: internally acquires `lvgl_port_lock` for the duration of the
- * `esp_lcd_panel_io_tx_param` call. Safe to call from any task *except*
- * from within LVGL's own flush callback or any other context that
- * already holds `lvgl_port_lock` (the lock is not recursive in this
- * configuration).
+ * `esp_lcd_panel_io_tx_param` call. `lvgl_port_lock` is a FreeRTOS
+ * recursive mutex (`esp_lvgl_port.c` uses `xSemaphoreCreateRecursiveMutex`
+ * + `xSemaphoreTakeRecursive`), so a caller already holding the lock —
+ * e.g. orientation.c during a rotation-dip fade — can call this safely;
+ * the second take just increments the recursion count.
  *
- * Why this is needed even though `esp_lcd_panel_io_spi` has its own
- * internal mutex: the panel-IO mutex only serialises QSPI bytes on the
- * wire. Its transaction-done notification is associated per-bus, so a
- * brightness write concurrent with an in-flight LVGL pixel flush can
+ * Why this lock is needed even though `esp_lcd_panel_io_spi` has its
+ * own internal mutex: the panel-IO mutex only serialises QSPI bytes on
+ * the wire. Its transaction-done notification is associated per-bus, so
+ * a brightness write concurrent with an in-flight LVGL pixel flush can
  * cause the flush-done semaphore to be lost — wedging LVGL and, on the
  * next call here, this function as well. See PR #53 for the full
  * failure analysis.
@@ -53,6 +54,6 @@ void amoled_sh8601_set_brightness_pct(uint8_t pct);
  *
  * Locking: same contract as `amoled_sh8601_set_brightness_pct` — holds
  * `lvgl_port_lock` for the underlying `esp_lcd_panel_disp_on_off` call.
- * Do not call while already holding `lvgl_port_lock`.
+ * Safe to call while already holding the lock (recursive mutex).
  */
 void amoled_sh8601_set_display_on(bool on);

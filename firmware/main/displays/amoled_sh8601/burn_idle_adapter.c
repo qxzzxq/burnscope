@@ -429,6 +429,25 @@ static void install_button_isr(void)
     ESP_ERROR_CHECK(gpio_isr_handler_add(BUTTON_GPIO, button_isr, NULL));
 }
 
+uint8_t burn_idle_adapter_current_brightness_pct(void)
+{
+    uint8_t pct;
+    portENTER_CRITICAL(&s_fade_mux);
+    pct = s_fade.current_pct;
+    portEXIT_CRITICAL(&s_fade_mux);
+    return pct;
+}
+
+void burn_idle_adapter_anchor_brightness_pct(uint8_t pct)
+{
+    /* Duration 0 → start_fade's short-circuit path: sets
+     * current_pct = pct, active = false, stops the fade timer, bumps
+     * generation. If pct matches the current anchor (typical case
+     * when orientation.c just snapshotted it), brightness_changed is
+     * false and no 0x51 write hits the panel. */
+    start_fade(pct, /*duration_us=*/0, /*pending_panel_off=*/false);
+}
+
 void burn_idle_adapter_start(void)
 {
     if (s_started) {

@@ -97,4 +97,16 @@ menu "AMOLED burn-in mitigation"
             runs after the fade reaches 0. Set to 0 for instantaneous
             dim/off (legacy behavior).
 
+    config BURNSCOPE_AMOLED_ORIENTATION_AUTO
+        bool "Auto-rotate the UI to follow the device's orientation"
+        default y
+        help
+            When enabled, a background task samples the QMI8658
+            accelerometer and rotates the LVGL display in 90°
+            quadrants to match the gravity vector. Disable for
+            diagnostic builds that need a fixed orientation; the
+            burn-in adapter's motion-wake path stays active either
+            way. See docs/fsd/oled-burn-in-mitigation-fsd.md FR-1.6
+            and IMU-ROT-004.
+
 endmenu

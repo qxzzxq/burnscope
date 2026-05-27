@@ -726,24 +726,20 @@ no-push rate when usage is unchanged.
   cost real tokens; direct OpenAI calls bypass `app-server` and
   break the no-tokens-consumed property; shared state across PCs
   needs cloud sync). Document the limitation and accept it for v1.
-- **G-5** Reconnected-device blind-spot in multi-screen setups. The
-  daemon evicts a device from `paired-devices.<agent>.json` after
-  `MAX_TRANSPORT_FAILURES` (= 5) consecutive failures, but it does
-  not re-discover the device when it later comes back online if any
-  other device remains in the paired list:
-  `_resolve_paired_devices` short-circuits on a non-empty cache and
-  never calls `discover_all()`. The user has to run `burnscope pair`
-  manually after a long-disconnect-then-reconnect of one display in
-  a multi-display setup.
-  Relevant to OLED Phase 2 because re-pushing on the firmware's
-  `EV_PUSH` event is the most user-visible way to wake the panel —
-  if the daemon never re-pushes to a returning device, the firmware
-  stays on whatever state it had at boot. A non-invasive fix would
-  be to merge fresh `discover_all()` results into the cached list
-  on every fire/poll instead of short-circuiting on a non-empty
-  cache, but a more elegant solution may need design work to avoid
-  hammering mDNS at every poll tick. Tracked separately from this
-  FSD. See deep review (post-#42) finding H-1.
+- **G-5** ~~Reconnected-device blind-spot in multi-screen setups.~~
+  **RESOLVED** by the mDNS resilience series (see
+  [`mdns-discovery-resilience-plan.html`](../mdns-discovery-resilience-plan.html)).
+  The daemon (and the Claude statusline) no longer evict a device on
+  transport / health failure — only `/summary` 401 may remove a
+  pairing. Transport and health failures are healed in-place via one
+  throttled `discover_all()` per `(agent, device_id)` cooldown (default
+  60 s, configurable via `BURNSCOPE_MDNS_RECONCILE_COOLDOWN_S`), with
+  the refreshed host committed through the update-only
+  `host_cache.update_paired_device_host` so a stale browse cannot
+  resurrect a concurrently-removed pairing. A returning display thus
+  re-receives push and health traffic on the next cycle without any
+  manual `burnscope pair`. Original concern preserved here for
+  historical context; see deep review (post-#42) finding H-1.
 
 ---
 

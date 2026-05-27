@@ -147,11 +147,17 @@ Re-pair via `burnscope-client pair-reset` (client-side cache wipe) plus the
 firmware long-press BOOT (NVS slot wipe).
 
 Shared modules: `schema.py` (frozen dataclasses matching the wire format),
-`discovery.py` (mDNS browse with cache invalidation on transport error),
+`discovery.py` (mDNS browse — resolves both Added and Updated events),
 `identity.py` (plaintext client_id resolver), `host_cache.py` (atomic state
-under `~/.burnscope/`), `pusher.py` (HTTP calls — `PushAuthError` 401 is
-distinct from `PushError` transport so callers know when to invalidate the
-cached host).
+under `~/.burnscope/`, including the per-`(agent, device_id)` mDNS
+reconciliation cooldown), `pusher.py` (HTTP calls plus the throttled
+mDNS-reconciliation helpers: `refresh_and_retry_transport_failures` heals
+stale cached IPs by browsing for the device by `device_id` and updating the
+host in-place via `update_paired_device_host`; `reconcile_duplicate_hosts`
+surfaces identity conflicts when two paired records share a cached host).
+`/summary` 401 is the only signal that removes a pairing — transport and
+health failures keep the device paired and rely on throttled mDNS
+reconciliation to recover.
 
 To add an agent: write a per-fire script (Claude-style) or a long-lived
 daemon module (Codex-style) that builds `AgentSnapshot`s and uses the shared

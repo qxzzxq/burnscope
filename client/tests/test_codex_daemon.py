@@ -1445,6 +1445,102 @@ async def test_pusher_loop_marks_duplicate_host_devices_unverified(monkeypatch):
     assert host_cache.read_push_state("codex")["ok"] is False
 
 
+async def test_health_loop_treats_device_id_mismatch_as_identity_conflict(
+    monkeypatch,
+):
+    """/health succeeded but the responding device's identity doesn't
+    match the paired record — we reached the wrong physical device.
+    Per plan §8c, treat as stale-host conflict: feed the device through
+    the mDNS reconciliation path, do not mark it healthy."""
+    from burnscope_client.discovery import DiscoveredDevice
+
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+    host_cache.add_paired_device(
+        "codex", PairedDevice("burnscope-aaaa", "10.0.0.5:80")
+    )
+
+    async def fake_fetch_health(host, client_id, client):
+        # Whoever is at 10.0.0.5:80 reports a different device_id —
+        # cached host points at someone else's device now.
+        return {"device_id": "burnscope-bbbb", "agents": {}}
+    monkeypatch.setattr(codex_daemon, "fetch_health", fake_fetch_health)
+    monkeypatch.setattr(codex_daemon, "HEALTH_INTERVAL_S", 0.005)
+
+    # mDNS finds the real device at a new host so the reconciliation
+    # path can heal the cache.
+    async def fake_discover_all(timeout=4.0, agent=None, zc=None):
+        return [DiscoveredDevice("burnscope-aaaa", "10.0.0.9:80", True, False)]
+    monkeypatch.setattr(codex_daemon, "discover_all", fake_discover_all)
+
+    task = asyncio.create_task(daemon._health_loop())
+    try:
+        for _ in range(400):
+            cached = host_cache.load_paired_devices("codex")
+            if cached and cached[0].host == "10.0.0.9:80":
+                break
+            await asyncio.sleep(0.005)
+        else:
+            raise AssertionError(
+                "health loop never refreshed host after identity mismatch"
+            )
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    # Cache refreshed to the right device.
+    assert host_cache.load_paired_devices("codex") == [
+        PairedDevice("burnscope-aaaa", "10.0.0.9:80")
+    ]
+
+
+async def test_health_loop_accepts_response_without_device_id(monkeypatch):
+    """Backwards compatibility: older firmware doesn't emit device_id.
+    Absence of the field must not be treated as a mismatch — the daemon
+    falls back to local duplicate-host detection alone (plan §4
+    rollout note)."""
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+    host_cache.add_paired_device(
+        "codex", PairedDevice("burnscope-aaaa", "10.0.0.5:80")
+    )
+
+    async def fake_fetch_health(host, client_id, client):
+        # Pre-0.5.x firmware shape: no device_id field.
+        return {"agents": {}}
+    monkeypatch.setattr(codex_daemon, "fetch_health", fake_fetch_health)
+    monkeypatch.setattr(codex_daemon, "HEALTH_INTERVAL_S", 0.005)
+
+    discovered = False
+
+    async def fake_discover_all(timeout=4.0, agent=None, zc=None):
+        nonlocal discovered
+        discovered = True
+        return []
+    monkeypatch.setattr(codex_daemon, "discover_all", fake_discover_all)
+
+    task = asyncio.create_task(daemon._health_loop())
+    try:
+        # Wait long enough for several cycles to run.
+        await asyncio.sleep(0.05)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    # Pairing untouched, no mDNS reconcile triggered (the probe was
+    # treated as successful because device_id absence ≠ mismatch).
+    assert host_cache.load_paired_devices("codex") == [
+        PairedDevice("burnscope-aaaa", "10.0.0.5:80")
+    ]
+    assert discovered is False, (
+        "absence of device_id must not trigger mDNS reconciliation"
+    )
+    # Health counter must remain at 0 — no failure was recorded.
+    assert daemon._health_failures.get("burnscope-aaaa", 0) == 0
+
+
 async def test_health_loop_marks_duplicate_host_devices_unverified(monkeypatch):
     """Codex health: two paired records share the same cached host. Even
     if /health succeeds at that host, neither device may be reported as

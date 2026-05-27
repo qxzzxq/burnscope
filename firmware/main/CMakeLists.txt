@@ -8,6 +8,7 @@ set(srcs
     "nvs_store.c"
     "snapshot.c"
     "storage.c"
+    "device_id.c"
     "burn_protection/burn_idle.c"
     "factory_reset.c"
     "provisioning.c"

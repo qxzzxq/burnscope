@@ -28,6 +28,7 @@
 #include "freertos/semphr.h"
 #include "nvs.h"
 
+#include "device_id.h"
 #include "mdns_svc.h"
 #include "nvs_store.h"
 #include "snapshot.h"
@@ -822,11 +823,18 @@ static esp_err_t health_get_handler(httpd_req_t *req)
         return httpd_resp_send_500(req);
     }
 
+    /* device_id matches the mDNS hostname (same source via device_id.c).
+     * The daemon uses it to detect duplicate-host conflicts when mDNS
+     * can't split aliased cached entries: a /health success whose
+     * device_id differs from the requested paired record is a stale-
+     * host conflict, not a healthy probe. */
     int off = snprintf(body, cap,
-                       "{\"firmware_version\":\"%s\","
+                       "{\"device_id\":\"%s\","
+                       "\"firmware_version\":\"%s\","
                        "\"uptime_s\":%lu,"
                        "\"free_heap_b\":%lu,"
                        "\"agents\":{",
+                       device_id_str(),
                        BURNSCOPE_FW_VERSION,
                        (unsigned long)uptime_s,
                        (unsigned long)free_heap);

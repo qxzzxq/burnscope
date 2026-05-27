@@ -129,14 +129,13 @@ class CodexDaemon:
         # change — see `_poll_loop`.
         self._last_pushed_snapshot: AgentSnapshot | None = None
         self._proc: asyncio.subprocess.Process | None = None
-        # Two transport-failure counters, one per probe path. Sharing a
-        # single counter caused either path's success to mask the other's
-        # failures: e.g. a device unreachable on `POST /summary` but
-        # answering `GET /health` would never get evicted because health
-        # kept resetting the counter the pusher was trying to accumulate
-        # (and vice versa). With separate counters, *either* path crossing
-        # MAX_TRANSPORT_FAILURES is enough to evict, and each path only
-        # resets its own counter on its own success.
+        # Two transport-failure counters, one per probe path. Each is
+        # diagnostic-only on the push side now (per the mDNS resilience
+        # plan, push transport failures no longer evict — only `/summary`
+        # 401 does). The health side still uses MAX_TRANSPORT_FAILURES
+        # as an eviction threshold; PR 3 of the resilience series will
+        # remove that too. Counters stay split per path so a push success
+        # cannot mask accumulated health failures, and vice versa.
         self._push_failures: dict[str, int] = {}
         self._health_failures: dict[str, int] = {}
 
@@ -374,9 +373,10 @@ class CodexDaemon:
         targeted push (only the diverged devices) instead of going
         through the queue + fan-out-to-all path.
 
-        Updates per-device push state, evicts on 401 or
-        MAX_TRANSPORT_FAILURES, advances `_last_pushed_snapshot` on any
-        device's success, and writes the aggregate status.
+        Updates per-device push state, evicts only on 401 (transport
+        failures are diagnostics-only per the mDNS resilience plan),
+        advances `_last_pushed_snapshot` on any device's success, and
+        writes the aggregate status.
 
         Caller must have already verified `self._client_id is not None`.
         """
@@ -402,17 +402,16 @@ class CodexDaemon:
                 self._health_failures.pop(device_id, None)
                 continue
             if result.kind == "transport":
-                failures = self._push_failures.get(device_id, 0) + 1
-                self._push_failures[device_id] = failures
-                if failures >= MAX_TRANSPORT_FAILURES:
-                    log.warning(
-                        "dropping %s after %d push transport failures",
-                        device_id, MAX_TRANSPORT_FAILURES,
-                    )
-                    host_cache.remove_paired_device(AGENT_NAME, device_id)
-                    self._push_failures.pop(device_id, None)
-                    self._health_failures.pop(device_id, None)
-                    continue
+                # Bump the diagnostics counter so logs and a future
+                # `burnscope status` view can surface a flaky peer, but
+                # DO NOT evict. Per the mDNS resilience plan, transport
+                # failure is a reachability signal, not an ownership one
+                # — the refresh-and-retry helper just ran one throttled
+                # mDNS pass and the device gets another chance next
+                # cycle. Only `/summary` 401 may remove a pairing here.
+                self._push_failures[device_id] = (
+                    self._push_failures.get(device_id, 0) + 1
+                )
             else:
                 # Push succeeded — clear only the push counter. Health
                 # has its own counter and resets independently.
@@ -430,9 +429,10 @@ class CodexDaemon:
         # the push — that device now has the snapshot, so re-pushing the
         # same content next minute would pummel a working peer because
         # of a flaky one. Failing devices fall behind by at most one
-        # poll cycle until the next semantic change, and persistent
-        # failures get evicted by MAX_TRANSPORT_FAILURES (here) and by
-        # the health loop. `overall_ok` is reserved for status reporting.
+        # poll cycle until the next semantic change; transport-failed
+        # peers get healed by the throttled mDNS reconciliation in
+        # `refresh_and_retry_transport_failures` rather than evicted.
+        # `overall_ok` is reserved for status reporting.
         if any_ok:
             self._last_pushed_snapshot = snapshot
 

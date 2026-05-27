@@ -137,6 +137,9 @@ def test_pair_reset_wipes_paired_lists_and_client_ids(_isolate_state=None):
     host_cache.write_client_id("codex",  "b@example.com")
     host_cache.add_paired_device("claude", PairedDevice("dev-1", "1.1.1.1:80"))
     host_cache.add_paired_device("codex",  PairedDevice("dev-2", "2.2.2.2:80"))
+    # Also seed mDNS-reconcile cooldown so we can verify it's cleared.
+    host_cache.claim_reconcile_slots("claude", ["dev-1"], now=1_000_000.0)
+    host_cache.claim_reconcile_slots("codex",  ["dev-2"], now=1_000_000.0)
 
     rc = cli.main(["pair-reset"])
     assert rc == 0
@@ -144,6 +147,14 @@ def test_pair_reset_wipes_paired_lists_and_client_ids(_isolate_state=None):
     assert host_cache.read_client_id("codex")  is None
     assert host_cache.load_paired_devices("claude") == []
     assert host_cache.load_paired_devices("codex")  == []
+    # Reconcile cooldown is wiped so a fresh re-pair doesn't have to
+    # wait for timestamps referencing devices we just forgot.
+    assert host_cache.claim_reconcile_slots(
+        "claude", ["dev-1"], now=1_000_005.0, cooldown_s=60.0,
+    ) == {"dev-1"}
+    assert host_cache.claim_reconcile_slots(
+        "codex", ["dev-2"], now=1_000_005.0, cooldown_s=60.0,
+    ) == {"dev-2"}
 
 
 def test_pair_reset_warns_when_codex_daemon_supervisor_present(

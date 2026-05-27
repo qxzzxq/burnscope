@@ -1262,6 +1262,57 @@ async def test_health_failures_alone_trigger_eviction(monkeypatch):
     assert daemon._health_failures.get("dev-quiet", 0) == 0
 
 
+# ====================== mDNS resilience §7: push transport failures don't evict
+
+
+async def test_pusher_loop_keeps_device_after_many_push_transport_failures(
+    monkeypatch,
+):
+    """Codex push path must not evict a device after MAX_TRANSPORT_FAILURES
+    transport misses. Reachability failure is not ownership loss — the
+    device may have been rebooted, roamed networks, or moved IP. Keep
+    it paired and let the throttled mDNS reconciliation heal it.
+
+    Counter still bumps for diagnostics (so `burnscope status` can show
+    the degraded device), but no `remove_paired_device` call is made on
+    transport failures.
+    """
+    from burnscope_client import pusher as pusher_mod
+
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+    host_cache.add_paired_device("codex", PairedDevice("dev-flaky", "10.0.0.5:80"))
+
+    async def fake_push_to_all(snapshot, devices, client_id, client):
+        return {d.device_id: PushResult(d.device_id, False, "transport") for d in devices}
+
+    monkeypatch.setattr(codex_daemon, "push_to_all", fake_push_to_all)
+    # Block the refresh path from healing the failure.
+    monkeypatch.setattr(pusher_mod, "push_to_all", fake_push_to_all)
+
+    async def fake_discover_all(timeout=4.0, agent=None, zc=None):
+        return []
+    monkeypatch.setattr(pusher_mod, "discover_all", fake_discover_all)
+
+    # Fire well past the old eviction threshold.
+    for i in range(10):
+        daemon._enqueue_snapshot(
+            AgentSnapshot(
+                agent="codex",
+                captured_at=i,
+                sessions=[SessionSnapshot("primary", 0.5, 1779066600)],
+            )
+        )
+        await _drain_one_push(
+            daemon,
+            predicate=lambda i=i: daemon._push_failures.get("dev-flaky", 0) >= i + 1,
+        )
+
+    paired = {d.device_id for d in host_cache.load_paired_devices("codex")}
+    assert paired == {"dev-flaky"}, "transport failures must not evict"
+    assert daemon._push_failures["dev-flaky"] == 10  # counter still advances
+
+
 # =================================================== L-6: per-device divergence
 
 

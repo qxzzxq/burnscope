@@ -35,14 +35,22 @@ import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Iterable, Iterator
 
 log = logging.getLogger(__name__)
 
 _LAST_PUSH_PREFIX = "last-push."
 _CLIENT_ID_PREFIX = "client-id."
 _PAIRED_DEVICES_PREFIX = "paired-devices."
+_RECONCILE_PREFIX = "mdns-reconcile."
 _LEGACY_HOST_FILENAME = "host"
+
+# Default per-(agent, device_id) cooldown between mDNS reconciliation
+# browses. The plan caps the firmware-side cost: a powered-off device
+# shouldn't be able to trigger a fresh full-LAN browse on every
+# statusline fire (~once a turn) or every push/health failure event.
+# Overridable for tests and ops via BURNSCOPE_MDNS_RECONCILE_COOLDOWN_S.
+RECONCILE_COOLDOWN_DEFAULT_S = 60.0
 
 _MAX_CLIENT_ID_LEN = 254  # RFC 5321 email cap; leaves headroom for userIDs.
 _MAX_DEVICE_ID_LEN = 64
@@ -290,6 +298,110 @@ def clear_paired_devices(agent: str) -> None:
         pass
 
 
+# --------------------------------------------------- mDNS reconciliation throttle
+
+def _reconcile_path(agent: str) -> Path:
+    return state_dir() / f"{_RECONCILE_PREFIX}{agent}.json"
+
+
+def _reconcile_cooldown_s() -> float:
+    raw = os.environ.get("BURNSCOPE_MDNS_RECONCILE_COOLDOWN_S")
+    if raw is None:
+        return RECONCILE_COOLDOWN_DEFAULT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        log.warning(
+            "BURNSCOPE_MDNS_RECONCILE_COOLDOWN_S=%r is not a float; using default",
+            raw,
+        )
+        return RECONCILE_COOLDOWN_DEFAULT_S
+    return max(0.0, value)
+
+
+def _load_reconcile_state(agent: str) -> dict[str, float]:
+    path = _reconcile_path(agent)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        log.warning("%s contained invalid JSON; resetting", path.name)
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    out: dict[str, float] = {}
+    for key, value in parsed.items():
+        if not isinstance(key, str) or _safe_device_id(key) is None:
+            continue
+        if not isinstance(value, (int, float)):
+            continue
+        out[key] = float(value)
+    return out
+
+
+def claim_reconcile_slots(
+    agent: str,
+    device_ids: Iterable[str],
+    *,
+    now: float | None = None,
+    cooldown_s: float | None = None,
+) -> set[str]:
+    """Atomically filter `device_ids` to the ones whose reconciliation
+    cooldown has expired, and mark each as just-reconciled.
+
+    Reconciliation cost (a full LAN mDNS browse) is fixed-per-call, so
+    the per-(agent, device_id) cooldown caps how often a single failing
+    device can drive new browses. The file-backed map survives across
+    short-lived statusline children and across daemon restarts, so
+    cooldown state isn't lost on process death.
+
+    The read-check-write sequence runs inside the per-agent flock for
+    serializability against concurrent claimants. Two statusline children
+    racing the same device get exactly one winner — the loser sees its
+    own just-written timestamp and reports the device as in-cooldown.
+
+    Unsafe `device_id` values are silently dropped (return set excludes
+    them) to match the rest of this module's policy on malicious mDNS
+    responders.
+
+    Returns the set the caller should now browse for; entries inside
+    their cooldown window are omitted.
+    """
+    requested = [d for d in device_ids if _safe_device_id(d) is not None]
+    if not requested:
+        return set()
+    now_ts = float(now) if now is not None else time.time()
+    cooldown = float(cooldown_s) if cooldown_s is not None else _reconcile_cooldown_s()
+    eligible: set[str] = set()
+    with _with_lock(agent):
+        state = _load_reconcile_state(agent)
+        for device_id in requested:
+            last_ts = state.get(device_id)
+            if last_ts is None or (now_ts - last_ts) >= cooldown:
+                eligible.add(device_id)
+                state[device_id] = now_ts
+        if eligible:
+            _atomic_write(_reconcile_path(agent), json.dumps(state))
+    return eligible
+
+
+def clear_reconcile_state(agent: str) -> None:
+    """Drop the per-agent reconcile cooldown map. Idempotent.
+
+    Called by `pair-reset` so a fresh re-pair after wiping local state
+    doesn't have to wait for cooldown timestamps that referenced
+    devices we no longer trust.
+    """
+    path = _reconcile_path(agent)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
 # ----------------------------------------------------------- last-push state
 
 def _last_push_path(agent: str, device_id: str | None) -> Path:
@@ -322,11 +434,11 @@ def bump_push_failures(agent: str, device_id: str) -> int:
     `burnscope status` reflects the latest outcome.
 
     Stateless callers (the claude statusline `--push` child) use this
-    to make eviction decisions across short-lived process lifetimes:
-    each fire bumps the counter, and after `MAX_TRANSPORT_FAILURES`
-    consecutive bumps the caller can evict the device. Serialized via
-    flock so two concurrent statusline children can't both miss each
-    other's increments.
+    to make the counter visible across short-lived process lifetimes
+    so `burnscope status` can surface degraded devices. Per the mDNS
+    resilience plan the counter is diagnostic-only — only `/summary`
+    401 may remove a pairing. Serialized via flock so two concurrent
+    statusline children can't both miss each other's increments.
 
     Unsafe `device_id` values yield 0 silently (matches the rest of
     this module's resilient policy on malicious mDNS responders).

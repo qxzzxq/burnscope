@@ -159,6 +159,9 @@ def main(argv: list[str] | None = None) -> int:
             host_cache.clear_paired_devices(agent)
             host_cache.clear_push_state(agent)
             host_cache.invalidate_client_id(agent)
+            # Drop reconcile cooldown so a fresh re-pair doesn't have to
+            # wait for timestamps referencing devices we just forgot.
+            host_cache.clear_reconcile_state(agent)
         print("Forgot paired devices, push state, and per-agent client_ids.")
         # The codex daemon, if installed, holds an in-memory copy of
         # _last_pushed_snapshot and _transport_failures that we just

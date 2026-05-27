@@ -228,6 +228,40 @@ def add_paired_device(agent: str, device: PairedDevice) -> None:
         save_paired_devices(agent, updated)
 
 
+def update_paired_device_host(agent: str, device_id: str, host: str) -> bool:
+    """Update one paired device's `host` in-place. Never inserts.
+
+    Returns True iff the device was present and its host was rewritten;
+    False if the device is no longer paired (so a concurrent
+    `/summary` 401 or `pair-reset` already removed it).
+
+    This is the narrow update-only sibling of `add_paired_device`. mDNS
+    reconciliation paths must use it instead of `add_paired_device` so a
+    stale browse that started before a concurrent removal cannot
+    resurrect a forgotten pairing. The load → check → save sequence runs
+    inside the per-agent flock for serializability against other
+    statusline children and the codex daemon.
+
+    Unsafe `device_id` values are rejected (return False) to match the
+    rest of this module's resilient policy on malicious mDNS responders.
+    """
+    if _safe_device_id(device_id) is None:
+        log.warning(
+            "update_paired_device_host: rejecting unsafe device_id %r", device_id
+        )
+        return False
+    with _with_lock(agent):
+        existing = load_paired_devices(agent)
+        for idx, current in enumerate(existing):
+            if current.device_id == device_id:
+                if current.host == host:
+                    return True
+                existing[idx] = PairedDevice(device_id=device_id, host=host)
+                save_paired_devices(agent, existing)
+                return True
+        return False
+
+
 def remove_paired_device(agent: str, device_id: str) -> None:
     """Drop the device with this `device_id`. No-op if not present.
 

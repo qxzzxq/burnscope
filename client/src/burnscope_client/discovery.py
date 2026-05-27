@@ -74,7 +74,13 @@ async def discover_all(
     log.debug("mDNS browse start: %s (timeout=%.1fs)", SERVICE_TYPE, timeout)
 
     def _on_change(zeroconf, service_type, name, state_change):
-        if state_change is not ServiceStateChange.Added:
+        # Resolve on both Added and Updated. zeroconf delivers Updated
+        # when a record (TXT, address, port) changes mid-browse; ignoring
+        # it would leave a stale snapshot for any device whose host or
+        # paired_* hint changed during the browse window. Removed events
+        # stay ignored — absence is not a deletion signal for BurnScope
+        # (the resilience plan keeps paired devices through mDNS gaps).
+        if state_change not in (ServiceStateChange.Added, ServiceStateChange.Updated):
             return
         task = asyncio.create_task(_resolve(zc, service_type, name, devices))
         resolve_tasks.add(task)

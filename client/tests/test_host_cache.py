@@ -376,3 +376,82 @@ def test_bump_push_failures_rejects_unsafe_device_id(_state_dir):
     assert host_cache.bump_push_failures("claude", "../etc/passwd") == 0
     # No state file created.
     assert host_cache.read_push_state("claude", device_id="dev-x") is None
+
+
+# =================================== mDNS resilience §1: update_paired_device_host
+
+def test_update_paired_device_host_rewrites_host_for_known_device(_state_dir):
+    host_cache.add_paired_device("claude", PairedDevice("dev-x", "10.0.0.5:80"))
+    host_cache.add_paired_device("claude", PairedDevice("dev-y", "10.0.0.6:80"))
+
+    changed = host_cache.update_paired_device_host(
+        "claude", "dev-x", "10.0.0.99:80"
+    )
+
+    assert changed is True
+    devices = {d.device_id: d.host for d in host_cache.load_paired_devices("claude")}
+    assert devices == {"dev-x": "10.0.0.99:80", "dev-y": "10.0.0.6:80"}
+
+
+def test_update_paired_device_host_returns_false_for_unknown_device(_state_dir):
+    """The whole reason this primitive exists: a stale reconciliation pass
+    that started before a concurrent /summary 401 or pair-reset removed
+    the device must NOT resurrect it. Returning False is the contract the
+    pusher relies on to drop the retry."""
+    host_cache.add_paired_device("claude", PairedDevice("dev-x", "10.0.0.5:80"))
+
+    changed = host_cache.update_paired_device_host(
+        "claude", "dev-removed", "10.0.0.99:80"
+    )
+
+    assert changed is False
+    # Still only the original device — no resurrection.
+    devices = host_cache.load_paired_devices("claude")
+    assert [d.device_id for d in devices] == ["dev-x"]
+
+
+def test_update_paired_device_host_returns_false_when_file_missing(_state_dir):
+    changed = host_cache.update_paired_device_host(
+        "claude", "dev-x", "10.0.0.99:80"
+    )
+    assert changed is False
+    assert host_cache.load_paired_devices("claude") == []
+
+
+def test_update_paired_device_host_rejects_unsafe_device_id(_state_dir):
+    host_cache.add_paired_device("claude", PairedDevice("dev-x", "10.0.0.5:80"))
+    changed = host_cache.update_paired_device_host(
+        "claude", "../../etc/passwd", "10.0.0.99:80"
+    )
+    assert changed is False
+    devices = host_cache.load_paired_devices("claude")
+    assert devices == [PairedDevice("dev-x", "10.0.0.5:80")]
+
+
+def test_update_paired_device_host_preserves_order(_state_dir):
+    """Refreshing one device's host must not reorder peers — the on-disk
+    list is occasionally inspected by `burnscope status` and order is
+    part of the user-visible UX."""
+    host_cache.add_paired_device("claude", PairedDevice("dev-a", "10.0.0.5:80"))
+    host_cache.add_paired_device("claude", PairedDevice("dev-b", "10.0.0.6:80"))
+    host_cache.add_paired_device("claude", PairedDevice("dev-c", "10.0.0.7:80"))
+
+    host_cache.update_paired_device_host("claude", "dev-b", "10.0.0.99:80")
+
+    devices = host_cache.load_paired_devices("claude")
+    assert [d.device_id for d in devices] == ["dev-a", "dev-b", "dev-c"]
+    assert devices[1].host == "10.0.0.99:80"
+
+
+def test_update_paired_device_host_does_not_clobber_unrelated_agent(_state_dir):
+    host_cache.add_paired_device("claude", PairedDevice("dev-x", "10.0.0.5:80"))
+    host_cache.add_paired_device("codex", PairedDevice("dev-x", "10.0.0.6:80"))
+
+    host_cache.update_paired_device_host("claude", "dev-x", "10.0.0.99:80")
+
+    assert host_cache.load_paired_devices("claude") == [
+        PairedDevice("dev-x", "10.0.0.99:80")
+    ]
+    assert host_cache.load_paired_devices("codex") == [
+        PairedDevice("dev-x", "10.0.0.6:80")
+    ]

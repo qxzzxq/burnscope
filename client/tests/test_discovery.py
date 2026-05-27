@@ -1,10 +1,12 @@
+import asyncio
 import logging
 import socket
 
 import pytest
-from zeroconf import ServiceInfo
+from zeroconf import ServiceInfo, ServiceStateChange
 from zeroconf.asyncio import AsyncZeroconf
 
+from burnscope_client import discovery
 from burnscope_client.discovery import (
     SERVICE_TYPE,
     DiscoveredDevice,
@@ -253,3 +255,63 @@ async def test_discover_all_treats_legacy_firmware_as_paired():
     # browse — the v2 client would otherwise auto-pair an older firmware
     # that doesn't know how to surface its slot state.
     assert all(d.device_id != "burnscope-old1" for d in free_for_claude)
+
+
+# ============================= mDNS resilience §9: Updated events get resolved
+
+async def test_discover_all_resolves_both_added_and_updated(monkeypatch):
+    """A `ServiceStateChange.Updated` event (e.g. TXT or address change
+    mid-browse) must trigger resolution. Otherwise a device whose
+    presence only ever fires as Updated — or whose record changes during
+    the browse window — would never appear in the discovery result.
+    `Removed` events stay ignored because absence is not a deletion
+    signal in BurnScope (we keep paired devices regardless of mDNS
+    visibility per the resilience plan)."""
+    captured: dict = {}
+
+    class _FakeBrowser:
+        def __init__(self, zc_inner, service_type, handlers):
+            captured["handler"] = handlers[0]
+
+        async def async_cancel(self):
+            return None
+
+    monkeypatch.setattr(discovery, "AsyncServiceBrowser", _FakeBrowser)
+
+    resolved_names: list[str] = []
+
+    async def _fake_resolve(zc, service_type, name, sink):
+        resolved_names.append(name)
+        instance = name.removesuffix("." + service_type)
+        sink[instance] = DiscoveredDevice(
+            device_id=instance,
+            host="10.0.0.5:80",
+            paired_claude=False,
+            paired_codex=False,
+        )
+
+    monkeypatch.setattr(discovery, "_resolve", _fake_resolve)
+
+    isolated_zc = AsyncZeroconf()
+    try:
+        task = asyncio.create_task(discover_all(timeout=0.3, zc=isolated_zc))
+        # Wait until the fake browser has captured the handler.
+        for _ in range(50):
+            if "handler" in captured:
+                break
+            await asyncio.sleep(0.005)
+        assert "handler" in captured, "AsyncServiceBrowser was never constructed"
+
+        handler = captured["handler"]
+        handler(None, SERVICE_TYPE, f"first.{SERVICE_TYPE}", ServiceStateChange.Added)
+        handler(None, SERVICE_TYPE, f"second.{SERVICE_TYPE}", ServiceStateChange.Updated)
+        handler(None, SERVICE_TYPE, f"gone.{SERVICE_TYPE}", ServiceStateChange.Removed)
+
+        devices = await task
+    finally:
+        await isolated_zc.async_close()
+
+    ids = {d.device_id for d in devices}
+    assert "first" in ids, "Added event must trigger resolution (regression check)"
+    assert "second" in ids, "Updated event must trigger resolution (§9 fix)"
+    assert "gone" not in ids, "Removed events must stay ignored"

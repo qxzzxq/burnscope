@@ -522,6 +522,24 @@ class CodexDaemon:
                     if body is None:
                         failed_devices.append(device)
                         continue
+                    # Identity verification (plan §8c): firmware ≥0.5.x
+                    # echoes `device_id` in /health. A mismatch means we
+                    # reached someone else's device at the cached host —
+                    # treat as a stale-host conflict so the mDNS reconcile
+                    # path runs. Older firmware omits the field; absence
+                    # is not a mismatch (backwards-compatible fallback).
+                    actual_id = body.get("device_id")
+                    if (
+                        isinstance(actual_id, str)
+                        and actual_id != device.device_id
+                    ):
+                        log.warning(
+                            "health: %s replied with device_id=%s (expected %s); "
+                            "treating as identity conflict",
+                            device.host, actual_id, device.device_id,
+                        )
+                        failed_devices.append(device)
+                        continue
                     ok_devices.append(device)
                     self._mark_health_ok(device, body, diverged_devices)
                 healed: set[str] = set()

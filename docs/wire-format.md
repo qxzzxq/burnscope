@@ -96,6 +96,7 @@ Response is JSON:
 
 | Field              | Type    | Description |
 |--------------------|---------|-------------|
+| `device_id`        | string  | Stable per-device identifier — the same `burnscope-XXXX` string the firmware advertises as its mDNS hostname (last two hex bytes of the WiFi STA MAC, lowercased). Matches `DiscoveredDevice.device_id` on the client. The daemon uses this for identity verification: a `/health` success whose `device_id` differs from the requested paired record is a stale-host / identity conflict, not a healthy probe — the cached host has been reassigned (DHCP) or aliases another paired entry. Pre-mDNS-resilience firmware images omit this field; the daemon treats absence as "trust the host" and relies on local duplicate-host detection alone. |
 | `firmware_version` | string  | Built-in version string. |
 | `uptime_s`         | integer | Seconds since boot. |
 | `free_heap_b`      | integer | Free heap in bytes. |

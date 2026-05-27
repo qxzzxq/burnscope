@@ -5,10 +5,10 @@
 
 #include "esp_err.h"
 #include "esp_log.h"
-#include "esp_mac.h"
 #include "mdns.h"
 #include "nvs.h"
 
+#include "device_id.h"
 #include "nvs_store.h"
 #include "version.h"
 
@@ -59,21 +59,24 @@ void mdns_svc_start(void)
 
     ESP_ERROR_CHECK(mdns_init());
 
-    uint8_t mac[6] = { 0 };
-    ESP_ERROR_CHECK(esp_read_mac(mac, ESP_MAC_WIFI_STA));
-
-    char hostname[32];
-    snprintf(hostname, sizeof(hostname), "burnscope-%02x%02x", mac[4], mac[5]);
+    /* Hostname is the device_id — single source of truth (device_id.c).
+     * The /health handler emits the same string so the daemon can
+     * verify HTTP identity against the cached mDNS hostname. */
+    const char *hostname = device_id_str();
     ESP_ERROR_CHECK(mdns_hostname_set(hostname));
 
-    /* Instance name carries the same MAC suffix so two devices on one LAN
+    /* Instance name carries the MAC suffix so two devices on one LAN
      * advertise as e.g. "BurnScope f64c" / "BurnScope 5730" instead of
      * relying on Bonjour to auto-rename one to "BurnScope-2". The
      * client's `device_id` keys off the hostname (which is unambiguous
      * either way), but a human-readable, collision-free instance name
-     * makes `dns-sd -B` and other tooling much easier to read. */
+     * makes `dns-sd -B` and other tooling much easier to read.
+     *
+     * Reads the same hostname suffix back so the two strings can't
+     * drift (e.g. if device_id ever changed format). */
     char instance[40];
-    snprintf(instance, sizeof(instance), "BurnScope %02x%02x", mac[4], mac[5]);
+    const char *suffix = hostname + (sizeof("burnscope-") - 1);
+    snprintf(instance, sizeof(instance), "BurnScope %s", suffix);
     ESP_ERROR_CHECK(mdns_instance_name_set(instance));
 
     mdns_txt_item_t txt[] = {

@@ -15,6 +15,7 @@ from burnscope_client.pusher import (
     fetch_health,
     push,
     push_to_all,
+    reconcile_duplicate_hosts,
     refresh_and_retry_transport_failures,
 )
 from burnscope_client.schema import AgentSnapshot, SessionSnapshot
@@ -348,6 +349,131 @@ async def test_refresh_and_retry_drops_retry_when_device_unpaired_concurrently(
     # Original transport failure preserved; no resurrected entry on disk.
     assert out["dev-moved"].kind == "transport"
     assert host_cache.load_paired_devices("claude") == []
+
+
+# =============================== mDNS resilience §3: reconcile_duplicate_hosts
+
+async def test_reconcile_duplicate_hosts_no_browse_when_no_duplicates(monkeypatch):
+    """Unique cached hosts → no mDNS browse, no unverified set."""
+    async def boom(*a, **kw):
+        raise AssertionError("discover_all must not run without duplicate hosts")
+    monkeypatch.setattr(pusher, "discover_all", boom)
+
+    devices = [
+        PairedDevice("dev-a", "10.0.0.5:80"),
+        PairedDevice("dev-b", "10.0.0.6:80"),
+    ]
+    unverified = await reconcile_duplicate_hosts("claude", devices)
+    assert unverified == set()
+
+
+async def test_reconcile_duplicate_hosts_splits_via_mdns(monkeypatch):
+    """Two paired records share a stale host; mDNS reveals their real
+    distinct hosts; update_paired_device_host splits them; nobody ends
+    up unverified."""
+    host_cache.add_paired_device("claude", PairedDevice("dev-a", "10.0.0.5:80"))
+    host_cache.add_paired_device("claude", PairedDevice("dev-b", "10.0.0.5:80"))
+    devices = host_cache.load_paired_devices("claude")
+
+    async def fake_discover(timeout=4.0, agent=None, zc=None):
+        return [
+            DiscoveredDevice("dev-a", "10.0.0.5:80", True, False),
+            DiscoveredDevice("dev-b", "10.0.0.7:80", True, False),
+        ]
+    monkeypatch.setattr(pusher, "discover_all", fake_discover)
+
+    unverified = await reconcile_duplicate_hosts("claude", devices)
+    assert unverified == set()
+    final = {d.device_id: d.host for d in host_cache.load_paired_devices("claude")}
+    assert final == {"dev-a": "10.0.0.5:80", "dev-b": "10.0.0.7:80"}
+
+
+async def test_reconcile_duplicate_hosts_marks_unresolved_unverified(monkeypatch):
+    """mDNS can't see either of the conflicting devices → both stay
+    paired and the set of unverified ids is returned so the caller
+    won't mark them healthy from a shared HTTP response."""
+    host_cache.add_paired_device("claude", PairedDevice("dev-a", "10.0.0.5:80"))
+    host_cache.add_paired_device("claude", PairedDevice("dev-b", "10.0.0.5:80"))
+    devices = host_cache.load_paired_devices("claude")
+
+    async def fake_discover(timeout=4.0, agent=None, zc=None):
+        return []
+    monkeypatch.setattr(pusher, "discover_all", fake_discover)
+
+    unverified = await reconcile_duplicate_hosts("claude", devices)
+    assert unverified == {"dev-a", "dev-b"}
+    # Pairings preserved (plan §3: never remove from this path).
+    assert len(host_cache.load_paired_devices("claude")) == 2
+
+
+async def test_reconcile_duplicate_hosts_throttles_browses(monkeypatch):
+    """Repeated calls inside the cooldown must not browse twice for the
+    same conflict — the throttle is shared with the transport-failure
+    path so they can't double-trigger a browse for the same device_id."""
+    host_cache.add_paired_device("claude", PairedDevice("dev-a", "10.0.0.5:80"))
+    host_cache.add_paired_device("claude", PairedDevice("dev-b", "10.0.0.5:80"))
+    devices = host_cache.load_paired_devices("claude")
+
+    browses = 0
+
+    async def counting_discover(timeout=4.0, agent=None, zc=None):
+        nonlocal browses
+        browses += 1
+        return []
+    monkeypatch.setattr(pusher, "discover_all", counting_discover)
+
+    await reconcile_duplicate_hosts("claude", devices)
+    await reconcile_duplicate_hosts("claude", devices)
+
+    assert browses == 1
+
+
+async def test_reconcile_duplicate_hosts_marks_cooldown_blocked_as_unverified(
+    monkeypatch,
+):
+    """If the throttle blocks the browse, the conflict cannot be
+    resolved this cycle — every device in the duplicate-host group
+    must be reported as unverified so the caller doesn't claim
+    per-device success from a shared HTTP response."""
+    host_cache.add_paired_device("claude", PairedDevice("dev-a", "10.0.0.5:80"))
+    host_cache.add_paired_device("claude", PairedDevice("dev-b", "10.0.0.5:80"))
+    # Pre-warm the cooldown so the next call short-circuits.
+    host_cache.claim_reconcile_slots(
+        "claude", ["dev-a", "dev-b"], now=1_000_000.0, cooldown_s=3600.0,
+    )
+
+    async def boom(*a, **kw):
+        raise AssertionError("cooldown should block the browse")
+    monkeypatch.setattr(pusher, "discover_all", boom)
+
+    # Default 60 s cooldown is overridden by env in this test? No —
+    # we just pre-claimed with 3600 s, so default 60 s still blocks.
+    devices = host_cache.load_paired_devices("claude")
+    unverified = await reconcile_duplicate_hosts("claude", devices)
+    assert unverified == {"dev-a", "dev-b"}
+
+
+async def test_reconcile_duplicate_hosts_keeps_unmoved_collider_unverified(
+    monkeypatch,
+):
+    """If mDNS finds one of the duplicates at a new host but the other
+    only at the same shared host, the collider that didn't move stays
+    unverified — its cached host still aliases another paired entry."""
+    host_cache.add_paired_device("claude", PairedDevice("dev-a", "10.0.0.5:80"))
+    host_cache.add_paired_device("claude", PairedDevice("dev-b", "10.0.0.5:80"))
+    devices = host_cache.load_paired_devices("claude")
+
+    async def fake_discover(timeout=4.0, agent=None, zc=None):
+        return [
+            DiscoveredDevice("dev-a", "10.0.0.5:80", True, False),
+            # dev-b not visible — can't refresh its host.
+        ]
+    monkeypatch.setattr(pusher, "discover_all", fake_discover)
+
+    unverified = await reconcile_duplicate_hosts("claude", devices)
+    # Both ids end up in the unverified set because their cached hosts
+    # still alias after the partial reconciliation.
+    assert unverified == {"dev-a", "dev-b"}
 
 
 @respx.mock

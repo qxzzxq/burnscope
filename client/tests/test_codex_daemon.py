@@ -1141,9 +1141,11 @@ async def test_push_one_advances_last_pushed_snapshot_on_partial_success(monkeyp
     # Aggregate `ok` still reports the truth that one device is unhealthy.
     assert host_cache.read_push_state("codex")["ok"] is False
     # Flaky peer is still paired (transport failure, not auth) and its
-    # push-failure counter has advanced toward MAX_TRANSPORT_FAILURES.
-    # Health counter is independent and should still be zero (no health
-    # probe ran in this test).
+    # diagnostic push-failure counter has advanced by one. Per the mDNS
+    # resilience plan the counter never drives eviction — it's just for
+    # logs and `burnscope status` to surface degraded peers. The health
+    # counter is independent and should still be zero (no health probe
+    # ran in this test).
     assert daemon._push_failures.get("dev-flaky") == 1
     assert daemon._health_failures.get("dev-flaky", 0) == 0
     assert {d.device_id for d in host_cache.load_paired_devices("codex")} == {
@@ -1217,49 +1219,186 @@ async def test_push_counter_does_not_reset_health_counter(monkeypatch):
     assert daemon._health_failures.get("dev-x") == 3
 
 
-async def test_health_failures_alone_trigger_eviction(monkeypatch):
-    """If health-side accumulates MAX failures, evict even when the
-    push-side hasn't observed any failures (deep-review H-2).
+async def test_health_loop_keeps_device_after_many_health_failures(monkeypatch):
+    """Per the mDNS resilience plan (§8), health failures must NEVER evict
+    a pairing. Only /summary 401 is an ownership signal. A device that
+    fails GET /health forever stays paired and shows up as degraded in
+    `burnscope status` so the user can investigate.
     """
+    from burnscope_client import pusher as pusher_mod
+
     daemon = CodexDaemon()
     daemon._client_id = "u@example.com"
     host_cache.add_paired_device("codex", PairedDevice("dev-quiet", "10.0.0.5:80"))
-
-    from burnscope_client import pusher as pusher_mod
 
     async def fake_fetch_health(host, client_id, client):
         return None  # always transport-fails
 
     monkeypatch.setattr(codex_daemon, "fetch_health", fake_fetch_health)
-    monkeypatch.setattr(codex_daemon, "HEALTH_INTERVAL_S", 0.005)
+    monkeypatch.setattr(codex_daemon, "HEALTH_INTERVAL_S", 0.001)
 
-    async def fake_push_to_all(snapshot, devices, client_id, client):
-        # Health loop never enqueues a push in this test — but if it does,
-        # don't double-evict from this side.
-        return {d.device_id: PushResult(d.device_id, True, "ok") for d in devices}
-
-    monkeypatch.setattr(codex_daemon, "push_to_all", fake_push_to_all)
-
+    # Health loop's mDNS reconciliation path must also find nothing.
     async def fake_discover_all(timeout=4.0, agent=None, zc=None):
         return []
+    monkeypatch.setattr(codex_daemon, "discover_all", fake_discover_all)
     monkeypatch.setattr(pusher_mod, "discover_all", fake_discover_all)
 
     task = asyncio.create_task(daemon._health_loop())
     try:
-        for _ in range(200):
-            if "dev-quiet" not in {d.device_id for d in host_cache.load_paired_devices("codex")}:
+        for _ in range(500):
+            if daemon._health_failures.get("dev-quiet", 0) >= 10:
                 break
             await asyncio.sleep(0.005)
         else:
-            raise AssertionError("device was never evicted by health loop")
+            raise AssertionError("counter never reached 10 misses")
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
 
+    # Counter advanced past the old eviction threshold; device still paired.
+    assert daemon._health_failures["dev-quiet"] >= 10
+    paired = {d.device_id for d in host_cache.load_paired_devices("codex")}
+    assert paired == {"dev-quiet"}
+
+
+async def test_health_loop_recovers_via_mdns_when_ip_changes(monkeypatch):
+    """Stale cached IP → /health fails → one throttled mDNS browse
+    rediscovers the device at its new host → retry /health at the new
+    host succeeds, the cache is updated, and the failure counter resets.
+    Without this path the codex daemon would keep probing the stale IP
+    forever even though the device is alive on the LAN."""
+    from burnscope_client.discovery import DiscoveredDevice
+
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+    host_cache.add_paired_device("codex", PairedDevice("dev-moved", "10.0.0.5:80"))
+
+    health_calls: list[str] = []
+
+    async def fake_fetch_health(host, client_id, client):
+        health_calls.append(host)
+        if host == "10.0.0.5:80":
+            return None
+        return {"agents": {}}
+
+    monkeypatch.setattr(codex_daemon, "fetch_health", fake_fetch_health)
+    monkeypatch.setattr(codex_daemon, "HEALTH_INTERVAL_S", 0.005)
+
+    async def fake_discover_all(timeout=4.0, agent=None, zc=None):
+        return [DiscoveredDevice("dev-moved", "10.0.0.9:80", True, False)]
+    monkeypatch.setattr(codex_daemon, "discover_all", fake_discover_all)
+
+    task = asyncio.create_task(daemon._health_loop())
+    try:
+        for _ in range(400):
+            cached = host_cache.load_paired_devices("codex")
+            if cached and cached[0].host == "10.0.0.9:80":
+                break
+            await asyncio.sleep(0.005)
+        else:
+            raise AssertionError("health loop never refreshed cached host")
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert host_cache.load_paired_devices("codex") == [
+        PairedDevice("dev-moved", "10.0.0.9:80")
+    ]
+    # Counter cleared by successful retry.
+    assert daemon._health_failures.get("dev-moved", 0) == 0
+    assert "10.0.0.5:80" in health_calls  # initial probe hit stale host
+    assert "10.0.0.9:80" in health_calls  # retry hit refreshed host
+
+
+async def test_health_loop_throttles_repeated_mdns_browses(monkeypatch):
+    """Repeated health failures inside the cooldown window must not
+    trigger repeated mDNS browses for the same offline device. The
+    `claim_reconcile_slots` gate keeps a powered-off display from
+    forcing a full LAN browse every HEALTH_INTERVAL_S."""
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+    host_cache.add_paired_device("codex", PairedDevice("dev-down", "10.0.0.5:80"))
+
+    async def always_fail(host, client_id, client):
+        return None
+    monkeypatch.setattr(codex_daemon, "fetch_health", always_fail)
+    monkeypatch.setattr(codex_daemon, "HEALTH_INTERVAL_S", 0.001)
+
+    browses = 0
+
+    async def counting_discover(timeout=4.0, agent=None, zc=None):
+        nonlocal browses
+        browses += 1
+        return []
+    monkeypatch.setattr(codex_daemon, "discover_all", counting_discover)
+
+    task = asyncio.create_task(daemon._health_loop())
+    try:
+        # Wait for the counter to accumulate well past 1 — proves multiple
+        # health cycles ran. Default cooldown 60 s should still gate them
+        # to a single browse.
+        for _ in range(500):
+            if daemon._health_failures.get("dev-down", 0) >= 5:
+                break
+            await asyncio.sleep(0.005)
+        else:
+            raise AssertionError("never accumulated 5 health failures")
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert browses == 1, (
+        f"5+ health failures should yield 1 throttled browse, got {browses}"
+    )
+
+
+async def test_health_loop_keeps_pairing_when_unpaired_during_reconcile(monkeypatch):
+    """If a concurrent /summary 401 or pair-reset removes the device
+    while the health-loop's mDNS browse is in flight, the refreshed
+    host must NOT be written back — update_paired_device_host returns
+    False and the retry is dropped. Same anti-resurrection guarantee
+    we get on the push side."""
+    from burnscope_client.discovery import DiscoveredDevice
+
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+    host_cache.add_paired_device("codex", PairedDevice("dev-moved", "10.0.0.5:80"))
+
+    async def fake_fetch_health(host, client_id, client):
+        return None  # always fail for this test
+    monkeypatch.setattr(codex_daemon, "fetch_health", fake_fetch_health)
+    monkeypatch.setattr(codex_daemon, "HEALTH_INTERVAL_S", 0.005)
+
+    discovered_once = False
+
+    async def fake_discover_all(timeout=4.0, agent=None, zc=None):
+        nonlocal discovered_once
+        if not discovered_once:
+            discovered_once = True
+            # Simulate the race: pairing removed while mDNS browses.
+            host_cache.remove_paired_device("codex", "dev-moved")
+        return [DiscoveredDevice("dev-moved", "10.0.0.9:80", True, False)]
+
+    monkeypatch.setattr(codex_daemon, "discover_all", fake_discover_all)
+
+    task = asyncio.create_task(daemon._health_loop())
+    try:
+        for _ in range(200):
+            if discovered_once:
+                break
+            await asyncio.sleep(0.005)
+        # Let one more cycle pass so we observe post-reconcile state.
+        await asyncio.sleep(0.02)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    # The pairing stays removed — no resurrection by the stale browse.
     assert host_cache.load_paired_devices("codex") == []
-    # Health failure counter was cleared as part of eviction.
-    assert daemon._health_failures.get("dev-quiet", 0) == 0
 
 
 # ====================== mDNS resilience §7: push transport failures don't evict
@@ -1268,10 +1407,10 @@ async def test_health_failures_alone_trigger_eviction(monkeypatch):
 async def test_pusher_loop_keeps_device_after_many_push_transport_failures(
     monkeypatch,
 ):
-    """Codex push path must not evict a device after MAX_TRANSPORT_FAILURES
-    transport misses. Reachability failure is not ownership loss — the
-    device may have been rebooted, roamed networks, or moved IP. Keep
-    it paired and let the throttled mDNS reconciliation heal it.
+    """Codex push path must not evict a device after many transport
+    misses. Reachability failure is not ownership loss — the device
+    may have been rebooted, roamed networks, or moved IP. Keep it
+    paired and let the throttled mDNS reconciliation heal it.
 
     Counter still bumps for diagnostics (so `burnscope status` can show
     the degraded device), but no `remove_paired_device` call is made on

@@ -92,7 +92,6 @@ REQUEST_TIMEOUT_S = 30.0
 # bounded + drop-oldest is the right shape: a stale snapshot has zero
 # value once a newer one arrives.
 SNAPSHOT_QUEUE_MAX = 8
-MAX_TRANSPORT_FAILURES = 5
 
 
 class CodexProtocolError(RuntimeError):
@@ -129,13 +128,13 @@ class CodexDaemon:
         # change — see `_poll_loop`.
         self._last_pushed_snapshot: AgentSnapshot | None = None
         self._proc: asyncio.subprocess.Process | None = None
-        # Two transport-failure counters, one per probe path. Each is
-        # diagnostic-only on the push side now (per the mDNS resilience
-        # plan, push transport failures no longer evict — only `/summary`
-        # 401 does). The health side still uses MAX_TRANSPORT_FAILURES
-        # as an eviction threshold; PR 3 of the resilience series will
-        # remove that too. Counters stay split per path so a push success
-        # cannot mask accumulated health failures, and vice versa.
+        # Two diagnostic transport-failure counters, one per probe path.
+        # Per the mDNS resilience plan, neither path evicts on transport
+        # failure — only `/summary` 401 removes a pairing. The counters
+        # stay split so a push success cannot zero out accumulated
+        # health failures, and vice versa, keeping the per-path "have we
+        # heard from this device recently" signal honest for logs and a
+        # future `burnscope status` view.
         self._push_failures: dict[str, int] = {}
         self._health_failures: dict[str, int] = {}
 
@@ -492,41 +491,24 @@ class CodexDaemon:
                 if not devices:
                     continue
                 diverged_devices: list[PairedDevice] = []
-                all_unreachable = True
+                failed_devices: list[PairedDevice] = []
+                any_ok = False
                 for device in devices:
                     body = await fetch_health(device.host, self._client_id, client)
                     if body is None:
-                        host_cache.write_push_state(
-                            AGENT_NAME, ok=False, device_id=device.device_id
-                        )
-                        failures = (
-                            self._health_failures.get(device.device_id, 0) + 1
-                        )
-                        self._health_failures[device.device_id] = failures
-                        if failures >= MAX_TRANSPORT_FAILURES:
-                            log.warning(
-                                "dropping %s after %d health failures",
-                                device.device_id, MAX_TRANSPORT_FAILURES,
-                            )
-                            host_cache.remove_paired_device(AGENT_NAME, device.device_id)
-                            self._push_failures.pop(device.device_id, None)
-                            self._health_failures.pop(device.device_id, None)
+                        failed_devices.append(device)
                         continue
-                    all_unreachable = False
-                    # Health succeeded — clear only the health counter.
-                    # Push has its own counter and resets independently.
-                    self._health_failures.pop(device.device_id, None)
-                    # Compare against `_last_pushed_snapshot` (the anchored
-                    # value the firmware actually has), not `_last_snapshot`
-                    # (the raw, possibly-drifted value from the app-server).
-                    # Otherwise poll-loop anchoring would manufacture a
-                    # spurious divergence here every cycle.
-                    if (
-                        self._last_pushed_snapshot is not None
-                        and _firmware_diverged(body, self._last_pushed_snapshot)
-                    ):
-                        diverged_devices.append(device)
-                if all_unreachable:
+                    any_ok = True
+                    self._mark_health_ok(device, body, diverged_devices)
+                if failed_devices:
+                    healed = await self._reconcile_health_failures(
+                        failed_devices, client, diverged_devices
+                    )
+                    if healed:
+                        any_ok = True
+                # Aggregate ok=False only when nothing was healthy in either
+                # round 1 (initial probe) or round 2 (post-reconcile retry).
+                if not any_ok:
                     host_cache.write_push_state(AGENT_NAME, ok=False)
                 if diverged_devices and self._last_pushed_snapshot is not None:
                     # Re-push only to the device(s) that actually diverged,
@@ -541,6 +523,112 @@ class CodexDaemon:
                     await self._push_to_devices(
                         self._last_pushed_snapshot, diverged_devices, client
                     )
+
+    def _mark_health_ok(
+        self,
+        device: PairedDevice,
+        body: dict,
+        diverged_devices: list[PairedDevice],
+    ) -> None:
+        """Record a successful health probe — clear the counter, then
+        check whether the firmware diverged from `_last_pushed_snapshot`.
+
+        Compare against `_last_pushed_snapshot` (the anchored value the
+        firmware actually has), not `_last_snapshot` (the raw value from
+        the app-server). Otherwise poll-loop anchoring would manufacture
+        a spurious divergence here every cycle.
+        """
+        self._health_failures.pop(device.device_id, None)
+        if (
+            self._last_pushed_snapshot is not None
+            and _firmware_diverged(body, self._last_pushed_snapshot)
+        ):
+            diverged_devices.append(device)
+
+    def _record_health_failure(self, device: PairedDevice) -> None:
+        """Persist a health-probe failure for `device` without evicting.
+
+        Per the mDNS resilience plan (§8) the pairing is preserved
+        regardless of how many health probes miss — only `/summary` 401
+        is an ownership signal. The counter still advances so logs (and
+        a future `burnscope status` view) can surface the degraded peer.
+        """
+        host_cache.write_push_state(
+            AGENT_NAME, ok=False, device_id=device.device_id
+        )
+        self._health_failures[device.device_id] = (
+            self._health_failures.get(device.device_id, 0) + 1
+        )
+
+    async def _reconcile_health_failures(
+        self,
+        failed: list[PairedDevice],
+        client: httpx.AsyncClient,
+        diverged_devices: list[PairedDevice],
+    ) -> bool:
+        """Run one throttled mDNS browse for the failed batch, retry
+        `/health` at any refreshed host, and record outcomes.
+
+        Returns True iff at least one device healed in round 2 (so the
+        caller can keep aggregate ok=True). Devices inside their per-
+        device cooldown are recorded as failed without launching a new
+        browse — that's the whole point of `claim_reconcile_slots`.
+        """
+        failed_ids = [d.device_id for d in failed]
+        eligible = host_cache.claim_reconcile_slots(AGENT_NAME, failed_ids)
+        if not eligible:
+            for device in failed:
+                self._record_health_failure(device)
+            return False
+
+        try:
+            discovered = await discover_all(timeout=DISCOVERY_TIMEOUT_S)
+        except Exception as exc:
+            # mDNS failures must not kill the long-lived health loop.
+            log.warning("mDNS browse during health reconcile failed: %s", exc)
+            for device in failed:
+                self._record_health_failure(device)
+            return False
+        by_id = {d.device_id: d for d in discovered}
+
+        any_healed = False
+        for device in failed:
+            if device.device_id not in eligible:
+                # Inside cooldown — record failure, don't try mDNS.
+                self._record_health_failure(device)
+                continue
+            found = by_id.get(device.device_id)
+            if found is None or found.host == device.host:
+                # mDNS didn't see it (or same host) — failure stands.
+                self._record_health_failure(device)
+                continue
+            if not host_cache.update_paired_device_host(
+                AGENT_NAME, device.device_id, found.host
+            ):
+                # Pairing was removed during reconcile (e.g. /summary 401
+                # in the pusher) — drop without resurrecting.
+                log.info(
+                    "skipped health retry for %s — pairing was removed during reconcile",
+                    device.device_id,
+                )
+                continue
+            log.info(
+                "health host changed for %s (%s -> %s); retrying",
+                device.device_id, device.host, found.host,
+            )
+            refreshed = PairedDevice(
+                device_id=device.device_id, host=found.host
+            )
+            retry = await fetch_health(refreshed.host, self._client_id, client)
+            if retry is None:
+                self._record_health_failure(refreshed)
+                continue
+            any_healed = True
+            host_cache.write_push_state(
+                AGENT_NAME, ok=True, device_id=refreshed.device_id
+            )
+            self._mark_health_ok(refreshed, retry, diverged_devices)
+        return any_healed
 
     # ----------------------------------------------------------- device list
 

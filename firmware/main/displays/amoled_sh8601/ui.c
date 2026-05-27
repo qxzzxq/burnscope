@@ -36,6 +36,7 @@
 #include "burn_idle_adapter.h"
 #include "driver.h"
 #include "nvs_store.h"
+#include "orientation.h"
 #include "snapshot.h"
 #include "touch.h"
 #include "version.h"
@@ -677,6 +678,11 @@ void display_profile_init(void)
     lvgl_port_unlock();
 
     burn_idle_adapter_start();
+    /* Orientation watcher runs after the burn-in adapter so its
+     * `qmi8658_init` has already brought up the IMU; the read in
+     * orientation.c's task short-circuits gracefully if the chip
+     * was missing or the init failed. */
+    orientation_start(disp);
     s_initialized = true;
 }
 

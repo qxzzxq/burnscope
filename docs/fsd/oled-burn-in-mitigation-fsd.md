@@ -185,7 +185,7 @@ client:
 |--------------------------------|-----------------------------------------------|------|
 | **Idle state machine**         | `firmware/main/burn_protection/burn_idle.{h,c}` | Pure-logic SM. Inputs: events + monotonic time. Outputs: `{state, brightness_pct, panel_on, changed}`. Zero ESP-IDF deps. |
 | **AMOLED idle adapter**        | `firmware/main/displays/amoled_sh8601/burn_idle_adapter.c` | Wires IMU sampling, touch IRQ, button IRQ, `POST /summary` callback, and a 1 Hz `esp_timer` into the SM; applies SM outputs to the SH8601 driver. |
-| **Orientation detector** *(Phase 3 — not yet shipped)* | `firmware/main/displays/amoled_sh8601/orientation.c` | Reads accelerometer gravity vector, picks quadrant with hysteresis + debounce, drives `lv_disp_set_rotation`. |
+| **Orientation detector** *(Phase 3 — landed; IMU-ROT-* hardware tests pending)* | `firmware/main/displays/amoled_sh8601/orientation.c` | Reads accelerometer gravity vector, picks quadrant with hysteresis + debounce, drives `lv_disp_set_rotation`. |
 | **Codex active poll + dedupe** | `client/src/burnscope_client/codex_daemon.py` (modified) + `client/src/burnscope_client/schema.py` (helper) | `AgentSnapshot.semantically_equal(other)` plus a new `_poll_loop` that calls `account/rateLimits/read` every `POLL_INTERVAL_S` and only enqueues when the result differs from `_last_pushed_snapshot`. |
 | **Palette validator** *(Phase 4 — not yet shipped)* | `firmware/main/displays/amoled_sh8601/palette_check.c` (or CMake-time script) | Static check that all colour tokens used by the AMOLED UI satisfy A4. |
 
@@ -218,7 +218,7 @@ firmware/main/
     ├── touch.c                # SHIPPED (Phase 2 PR-1) — polled FT3168 reader for the LVGL indev
     ├── qmi8658.c              # SHIPPED (Phase 2 PR-2) — accel-only QMI8658 driver (motion wake)
     ├── burn_idle_adapter.c    # SHIPPED (Phase 2 PR-1 + PR-2) — events + outputs ↔ hardware
-    ├── orientation.c          # PLANNED (Phase 3) — accel → quadrant → lv_disp_set_rotation
+    ├── orientation.c          # SHIPPED (Phase 3) — accel → quadrant → lv_disp_set_rotation (IMU-ROT-* pending hardware verification)
     └── palette_check.c        # PLANNED (Phase 4) — token validator (or build-time .py)
 
 client/src/burnscope_client/

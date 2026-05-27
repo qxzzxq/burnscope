@@ -74,4 +74,27 @@ menu "AMOLED burn-in mitigation"
             IMU adapter; carried in the burn_idle config struct so
             the SM and adapter share one configuration record.
 
+    config BURNSCOPE_AMOLED_WAKE_FADE_MS
+        int "Brightness fade-up duration (ms)"
+        default 300
+        range 0 5000
+        help
+            Duration of the linear brightness ramp when the panel is
+            waking or transitioning to a brighter state (OFF→DIMMED,
+            OFF→ACTIVE, DIMMED→ACTIVE). The SH8601/CO5300 has no
+            hardware fade primitive, so the adapter writes intermediate
+            0x51 register values at ~30 Hz over this interval. Set to 0
+            for instantaneous wake (legacy behavior).
+
+    config BURNSCOPE_AMOLED_SLEEP_FADE_MS
+        int "Brightness fade-down duration (ms)"
+        default 1500
+        range 0 5000
+        help
+            Duration of the linear brightness ramp when the panel is
+            dimming or powering down (ACTIVE→DIMMED, DIMMED→OFF,
+            ACTIVE→OFF). For DIMMED→OFF transitions the DISPOFF command
+            runs after the fade reaches 0. Set to 0 for instantaneous
+            dim/off (legacy behavior).
+
 endmenu

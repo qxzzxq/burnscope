@@ -3,10 +3,17 @@
  * topology. Implementation notes:
  *
  *  - Brightness/sleep changes apply only when the SM reports
- *    `output.changed`; ordering is wake-first (panel-on before
- *    brightness write) and sleep-last (brightness 0 then panel-off) so
- *    a transitioning frame never flashes black before the panel sleeps
- *    or full-bright before a wake.
+ *    `output.changed`; ordering is wake-first (DISPON before the
+ *    fade-up begins) and sleep-last (DISPOFF only after the fade-down
+ *    reaches 0) so a transitioning frame never flashes black before
+ *    the panel sleeps or full-bright before a wake.
+ *  - Brightness changes ramp via a linear fade. The SH8601/CO5300 has
+ *    no hardware fade primitive, so a dedicated esp_timer fires at
+ *    ~30 Hz only while a fade is in flight, writing intermediate 0x51
+ *    register values; it stops itself on completion. A new fade
+ *    preempts an in-flight one by re-anchoring `start_pct` to the
+ *    *current* interpolated value, so a button press during a dim-down
+ *    smoothly reverses direction rather than snapping.
  *  - The 1 Hz tick is driven by an `esp_timer_*` periodic callback that
  *    runs on the esp_timer task and posts EV_TIME into the queue. We do
  *    *not* call `burn_idle_step` directly from the timer callback —
@@ -46,6 +53,7 @@ static const char *TAG = "burn_idle_ad";
 #define IMU_POST_DEBOUNCE_US    200000       /* 200 ms between consecutive EV_MOTION posts */
 #define IMU_TASK_STACK          2560
 #define IMU_TASK_PRIORITY       3            /* below drain task */
+#define FADE_STEP_PERIOD_US     33000        /* ~30 Hz brightness ramp */
 
 static burn_idle_t        s_sm;
 static QueueHandle_t      s_queue       = NULL;
@@ -65,6 +73,32 @@ static int16_t            s_imu_last_posted_mg[3] = { 0, 0, 0 };
 static int64_t            s_imu_last_posted_us    = INT64_MIN;
 static bool               s_imu_baseline_set      = false;
 static int16_t            s_imu_threshold_mg      = 0;
+
+/* Fade engine state. `current_pct` is the last value we wrote to the
+ * 0x51 register and is the only source-of-truth for the panel's actual
+ * brightness — start_fade() anchors a new ramp here so preempting
+ * events never produce a visible step. `pending_panel_off` carries the
+ * sleep-last contract: the DISPOFF command runs only after the fade
+ * reaches 0, and is cleared whenever a subsequent fade redirects the
+ * panel back toward ON (e.g. button mid-sleep). `generation` bumps on
+ * every start_fade so an in-flight fade_step_cb that already snapshot
+ * the previous fade's parameters can drop its hardware writes after a
+ * preemption (drops a stale brightness or — worse — a DISPOFF that
+ * would briefly black-out the panel right after a wake). All fields
+ * are read and written from two contexts (drain task and esp_timer
+ * task) so accesses are guarded by `s_fade_mux`. */
+static struct {
+    uint8_t  start_pct;
+    uint8_t  target_pct;
+    uint8_t  current_pct;
+    int64_t  start_us;
+    int64_t  duration_us;
+    uint32_t generation;
+    bool     pending_panel_off;
+    bool     active;
+} s_fade;
+static portMUX_TYPE       s_fade_mux    = portMUX_INITIALIZER_UNLOCKED;
+static esp_timer_handle_t s_fade_timer  = NULL;
 
 static void post_event(burn_idle_event_t ev)
 {
@@ -116,17 +150,187 @@ void burn_idle_adapter_notify_touch(void)
     post_event(BURN_IDLE_EV_TOUCH);
 }
 
+static void fade_step_cb(void *arg)
+{
+    (void)arg;
+
+    uint8_t  start_pct;
+    uint8_t  target_pct;
+    int64_t  start_us;
+    int64_t  duration_us;
+    uint32_t my_gen;
+
+    /* Pass 1: snapshot inputs only. Mutations are deferred to Pass 2
+     * (under a re-check'd lock) so a stale tick can't corrupt
+     * s_fade.current_pct — start_fade() reads that field as the
+     * anchor for the next ramp and would otherwise blend from a
+     * value never actually written to the panel. */
+    portENTER_CRITICAL(&s_fade_mux);
+    if (!s_fade.active) {
+        /* Late callback after a stop — nothing to do. */
+        portEXIT_CRITICAL(&s_fade_mux);
+        return;
+    }
+    my_gen      = s_fade.generation;
+    start_pct   = s_fade.start_pct;
+    target_pct  = s_fade.target_pct;
+    start_us    = s_fade.start_us;
+    duration_us = s_fade.duration_us;
+    portEXIT_CRITICAL(&s_fade_mux);
+
+    /* Compute next value — pure math against the snapshot. */
+    const int64_t now     = esp_timer_get_time();
+    const int64_t elapsed = now - start_us;
+    uint8_t to_write;
+    bool    finished;
+    if (elapsed >= duration_us) {
+        to_write = target_pct;
+        finished = true;
+    } else {
+        const int delta  = (int)target_pct - (int)start_pct;
+        const int interp = (int)start_pct
+                         + (int)((int64_t)delta * elapsed / duration_us);
+        to_write = (uint8_t)(interp < 0 ? 0 : (interp > 100 ? 100 : interp));
+        finished = false;
+    }
+
+    /* Pass 2: re-check generation, then atomically commit state and
+     * stop the timer on completion. Stopping under the lock — paired
+     * with `s_fade.active = false` — makes it safe for a start_fade()
+     * racing in immediately after this critical section to see
+     * active=false and cleanly restart the timer for its own fade
+     * (avoids the "active=true with stopped timer" stall). */
+    bool do_dispoff = false;
+    portENTER_CRITICAL(&s_fade_mux);
+    if (s_fade.generation != my_gen) {
+        portEXIT_CRITICAL(&s_fade_mux);
+        return;
+    }
+    s_fade.current_pct = to_write;
+    if (finished) {
+        s_fade.active            = false;
+        do_dispoff               = s_fade.pending_panel_off;
+        s_fade.pending_panel_off = false;
+        (void)esp_timer_stop(s_fade_timer);
+    }
+    portEXIT_CRITICAL(&s_fade_mux);
+
+    /* Hardware writes outside the lock. A brightness write that
+     * loses the race with a preempting start_fade() is benign — the
+     * next ~33 ms tick of the new fade overwrites it. DISPOFF gets
+     * one more generation re-check immediately before it fires so
+     * a wake event arriving between Pass 2 and here can still
+     * cancel the panel-off. A vanishingly narrow window remains
+     * between that final re-check and the DISPOFF call itself
+     * (~50 µs of QSPI tx_param); we accept it rather than hold a
+     * spinlock across a potentially blocking panel-IO call. */
+    amoled_sh8601_set_brightness_pct(to_write);
+    if (do_dispoff) {
+        portENTER_CRITICAL(&s_fade_mux);
+        const bool still_ours = (s_fade.generation == my_gen);
+        portEXIT_CRITICAL(&s_fade_mux);
+        if (still_ours) {
+            amoled_sh8601_set_display_on(false);
+        }
+    }
+}
+
+static void start_fade(uint8_t target_pct, int64_t duration_us, bool pending_off)
+{
+    bool short_circuit;
+    bool need_start         = false;
+    bool brightness_changed = false;
+
+    portENTER_CRITICAL(&s_fade_mux);
+    /* Short-circuit when the ramp would have zero duration *or* zero
+     * delta. The zero-delta case matters for the
+     * DIMMED_BRIGHTNESS_PCT=0 config: DIMMED→OFF would otherwise
+     * spend SLEEP_FADE_MS writing 0→0 before issuing the DISPOFF,
+     * delaying the panel-off by the full fade duration for no
+     * visible benefit. */
+    const uint8_t old_current = s_fade.current_pct;
+    short_circuit = (duration_us <= 0) || (old_current == target_pct);
+    if (short_circuit) {
+        brightness_changed       = (old_current != target_pct);
+        s_fade.current_pct       = target_pct;
+        s_fade.active            = false;
+        s_fade.pending_panel_off = false;
+        /* Bump generation so any in-flight fade_step_cb that already
+         * snapshot the previous fade's parameters will recognise
+         * itself as stale and skip its hardware writes. */
+        s_fade.generation++;
+    } else {
+        /* Anchor the new ramp at the current interpolated value so a
+         * preempting event blends from wherever the in-flight fade
+         * had reached — no visible jump back to the previous start. */
+        s_fade.start_pct         = old_current;
+        s_fade.target_pct        = target_pct;
+        s_fade.start_us          = esp_timer_get_time();
+        s_fade.duration_us       = duration_us;
+        /* Overwrite, don't OR: a wake-direction fade must clear any
+         * pending DISPOFF left behind by a preempted sleep fade. */
+        s_fade.pending_panel_off = pending_off;
+        s_fade.generation++;
+        need_start               = !s_fade.active;
+        s_fade.active            = true;
+    }
+    portEXIT_CRITICAL(&s_fade_mux);
+
+    if (short_circuit) {
+        (void)esp_timer_stop(s_fade_timer);
+        /* Only write 0x51 when the value would actually change —
+         * skips a redundant QSPI command in the legacy snap path
+         * (duration=0) when the SM's target already matches the
+         * current brightness (e.g. transitions that change only
+         * `panel_on`, not `brightness_pct`). */
+        if (brightness_changed) {
+            amoled_sh8601_set_brightness_pct(target_pct);
+        }
+        if (pending_off) {
+            amoled_sh8601_set_display_on(false);
+        }
+        return;
+    }
+
+    if (need_start) {
+        (void)esp_timer_start_periodic(s_fade_timer, FADE_STEP_PERIOD_US);
+    }
+}
+
 static void apply_output(const burn_idle_output_t *out)
 {
-    /* Wake-first: bring the panel back before changing brightness so
-     * the first rendered frame after wake isn't preceded by a
-     * brightness write that the panel ignores (or worse, races). */
-    if (out->panel_on && !s_prev_panel_on) {
+    const bool waking   = out->panel_on && !s_prev_panel_on;
+    const bool sleeping = !out->panel_on && s_prev_panel_on;
+
+    if (waking) {
+        /* Wake-first: DISPON is instantaneous so the ramp's brightness
+         * writes actually reach the panel. The ramp itself goes from
+         * the current 0x51 value (0 after a prior sleep-last) up to
+         * the SM's target. */
         amoled_sh8601_set_display_on(true);
-    }
-    amoled_sh8601_set_brightness_pct(out->brightness_pct);
-    if (!out->panel_on && s_prev_panel_on) {
-        amoled_sh8601_set_display_on(false);
+        start_fade(out->brightness_pct,
+                   (int64_t)CONFIG_BURNSCOPE_AMOLED_WAKE_FADE_MS * 1000LL,
+                   /*pending_panel_off=*/false);
+    } else if (sleeping) {
+        /* Sleep-last: ramp down to 0, then DISPOFF inside the fade
+         * callback once the target is reached. */
+        start_fade(/*target_pct=*/0,
+                   (int64_t)CONFIG_BURNSCOPE_AMOLED_SLEEP_FADE_MS * 1000LL,
+                   /*pending_panel_off=*/true);
+    } else {
+        /* Same-power transition (e.g. ACTIVE↔DIMMED). Direction picks
+         * the duration so a snappy wake-up to brighter still feels
+         * snappy when promoted from DIMMED rather than from OFF. */
+        uint8_t current;
+        portENTER_CRITICAL(&s_fade_mux);
+        current = s_fade.current_pct;
+        portEXIT_CRITICAL(&s_fade_mux);
+        const bool going_up = out->brightness_pct > current;
+        const int64_t duration_us = going_up
+            ? (int64_t)CONFIG_BURNSCOPE_AMOLED_WAKE_FADE_MS  * 1000LL
+            : (int64_t)CONFIG_BURNSCOPE_AMOLED_SLEEP_FADE_MS * 1000LL;
+        start_fade(out->brightness_pct, duration_us,
+                   /*pending_panel_off=*/false);
     }
     s_prev_panel_on = out->panel_on;
 }
@@ -259,6 +463,14 @@ void burn_idle_adapter_start(void)
      * stays consistent. */
     amoled_sh8601_set_display_on(true);
     amoled_sh8601_set_brightness_pct(cfg.active_brightness_pct);
+    /* Seed the fade engine with the actual brightness we just wrote so
+     * the first subsequent ramp starts from the correct anchor. The
+     * struct is zero-initialised (current_pct=0) by default; without
+     * this seed the first ACTIVE→DIMMED transition would anchor the
+     * ramp at 0 and the very first fade tick would write 0 to the
+     * brightness register — a visible jump from active brightness
+     * down to black before ramping back up toward the dimmed target. */
+    s_fade.current_pct = cfg.active_brightness_pct;
 
     s_queue = xQueueCreate(EVENT_QUEUE_DEPTH, sizeof(burn_idle_event_t));
     configASSERT(s_queue != NULL);
@@ -297,6 +509,17 @@ void burn_idle_adapter_start(void)
     ESP_ERROR_CHECK(esp_timer_create(&tick_args, &s_tick_timer));
     ESP_ERROR_CHECK(esp_timer_start_periodic(s_tick_timer, TICK_PERIOD_US));
 
+    /* Created but not started — start_fade() starts the periodic timer
+     * on demand and fade_step_cb() stops it on completion, so it only
+     * draws CPU while a ramp is in flight. */
+    const esp_timer_create_args_t fade_args = {
+        .callback        = fade_step_cb,
+        .arg             = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name            = "burn_idle_fade",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&fade_args, &s_fade_timer));
+
     BaseType_t ok = xTaskCreate(drain_task, "burn_idle_drain",
                                 DRAIN_TASK_STACK, NULL,
                                 DRAIN_TASK_PRIORITY, NULL);
@@ -304,10 +527,13 @@ void burn_idle_adapter_start(void)
 
     s_started = true;
     ESP_LOGI(TAG,
-             "started: dim=%d min, off=%d min, br=%d%%/%d%%, motion=%d mg",
+             "started: dim=%d min, off=%d min, br=%d%%/%d%%, motion=%d mg, "
+             "fade wake=%d ms / sleep=%d ms",
              CONFIG_BURNSCOPE_AMOLED_IDLE_DIM_MINUTES,
              CONFIG_BURNSCOPE_AMOLED_IDLE_OFF_MINUTES,
              CONFIG_BURNSCOPE_AMOLED_ACTIVE_BRIGHTNESS_PCT,
              CONFIG_BURNSCOPE_AMOLED_DIMMED_BRIGHTNESS_PCT,
-             CONFIG_BURNSCOPE_AMOLED_MOTION_THRESHOLD_MG);
+             CONFIG_BURNSCOPE_AMOLED_MOTION_THRESHOLD_MG,
+             CONFIG_BURNSCOPE_AMOLED_WAKE_FADE_MS,
+             CONFIG_BURNSCOPE_AMOLED_SLEEP_FADE_MS);
 }

@@ -274,7 +274,11 @@ genuinely meaningful when they do happen.
   touch wake (driven by the LVGL touch indev's read callback in
   `ui.c` on a rising-edge press), button IRQ binding, 1 Hz
   `esp_timer` for `EV_TIME`, snapshot listener hooked to `EV_PUSH`,
-  brightness + panel sleep/wake actions on SM output.
+  brightness + panel sleep/wake actions on SM output. Brightness
+  changes go through a fade engine — a second `esp_timer` runs at
+  ~30 Hz only while a ramp is in flight, interpolating between the
+  current 0x51 register value and the SM's target so the panel
+  visibly ramps rather than snaps.
 
 **Exit criteria.** Phase 2 hardware tests in § 8.2 pass: manual
 dim/off timing, all four wake sources, push-with-no-change does
@@ -444,19 +448,30 @@ no-push rate when usage is unchanged.
 - **FR-3.5** [Must]: The adapter shall run a 1 Hz `esp_timer` that
   calls `burn_idle_step(sm, EV_TIME, now_us)` once per second.
 - **FR-3.6** [Must]: On any `output.changed == true` step, the
-  adapter shall apply `brightness_pct` to the SH8601 brightness
-  register and, on `panel_on` transitions, call panel sleep or
-  wake. Brightness changes shall be instantaneous (no fade-up on
-  wake) per the source spec.
+  adapter shall drive `brightness_pct` to the SH8601 brightness
+  register through a linear fade engine and, on `panel_on`
+  transitions, call panel sleep or wake. The fade ramps from the
+  panel's current register value to the SM's target over
+  `BURNSCOPE_AMOLED_WAKE_FADE_MS` (when the target is brighter
+  than the current value or the panel is waking from OFF) or
+  `BURNSCOPE_AMOLED_SLEEP_FADE_MS` (when the target is dimmer or
+  the panel is powering down). Wake-first / sleep-last ordering
+  shall be preserved: `DISPON` runs before the fade-up begins; for
+  panel-off transitions `DISPOFF` runs only after the fade-down
+  reaches 0. A new fade shall preempt any in-flight fade by
+  re-anchoring its start point at the current interpolated value,
+  so a wake event during a dim-down reverses direction smoothly.
+  Setting either Kconfig duration to 0 shall fall back to the
+  instantaneous register write (FR-3.6 legacy behaviour).
 - **FR-3.7** [Must]: While in `BURN_IDLE_OFF`, the HTTP server,
   Wi-Fi, mDNS, and snapshot store shall continue to operate; an
   incoming `POST /summary` shall update the framebuffer and emit
   `EV_PUSH`, soft-waking the panel to `BURN_IDLE_DIMMED` per
   FR-2.3.
 - **FR-3.8** [Should]: The motion threshold, dim threshold, off
-  threshold, default brightness, and dimmed brightness shall be
-  exposed as Kconfig options under `BurnScope display → AMOLED
-  burn-in`.
+  threshold, default brightness, dimmed brightness, wake fade
+  duration, and sleep fade duration shall be exposed as Kconfig
+  options under `BurnScope display → AMOLED burn-in`.
 
 **FR-4 Codex Daemon Active Poll + Push Dedupe**
 
@@ -545,19 +560,31 @@ no-push rate when usage is unchanged.
 - **NFR-1.2** [Should]: The IMU adapter at 21 Hz sampling shall
   consume < 2 % of one CPU core averaged over a 60 s window in
   Active state.
-- **NFR-2.1** [Must]: Wake latency shall be ≤ 200 ms at the 95th
-  percentile, measured per wake class:
+- **NFR-2.1** [Must]: Wake responsiveness shall be ≤ 200 ms at the
+  95th percentile, measured per wake class as *event → first
+  visible brightness change* (i.e. the leading edge of the fade
+  ramp, not its completion):
   - Direct-interaction wakes (`EV_MOTION`, `EV_TOUCH`,
-    `EV_BUTTON`): event → brightness restored to
-    `active_brightness_pct`.
-  - Soft wakes (`EV_PUSH`): event → brightness restored to
-    `dimmed_brightness_pct` if the panel was in `BURN_IDLE_OFF`
-    or `BURN_IDLE_DIMMED`; no panel write if the panel was in
-    `BURN_IDLE_ACTIVE` (output unchanged per FR-2.3).
-- **NFR-2.2** [Should]: Dim-to-Off transition shall be visually
-  noticeable but not abrupt; the SH8601 brightness register write
-  is the only required action (no fade ramp). If a smoother visual
-  is required later, it shall be added in the adapter, not the SM.
+    `EV_BUTTON`): event → fade toward `active_brightness_pct`
+    starts.
+  - Soft wakes (`EV_PUSH`): event → fade toward
+    `dimmed_brightness_pct` starts if the panel was in
+    `BURN_IDLE_OFF` or `BURN_IDLE_DIMMED`; no panel write if the
+    panel was in `BURN_IDLE_ACTIVE` (output unchanged per FR-2.3).
+  - The fade itself takes `BURNSCOPE_AMOLED_WAKE_FADE_MS`
+    (default 300 ms) to reach the target; setting that Kconfig to
+    0 collapses fade completion onto the 200 ms responsiveness
+    budget.
+- **NFR-2.2** [Should]: Brightness transitions (Dim, Off, Wake) are
+  ramped by the adapter's fade engine — linear interpolation at
+  ~30 Hz between the panel's current 0x51 value and the SM's
+  target, driven by a dedicated `esp_timer` that only runs while a
+  ramp is in flight. Ramp durations are split by direction so a
+  wake feels responsive (`BURNSCOPE_AMOLED_WAKE_FADE_MS`, default
+  300 ms) while a dim feels gentle
+  (`BURNSCOPE_AMOLED_SLEEP_FADE_MS`, default 1500 ms). The fade
+  lives entirely in the adapter; the SM remains pure and emits
+  step targets only.
 - **NFR-3.1** [Must]: In steady-state operation where upstream
   rate-limit values are unchanged, the daemon shall produce zero
   `POST /summary` pushes (modulo the first-run push at bootstrap).
@@ -950,10 +977,11 @@ Unchanged. The idle SM starts in `BURN_IDLE_ACTIVE` at boot.
 |------------|----------------------------------|---------------------------------------------------------------------------|------------------|
 | DIM-001    | Dim at 5 min                     | Set defaults; leave device untouched; observe.                            | Brightness drops to 20 % at 5 min ± 5 s. |
 | DIM-002    | Off at 30 min                    | Continue from DIM-001.                                                    | Panel goes dark at 30 min ± 5 s. |
-| WAKE-001   | Motion wake                      | Tap / lift device while OFF.                                              | Panel restores to 70 % within 200 ms. |
-| WAKE-002   | Touch wake                       | Tap screen while OFF.                                                     | Panel restores within 200 ms. |
-| WAKE-003   | Button wake                      | Press button while OFF.                                                   | Panel restores within 200 ms. |
-| WAKE-004   | Qualifying push soft-wake        | While OFF, run a Codex prompt that burns ≥ 1 % of a window.               | Within ≤ 60 s of activity, push fires and panel soft-wakes to DIMMED (≈ `dimmed_brightness_pct`) within 200 ms of the push. State remains DIMMED until a direct interaction (motion / touch / button) lifts to ACTIVE, or `(off_after_us − dim_after_us)` of silence falls back to OFF. |
+| WAKE-001   | Motion wake                      | Tap / lift device while OFF.                                              | Panel begins ramping toward 70 % within 200 ms and reaches it after the configured `BURNSCOPE_AMOLED_WAKE_FADE_MS` (default 300 ms → fully bright by ~500 ms total). |
+| WAKE-002   | Touch wake                       | Tap screen while OFF.                                                     | Same fade profile as WAKE-001 — ramp begins within 200 ms, completes after `BURNSCOPE_AMOLED_WAKE_FADE_MS`. |
+| WAKE-003   | Button wake                      | Press button while OFF.                                                   | Same fade profile as WAKE-001 — ramp begins within 200 ms, completes after `BURNSCOPE_AMOLED_WAKE_FADE_MS`. |
+| WAKE-004   | Qualifying push soft-wake        | While OFF, run a Codex prompt that burns ≥ 1 % of a window.               | Within ≤ 60 s of activity, push fires and the panel begins ramping toward `dimmed_brightness_pct` within 200 ms of the push, reaching it after `BURNSCOPE_AMOLED_WAKE_FADE_MS`. State remains DIMMED until a direct interaction (motion / touch / button) lifts to ACTIVE, or `(off_after_us − dim_after_us)` of silence falls back to OFF. |
+| FADE-001   | Mid-fade preemption              | Let the panel begin a dim-down (ACTIVE → DIMMED at the 5-min mark); within the first second of the fade, press the button. | The brightness ramp reverses direction smoothly from the in-flight value back up to `active_brightness_pct` — no visible jump back to full first. |
 | WAKE-005   | Non-qualifying poll does NOT wake| While OFF, leave upstream untouched for 5 min.                            | Codex daemon issues no pushes; panel stays OFF. |
 | POLL-001   | Poll fires on cadence             | Run daemon with `BURNSCOPE_LOG_LEVEL=DEBUG`; tail the log for 70 s with no upstream activity. | At least one "codex poll: rate limits unchanged; skipping push" debug line in the window. |
 | POLL-002   | Poll no-ops before bootstrap     | Force `_client_id = None`; let `_poll_loop` run a few iterations.         | Zero calls to `_request`; queue stays empty. |

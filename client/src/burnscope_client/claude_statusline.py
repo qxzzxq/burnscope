@@ -66,10 +66,10 @@ DISCOVERY_TIMEOUT_S = 4.0
 # Statusline children are short-lived (one per Claude Code turn), so we
 # can't keep a per-process failure counter the way codex_daemon does.
 # Instead, the per-device `last-push.claude.<device_id>` file carries a
-# `consecutive_failures` field that survives between fires. After this
-# many consecutive transport failures, the device is evicted from the
-# paired list — matching codex_daemon's MAX_TRANSPORT_FAILURES policy.
-MAX_TRANSPORT_FAILURES = 5
+# `consecutive_failures` field that survives between fires. It feeds
+# `burnscope status` so users can see degraded devices, but per the
+# mDNS resilience plan it does NOT drive eviction — only `/summary` 401
+# and explicit `pair-reset` can remove a pairing.
 
 log = logging.getLogger(__name__)
 
@@ -277,15 +277,13 @@ async def _do_fanout(snapshot: AgentSnapshot, client_id: str) -> int:
             )
             host_cache.remove_paired_device(AGENT_NAME, device_id)
             continue
-        # Transport (or any other non-auth) failure: persist the bump.
+        # Transport (or any other non-auth) failure: persist the bump
+        # for `burnscope status`, but keep the pairing. The mDNS
+        # resilience plan trades eviction for throttled mDNS recovery
+        # in `refresh_and_retry_transport_failures` — a powered-off or
+        # IP-changed device must keep its slot so it heals automatically.
         overall_ok = False
-        failures = host_cache.bump_push_failures(AGENT_NAME, device_id)
-        if failures >= MAX_TRANSPORT_FAILURES:
-            log.warning(
-                "dropping %s after %d push transport failures",
-                device_id, MAX_TRANSPORT_FAILURES,
-            )
-            host_cache.remove_paired_device(AGENT_NAME, device_id)
+        host_cache.bump_push_failures(AGENT_NAME, device_id)
 
     host_cache.write_push_state(AGENT_NAME, ok=overall_ok)
     return 0 if overall_ok else 1

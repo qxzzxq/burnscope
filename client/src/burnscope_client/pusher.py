@@ -146,15 +146,25 @@ async def refresh_and_retry_transport_failures(
     be healed by browsing for the device by id and retrying the push at
     its new host.
 
-    For each entry in `results` with `kind="transport"`:
+    Throttling: each `(agent, device_id)` is gated by
+    `host_cache.claim_reconcile_slots`, which keeps a powered-off device
+    from forcing a fresh full-LAN browse on every statusline fire. If
+    every transport-failed device is inside its cooldown window, the
+    helper returns results unchanged with no browse.
+
+    Update-only writes: a refreshed host is committed via
+    `host_cache.update_paired_device_host`. If that returns False — the
+    device was removed concurrently by a `/summary` 401 or `pair-reset`
+    while discovery was in flight — the retry is dropped so stale mDNS
+    data cannot resurrect a forgotten pairing.
+
+    For each entry in `results` with `kind="transport"` that won a
+    cooldown slot:
       - Browse `_burnscope._tcp.local`.
-      - If the device shows up at a *different* host: update the
-        paired-devices cache for `agent` and re-push to the new host.
-      - If the device shows up at the same host (or doesn't show up at
-        all): leave the result unchanged. Retrying immediately against
-        the same host can't recover from a moved IP, and the only thing
-        that would heal a same-host failure (the device coming back) is
-        already covered by the next fire.
+      - If the device shows up at a *different* host: try the update-only
+        cache write, then re-push to the new host on success.
+      - If the device shows up at the same host, doesn't show up at all,
+        or its pairing has just been removed: leave the result unchanged.
 
     Returns a fresh dict; entries for retried devices are replaced with
     the retry outcome.
@@ -165,23 +175,37 @@ async def refresh_and_retry_transport_failures(
     if not transport_failed:
         return dict(results)
 
+    eligible = host_cache.claim_reconcile_slots(agent, transport_failed)
+    if not eligible:
+        log.debug(
+            "all %d transport-failed device(s) inside mDNS reconcile cooldown; "
+            "skipping browse",
+            len(transport_failed),
+        )
+        return dict(results)
+
     discovered = await discover_all(timeout=discovery_timeout)
     by_id = {d.device_id: d for d in discovered}
     old_hosts = {d.device_id: d.host for d in devices}
 
     updated = dict(results)
-    for device_id in transport_failed:
+    for device_id in eligible:
         found = by_id.get(device_id)
         if found is None:
             continue
         if found.host == old_hosts.get(device_id):
             continue
+        if not host_cache.update_paired_device_host(agent, device_id, found.host):
+            log.info(
+                "skipped retry for %s — pairing was removed during reconcile",
+                device_id,
+            )
+            continue
         log.info(
-            "host changed for %s (%s -> %s); refreshing cache and retrying push",
+            "host changed for %s (%s -> %s); retrying push",
             device_id, old_hosts.get(device_id), found.host,
         )
         refreshed = PairedDevice(device_id=device_id, host=found.host)
-        host_cache.add_paired_device(agent, refreshed)
         retry = await push_to_all(snapshot, [refreshed], client_id, client)
         updated[device_id] = retry[device_id]
     return updated

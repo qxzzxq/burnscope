@@ -386,16 +386,17 @@ def test_push_migrates_legacy_host_file(monkeypatch, _isolate_state):
     assert not legacy.exists()
 
 
-# =================================== M-3: statusline persistent failure counter
+# ============================ mDNS resilience §6: transport failures don't evict
 
 
-def test_push_evicts_device_after_max_consecutive_transport_failures(monkeypatch):
-    """Statusline children are short-lived, but the per-device push-state
-    file carries `consecutive_failures` across fires. After
-    MAX_TRANSPORT_FAILURES bumps the device must be evicted on the
-    next fire — without this, an offline device would stay paired
-    forever because each child starts from a clean in-memory state
-    (deep-review M-3).
+def test_push_keeps_device_after_many_consecutive_transport_failures(monkeypatch):
+    """Reachability failure is NOT ownership loss. Per the mDNS resilience
+    plan, only `/summary` HTTP 401 and explicit `pair-reset` may remove a
+    pairing. A powered-off or temporarily-unreachable device must keep
+    its slot so it recovers automatically when it comes back.
+
+    Counter still advances so `burnscope status` can surface that the
+    device is degraded — only the eviction action is gone.
     """
     _stub_identity(monkeypatch)
     _stub_discover_none(monkeypatch)
@@ -405,15 +406,17 @@ def test_push_evicts_device_after_max_consecutive_transport_failures(monkeypatch
     )
     host_cache.add_paired_device("claude", PairedDevice("dev-dead", "10.0.0.5:80"))
 
-    # Fire enough times to cross the threshold. Each `main(["--push"])`
-    # consumes stdin, so re-stub it before every fire.
-    for _ in range(claude_statusline.MAX_TRANSPORT_FAILURES):
+    # Fire well past the old eviction threshold — none should remove it.
+    for _ in range(10):
         _stub_stdin(monkeypatch)
         claude_statusline.main(["--push"])
 
-    # Device removed; per-device state cleaned up by remove_paired_device.
-    assert host_cache.load_paired_devices("claude") == []
-    assert host_cache.read_push_state("claude", device_id="dev-dead") is None
+    paired = {d.device_id for d in host_cache.load_paired_devices("claude")}
+    assert paired == {"dev-dead"}
+    state = host_cache.read_push_state("claude", device_id="dev-dead")
+    assert state is not None
+    assert state["ok"] is False
+    assert state["consecutive_failures"] == 10
 
 
 def test_push_transport_failure_then_success_resets_counter(monkeypatch):

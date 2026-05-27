@@ -279,3 +279,99 @@ async def test_refresh_and_retry_leaves_other_devices_untouched(monkeypatch):
         )
     assert out["dev-ok"] == PushResult("dev-ok", True, "ok")
     assert out["dev-moved"] == PushResult("dev-moved", True, "ok")
+
+
+# ============================== mDNS resilience §2: throttle + update-only
+
+async def test_refresh_and_retry_skips_browse_when_cooldown_active(monkeypatch):
+    """Two transport failures inside the same cooldown window must not
+    trigger two mDNS browses for the same device — that pummels mDNS for
+    a powered-off display. The second call records the failure but
+    short-circuits the browse via claim_reconcile_slots."""
+    host_cache.add_paired_device("claude", PairedDevice("dev-down", "10.0.0.5:80"))
+    # First call gets the slot and runs a browse.
+    browses = 0
+
+    async def counting_discover(timeout=4.0, agent=None, zc=None):
+        nonlocal browses
+        browses += 1
+        return []
+
+    monkeypatch.setattr(pusher, "discover_all", counting_discover)
+
+    results = {"dev-down": PushResult("dev-down", False, "transport")}
+    devices = [PairedDevice("dev-down", "10.0.0.5:80")]
+
+    async with httpx.AsyncClient() as client:
+        # First call: cooldown is cold → browse runs.
+        await refresh_and_retry_transport_failures(
+            _snapshot(), devices, results, CLIENT_ID, client, "claude",
+        )
+        # Second call: cooldown still active → no second browse.
+        await refresh_and_retry_transport_failures(
+            _snapshot(), devices, results, CLIENT_ID, client, "claude",
+        )
+
+    assert browses == 1
+
+
+@respx.mock
+async def test_refresh_and_retry_drops_retry_when_device_unpaired_concurrently(
+    monkeypatch,
+):
+    """If a concurrent path (e.g. /summary 401, pair-reset) removed the
+    device while discovery was in flight, update_paired_device_host
+    returns False and the retry must be skipped — never resurrect a
+    forgotten pairing.
+    """
+    host_cache.add_paired_device("claude", PairedDevice("dev-moved", "10.0.0.5:80"))
+
+    async def fake_discover(timeout=4.0, agent=None, zc=None):
+        # Simulate the race: remove the pairing while mDNS browses.
+        host_cache.remove_paired_device("claude", "dev-moved")
+        return [DiscoveredDevice("dev-moved", "10.0.0.9:80", True, False)]
+
+    monkeypatch.setattr(pusher, "discover_all", fake_discover)
+    # If the retry runs anyway, this mock route would catch it — and
+    # then the assertion below fails. We deliberately don't register
+    # the route so any retry attempt would also raise an unmatched-route
+    # error from respx.
+
+    results = {"dev-moved": PushResult("dev-moved", False, "transport")}
+    devices = [PairedDevice("dev-moved", "10.0.0.5:80")]
+
+    async with httpx.AsyncClient() as client:
+        out = await refresh_and_retry_transport_failures(
+            _snapshot(), devices, results, CLIENT_ID, client, "claude",
+        )
+
+    # Original transport failure preserved; no resurrected entry on disk.
+    assert out["dev-moved"].kind == "transport"
+    assert host_cache.load_paired_devices("claude") == []
+
+
+@respx.mock
+async def test_refresh_and_retry_uses_update_only_not_insert(monkeypatch):
+    """A successful refresh must update the existing entry without
+    growing the paired list — proves the helper went through
+    update_paired_device_host rather than add_paired_device."""
+    host_cache.add_paired_device("claude", PairedDevice("dev-moved", "10.0.0.5:80"))
+    host_cache.add_paired_device("claude", PairedDevice("dev-peer", "10.0.0.6:80"))
+
+    async def fake_discover(timeout=4.0, agent=None, zc=None):
+        return [DiscoveredDevice("dev-moved", "10.0.0.9:80", True, False)]
+
+    monkeypatch.setattr(pusher, "discover_all", fake_discover)
+    respx.post("http://10.0.0.9:80/summary").mock(return_value=httpx.Response(204))
+
+    results = {"dev-moved": PushResult("dev-moved", False, "transport")}
+    devices = [PairedDevice("dev-moved", "10.0.0.5:80")]
+
+    async with httpx.AsyncClient() as client:
+        await refresh_and_retry_transport_failures(
+            _snapshot(), devices, results, CLIENT_ID, client, "claude",
+        )
+
+    cached = host_cache.load_paired_devices("claude")
+    by_id = {d.device_id: d.host for d in cached}
+    assert by_id == {"dev-moved": "10.0.0.9:80", "dev-peer": "10.0.0.6:80"}

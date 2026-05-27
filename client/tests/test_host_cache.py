@@ -455,3 +455,140 @@ def test_update_paired_device_host_does_not_clobber_unrelated_agent(_state_dir):
     assert host_cache.load_paired_devices("codex") == [
         PairedDevice("dev-x", "10.0.0.6:80")
     ]
+
+
+# ============================== mDNS resilience §2/§6/§7: claim_reconcile_slots
+
+def test_claim_reconcile_slots_returns_all_on_cold_cache(_state_dir):
+    """First call with empty state should let everyone through and mark
+    them all as just-reconciled."""
+    eligible = host_cache.claim_reconcile_slots(
+        "claude", ["dev-a", "dev-b"], now=1_000_000.0
+    )
+    assert eligible == {"dev-a", "dev-b"}
+
+
+def test_claim_reconcile_slots_suppresses_repeat_within_cooldown(_state_dir):
+    host_cache.claim_reconcile_slots(
+        "claude", ["dev-a"], now=1_000_000.0, cooldown_s=60.0
+    )
+    # Same device, only 30 s later → cooldown still active.
+    eligible = host_cache.claim_reconcile_slots(
+        "claude", ["dev-a"], now=1_000_030.0, cooldown_s=60.0
+    )
+    assert eligible == set()
+
+
+def test_claim_reconcile_slots_re_eligible_after_cooldown(_state_dir):
+    host_cache.claim_reconcile_slots(
+        "claude", ["dev-a"], now=1_000_000.0, cooldown_s=60.0
+    )
+    eligible = host_cache.claim_reconcile_slots(
+        "claude", ["dev-a"], now=1_000_061.0, cooldown_s=60.0
+    )
+    assert eligible == {"dev-a"}
+
+
+def test_claim_reconcile_slots_partial_eligibility(_state_dir):
+    """One device in cooldown, one fresh → only the fresh one comes back."""
+    host_cache.claim_reconcile_slots(
+        "claude", ["dev-hot"], now=1_000_000.0, cooldown_s=60.0
+    )
+    eligible = host_cache.claim_reconcile_slots(
+        "claude", ["dev-hot", "dev-cold"], now=1_000_010.0, cooldown_s=60.0
+    )
+    assert eligible == {"dev-cold"}
+
+
+def test_claim_reconcile_slots_env_override(_state_dir, monkeypatch):
+    monkeypatch.setenv("BURNSCOPE_MDNS_RECONCILE_COOLDOWN_S", "5.0")
+    host_cache.claim_reconcile_slots("claude", ["dev-a"], now=1_000_000.0)
+    # 6 s later — past the 5-second override cooldown.
+    eligible = host_cache.claim_reconcile_slots(
+        "claude", ["dev-a"], now=1_000_006.0
+    )
+    assert eligible == {"dev-a"}
+
+
+def test_claim_reconcile_slots_env_override_bad_value_uses_default(
+    _state_dir, monkeypatch, caplog
+):
+    monkeypatch.setenv("BURNSCOPE_MDNS_RECONCILE_COOLDOWN_S", "not-a-number")
+    caplog.set_level("WARNING", logger="burnscope_client.host_cache")
+    host_cache.claim_reconcile_slots("claude", ["dev-a"], now=1_000_000.0)
+    # 30 s later — should still be blocked under the default 60 s cooldown.
+    eligible = host_cache.claim_reconcile_slots(
+        "claude", ["dev-a"], now=1_000_030.0
+    )
+    assert eligible == set()
+    assert any(
+        "BURNSCOPE_MDNS_RECONCILE_COOLDOWN_S" in r.message for r in caplog.records
+    )
+
+
+def test_claim_reconcile_slots_is_per_agent(_state_dir):
+    """Claiming on one agent must not consume the other agent's slot."""
+    host_cache.claim_reconcile_slots("claude", ["dev-x"], now=1_000_000.0)
+    # codex hasn't touched dev-x at all → fresh.
+    assert host_cache.claim_reconcile_slots(
+        "codex", ["dev-x"], now=1_000_000.0
+    ) == {"dev-x"}
+
+
+def test_claim_reconcile_slots_empty_input_no_write(_state_dir):
+    host_cache.claim_reconcile_slots("claude", [], now=1_000_000.0)
+    # No state file should have been created for an empty request.
+    assert not (_state_dir / "mdns-reconcile.claude.json").exists()
+
+
+def test_claim_reconcile_slots_skips_unsafe_device_ids(_state_dir):
+    eligible = host_cache.claim_reconcile_slots(
+        "claude", ["../../etc/passwd", "dev-ok"], now=1_000_000.0
+    )
+    assert eligible == {"dev-ok"}
+
+
+def test_claim_reconcile_slots_recovers_from_corrupted_state(_state_dir):
+    (_state_dir / "mdns-reconcile.claude.json").write_text("not json")
+    eligible = host_cache.claim_reconcile_slots(
+        "claude", ["dev-a"], now=1_000_000.0
+    )
+    assert eligible == {"dev-a"}
+
+
+def test_concurrent_claim_serializes_to_single_winner(_state_dir):
+    """Two threads racing the same device must not both 'claim' it. The
+    per-agent flock turns the read-check-write into a serializable op,
+    so exactly one thread wins; the other sees its own (just-written)
+    timestamp inside the cooldown window."""
+    winners: list[set[str]] = []
+    barrier = threading.Barrier(8)
+
+    def worker():
+        barrier.wait()
+        winners.append(
+            host_cache.claim_reconcile_slots(
+                "claude", ["dev-contended"], now=1_000_000.0, cooldown_s=60.0
+            )
+        )
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    granted = sum(1 for w in winners if w == {"dev-contended"})
+    assert granted == 1, (
+        f"exactly one thread should win the slot, got {granted}: {winners}"
+    )
+
+
+def test_clear_reconcile_state_is_idempotent(_state_dir):
+    host_cache.clear_reconcile_state("claude")  # nothing to do
+    host_cache.claim_reconcile_slots("claude", ["dev-a"], now=1_000_000.0)
+    host_cache.clear_reconcile_state("claude")
+    # After clear, the device is immediately re-claimable.
+    assert host_cache.claim_reconcile_slots(
+        "claude", ["dev-a"], now=1_000_001.0, cooldown_s=60.0
+    ) == {"dev-a"}

@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BurnScope mDNS Discovery Resilience Plan</title>
+<style>
+  :root {
+    --accent: #2c5aa0;
+    --accent-soft: #eef3fa;
+    --border: #d8dee4;
+    --bg-soft: #f6f8fa;
+    --bg-code: #f4f4f7;
+    --text: #24292f;
+    --muted: #57606a;
+    --danger: #b42318;
+    --ok: #1a7f37;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    max-width: 1060px;
+    margin: 2em auto;
+    padding: 0 1.5em 3em;
+    color: var(--text);
+    line-height: 1.55;
+  }
+  h1 { border-bottom: 2px solid var(--accent); padding-bottom: .35em; }
+  h2 { border-bottom: 1px solid var(--border); padding-bottom: .25em; margin-top: 2.2em; }
+  h3 { color: var(--accent); margin-top: 1.6em; }
+  p { margin: .65em 0; }
+  code, pre { font-family: "SF Mono", Menlo, Consolas, monospace; }
+  code {
+    background: var(--bg-code);
+    padding: .1em .35em;
+    border-radius: 3px;
+    font-size: .92em;
+  }
+  pre {
+    background: var(--bg-code);
+    padding: 1em 1.2em;
+    border-radius: 6px;
+    overflow-x: auto;
+    border-left: 3px solid var(--accent);
+    font-size: .9em;
+  }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 1em 0;
+    font-size: .93em;
+  }
+  th, td {
+    border: 1px solid var(--border);
+    padding: .6em .8em;
+    text-align: left;
+    vertical-align: top;
+  }
+  th { background: var(--bg-soft); font-weight: 600; }
+  ul, ol { padding-left: 1.5em; }
+  li { margin: .25em 0; }
+  .toc, .note {
+    background: var(--bg-soft);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 1em 1.2em;
+  }
+  .note { border-left: 4px solid var(--accent); }
+  .bad { color: var(--danger); font-weight: 600; }
+  .good { color: var(--ok); font-weight: 600; }
+  .muted { color: var(--muted); }
+</style>
+</head>
+<body>
+<h1>BurnScope mDNS Discovery Resilience Plan</h1>
+
+<p class="muted">Prepared 2026-05-27. Scope: client-side discovery, paired-device cache lifecycle, Codex daemon health/push loops, Claude statusline push child, and related tests. The core recovery fix is client-side. A small firmware <code>/health</code> identity field is recommended to close the duplicate-host ambiguity when mDNS is unavailable.</p>
+
+<div class="toc">
+  <strong>Contents</strong>
+  <ul>
+    <li><a href="#summary">Summary</a></li>
+    <li><a href="#current-bugs">Current Logical Bugs</a></li>
+    <li><a href="#target-protocol">Target Protocol</a></li>
+    <li><a href="#implementation-plan">Implementation Plan</a></li>
+    <li><a href="#tests">Test Plan</a></li>
+    <li><a href="#rollout">Rollout Notes</a></li>
+  </ul>
+</div>
+
+<h2 id="summary">Summary</h2>
+
+<p>The client currently treats repeated transport or health failures as a reason to remove a device from <code>paired-devices.&lt;agent&gt;.json</code>. That makes sense for authorization failures, but not for reachability failures. A device can be powered off, rebooting, roaming, blocked by mDNS, or moved to a new DHCP address while it is still legitimately paired to this laptop.</p>
+
+<p>The fix is to make <code>paired-devices</code> a durable ownership cache. Only explicit user action or an agent-specific <code>/summary</code> HTTP <code>401</code> should remove a pairing. Transport and health failures should mark the device unhealthy, refresh its host through mDNS by stable <code>device_id</code>, and keep retrying over time.</p>
+
+<p>The implementation must also be race-safe: host refresh is an update-only operation, not an add operation. A stale mDNS reconciliation task must not re-insert a device that another process already removed after an agent-specific auth failure or <code>pair-reset</code>.</p>
+
+<p>One more invariant is required: a cached <code>host</code> must not be trusted as proof that the intended <code>device_id</code> was reached. If two local device records point at the same <code>ip:port</code>, HTTP can succeed against one physical ESP32 while the client records success for both logical devices. Duplicate cached hosts must therefore trigger identity reconciliation even when there is no transport failure.</p>
+
+<h2 id="current-bugs">Current Logical Bugs</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>Bug</th>
+      <th>Observed Behavior</th>
+      <th>Root Cause</th>
+      <th>Expected Behavior</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Single unreachable device is permanently lost in a multi-device fleet</td>
+      <td>After <code>MAX_TRANSPORT_FAILURES</code>, the failed device is removed. If another paired device remains, auto-pair discovery never runs because the paired list is not empty.</td>
+      <td>Reachability failure is conflated with ownership loss.</td>
+      <td>Keep the device paired, show it unhealthy, and recover automatically when mDNS or HTTP reachability returns.</td>
+    </tr>
+    <tr>
+      <td>Changed reserved/DHCP IP is not always refreshed</td>
+      <td>Push-side refresh can heal stale IPs only when a push is attempted and fails. Codex can skip pushes due to semantic dedupe, so health probes keep using the stale host. Worse, if two cached device records point to the same <code>host</code>, HTTP can succeed against the wrong physical device and no failure path runs.</td>
+      <td>Host refresh is tied only to push transport failures, not to health failures, duplicate-host detection, or periodic identity reconciliation.</td>
+      <td>Reachability failures and duplicate cached hosts should trigger throttled reconciliation by <code>device_id</code>. HTTP success to a duplicated host should not mark every logical device healthy unless identity is verified.</td>
+    </tr>
+    <tr>
+      <td>Health loop can evict a device without trying mDNS recovery</td>
+      <td>Codex health failures increment an in-memory counter and remove the device after five misses.</td>
+      <td>The health loop calls <code>fetch_health(cached_host)</code> only; it does not reconcile the cached host with current mDNS data.</td>
+      <td>On health failure, run one shared, throttled mDNS refresh for failed devices, retry health at the refreshed host if changed, then record failure only if still unreachable.</td>
+    </tr>
+    <tr>
+      <td>Manual <code>burnscope pair</code> is required to recover some valid pairings</td>
+      <td>A device that was removed from the local cache but remains TOFU-bound on firmware can be recovered only when the entire list is empty or when the user runs <code>pair</code>.</td>
+      <td>Normal steady-state discovery is disabled for non-empty paired lists.</td>
+      <td>Normal operation should preserve pairings so recovery does not depend on re-pairing. Optional periodic reconciliation can merge already-known devices by <code>device_id</code>.</td>
+    </tr>
+    <tr>
+      <td>Failure counters are treated as eviction timers</td>
+      <td>Five consecutive transport misses delete the device and its per-device status file.</td>
+      <td>The counter is used for cleanup instead of status/backoff.</td>
+      <td>Counters should drive health state, logging, and retry cadence, not pairing deletion.</td>
+    </tr>
+    <tr>
+      <td>mDNS browser ignores update events</td>
+      <td><code>discover_all()</code> handles only <code>ServiceStateChange.Added</code>.</td>
+      <td>Initial browse usually works, but changed records during a browse can arrive as updates.</td>
+      <td>Resolve both <code>Added</code> and <code>Updated</code>; ignore only <code>Removed</code>.</td>
+    </tr>
+    <tr>
+      <td>Stale reconciliation can resurrect removed pairings</td>
+      <td>A host refresh that started from an old paired-device snapshot can call <code>add_paired_device()</code> after another process removed the same device.</td>
+      <td>Host refresh uses an insert-or-update primitive instead of re-checking current pairing state under the paired-device lock.</td>
+      <td>Use an update-only cache operation that returns false when the device is no longer paired.</td>
+    </tr>
+    <tr>
+      <td>Unthrottled mDNS refresh can pile up for offline devices</td>
+      <td>After non-auth eviction is removed, a powered-off device can trigger a full mDNS browse on every failed push or health probe.</td>
+      <td>Reconciliation is tied directly to each failure event and has no per-device cooldown.</td>
+      <td>Throttle reconciliation per <code>agent/device_id</code>; failures inside the cooldown should update status without starting another browse.</td>
+    </tr>
+    <tr>
+      <td>Duplicate cached hosts can hide stale records</td>
+      <td>Two paired-device entries can both point at the same <code>ip:port</code>. Pushing or probing both entries hits one physical device twice and can produce two apparent successes.</td>
+      <td>The local cache has no uniqueness check for active <code>host</code> values, and current HTTP responses do not include the responding device's stable <code>device_id</code>.</td>
+      <td>Treat duplicate hosts as an identity conflict. Reconcile the affected <code>device_id</code>s through mDNS, and add a firmware <code>/health.device_id</code> field so HTTP success can be tied to the expected device.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="target-protocol">Target Protocol</h2>
+
+<h3>Identity Model</h3>
+
+<ul>
+  <li><code>device_id</code> is the stable device identity, derived from the mDNS hostname seeded by the ESP32 WiFi MAC.</li>
+  <li><code>host</code> is volatile routing data: <code>ip:port</code>. It must be refreshable and must never be used as proof of identity.</li>
+  <li>A <code>host</code> should normally map to at most one paired <code>device_id</code> for a given agent. Duplicate cached hosts are an identity conflict, not a healthy state.</li>
+  <li><code>client_id</code> plus firmware NVS pairing slot is the authorization binding.</li>
+  <li>HTTP <code>401</code> from <code>/summary</code> for the current agent means ownership/auth mismatch and may remove the local pairing for that agent.</li>
+  <li>HTTP <code>401</code> from generic <code>/health</code> is not currently an agent-specific ownership signal. Treat it as an unhealthy probe result unless firmware changes <code>/health</code> to report agent-specific rejection.</li>
+  <li>Timeout, connect error, DNS failure, HTTP 5xx, invalid health body, mDNS absence, and duplicate-host ambiguity mean reachability, identity, or firmware health trouble. They must not remove pairing.</li>
+</ul>
+
+<h3>State Machine</h3>
+
+<pre><code>paired + healthy
+  on push/health success:
+    keep paired, reset relevant failure counter
+
+paired + stale_host
+  on transport/health failure:
+    if reconciliation cooldown allows it, discover all BurnScope devices
+    if same device_id found at a different host:
+      update paired-devices host only if still paired under lock
+      if update succeeded, retry request once
+    if retry succeeds:
+      become healthy
+    else:
+      become paired + unhealthy
+
+paired + host_conflict
+  when multiple paired records share the same host:
+    do not treat HTTP success to that host as proof for every device_id
+    if reconciliation cooldown allows it, discover all BurnScope devices
+    update each visible conflicted device_id to its discovered host under lock
+    if all duplicates were split to distinct hosts:
+      become healthy on next successful HTTP exchange
+    if conflict remains unresolved:
+      keep pairings, mark affected devices identity-unverified/unhealthy
+      stay in host_conflict until the next cooldown-eligible reconciliation
+
+paired + unhealthy
+  on repeated transport/health failure:
+    keep paired
+    update per-device status with failure count and last error time
+    optionally slow retry cadence
+  on mDNS or HTTP success:
+    update host if needed
+    become healthy
+
+paired + auth_rejected
+  on HTTP 401 from /summary for this agent:
+    remove only that agent/device pairing
+    clear per-device push state
+
+unpaired / forgotten
+  only entered by pair-reset, manual unpair, invalid local cache, or /summary 401
+</code></pre>
+
+<h3>Discovery Rules</h3>
+
+<ol>
+  <li>Run unfiltered mDNS discovery when reconciling already-paired devices. The firmware TXT <code>paired_*</code> flags are hints for first-time claiming, not for refreshing a known pairing.</li>
+  <li>Match discovered records to cached pairings only by <code>device_id</code>.</li>
+  <li>If a cached <code>device_id</code> is visible with a different <code>host</code>, update the local cache only through an update-only operation that re-checks the current paired list under lock.</li>
+  <li>If two or more cached <code>device_id</code>s share the same <code>host</code>, force a throttled reconciliation for that duplicate-host group even if the last HTTP request succeeded.</li>
+  <li>If duplicate-host reconciliation cannot prove which device responded, keep all pairings but mark the affected devices as identity-unverified rather than healthy.</li>
+  <li>If a cached <code>device_id</code> is absent from mDNS, leave the cached host and paired state intact.</li>
+  <li>Resolve both mDNS <code>Added</code> and <code>Updated</code> events.</li>
+  <li>Do not add arbitrary newly-discovered devices during background reconciliation; adding new pairings remains the job of auto-pair on first run or <code>burnscope pair</code>.</li>
+  <li>Throttle mDNS reconciliation per <code>agent/device_id</code> with a 60 s cooldown (override via <code>BURNSCOPE_MDNS_RECONCILE_COOLDOWN_S</code>). A failed request inside the cooldown should record failure state without launching another browse.</li>
+</ol>
+
+<h3>Removal Rules</h3>
+
+<table>
+  <thead>
+    <tr>
+      <th>Signal</th>
+      <th>Remove pairing?</th>
+      <th>Reason</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>HTTP <code>401</code> from <code>/summary</code> for this agent</td>
+      <td class="good">Yes</td>
+      <td>The device is reachable and explicitly says this client is not authorized for that agent slot.</td>
+    </tr>
+    <tr>
+      <td>HTTP <code>401</code> from generic <code>/health</code></td>
+      <td class="bad">No</td>
+      <td>Current firmware authorizes <code>/health</code> against any populated slot, not the specific agent being probed.</td>
+    </tr>
+    <tr>
+      <td>User runs <code>pair-reset</code></td>
+      <td class="good">Yes</td>
+      <td>Explicit local forget operation.</td>
+    </tr>
+    <tr>
+      <td>Transport failure, timeout, connection refused</td>
+      <td class="bad">No</td>
+      <td>May be temporary or caused by IP churn.</td>
+    </tr>
+    <tr>
+      <td>mDNS does not see the device</td>
+      <td class="bad">No</td>
+      <td>mDNS is lossy and absence is not proof of unpairing.</td>
+    </tr>
+    <tr>
+      <td>Health failure or invalid health JSON</td>
+      <td class="bad">No</td>
+      <td>Reachability or firmware-state signal only.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="implementation-plan">Implementation Plan</h2>
+
+<h3>1. Add an Update-Only Host Cache Operation</h3>
+
+<p>Add a locked cache primitive in <code>client/src/burnscope_client/host_cache.py</code> that changes the host for an already-paired device without ever inserting a missing device. Today the only mutating primitive there is <code>add_paired_device</code> (insert-or-update); we deliberately want a narrower update-only sibling:</p>
+
+<pre><code>update_paired_device_host(agent, device_id, host) -&gt; bool
+  with paired-devices lock:
+    current = load_paired_devices(agent)
+    if device_id is not present:
+      return false
+    replace only that device's host
+    save_paired_devices(agent, current)
+    return true
+</code></pre>
+
+<p>This operation prevents stale reconciliation from resurrecting a pairing removed by a concurrent <code>/summary</code> 401 path or <code>pair-reset</code>.</p>
+
+<h3>2. Reuse and Harden the Push Refresh Helper</h3>
+
+<p>Keep the existing push-side shape: attempt the cached host first, then use mDNS only for devices that reported <code>kind="transport"</code>. The helper already exists as <code>refresh_and_retry_transport_failures</code> in <code>client/src/burnscope_client/pusher.py</code>; harden it with update-only host writes and throttling:</p>
+
+<pre><code>refresh_and_retry_transport_failures(agent, paired_devices, results, timeout)
+  failed = devices with kind == "transport"
+  eligible = failed devices whose reconciliation cooldown has expired
+  if eligible is empty:
+    return original results
+  discovered = discover_all(timeout=timeout)
+  for each discovered device whose device_id is in eligible:
+    if discovered.host != cached.host:
+      if update_paired_device_host(agent, device_id, discovered.host) is false:
+        skip retry because device is no longer paired
+      else:
+        retry push once at discovered.host
+  return updated results
+</code></pre>
+
+<p>The throttle should be keyed by <code>agent/device_id</code>. For Claude statusline children it should be file-backed because each push runs in a short-lived process. For the Codex daemon it can reuse the same file-backed state or mirror it in memory with conservative persistence for consistency.</p>
+
+<h3>3. Detect and Reconcile Duplicate Cached Hosts</h3>
+
+<p>Before declaring per-device success, scan the current paired list for duplicate <code>host</code> values. Duplicate hosts mean at least one local record may be stale, and success from that host cannot identify which physical display accepted the request.</p>
+
+<pre><code>reconcile_duplicate_hosts(agent, paired_devices, timeout)
+  duplicate_groups = host values used by more than one device_id
+  affected = device_ids in duplicate_groups whose cooldown has expired
+  if affected is empty:
+    mark duplicate groups identity-unverified for status
+    return
+  discovered = discover_all(timeout=timeout)
+  for each discovered device whose device_id is in affected:
+    update_paired_device_host(agent, device_id, discovered.host)
+  reload paired-devices
+  if duplicates remain:
+    keep pairings, mark affected devices identity-unverified/unhealthy
+</code></pre>
+
+<p>This pass should be update-only and throttled like transport recovery. It should never add new devices and never remove pairings. If mDNS is available, it will split the two records back to their current hosts. If mDNS is unavailable, the client must preserve the pairings but avoid reporting every duplicate-host entry as healthy.</p>
+
+<h3>4. Add Optional HTTP Device Identity</h3>
+
+<p>For complete protection when mDNS is unavailable, firmware should include the responding device identity in <code>/health</code>. <code>/health</code> is the natural carrier because <code>POST /summary</code> currently returns <code>204 No Content</code> with no body — there is no place on the push path itself to read the responding device's identity, so identity verification has to ride on a follow-up <code>GET /health</code>.</p>
+
+<pre><code>{
+  "device_id": "burnscope-5730",
+  "firmware_version": "...",
+  "uptime_s": 123,
+  "free_heap_b": 456,
+  "agents": { ... }
+}
+</code></pre>
+
+<p>The value must match the mDNS hostname-derived <code>device_id</code>. The client can then treat a successful health response whose <code>device_id</code> differs from the requested paired record as a stale-host/identity conflict and trigger reconciliation. Until this field exists, duplicate-host conflicts can be detected locally, but resolving them depends on mDNS visibility.</p>
+
+<h3>5. Update Push Failure Handling</h3>
+
+<ul>
+  <li>Keep the existing immediate push, because the cached host is usually correct.</li>
+  <li>Before writing per-device success, check whether the device's cached <code>host</code> is duplicated in the current paired list. If so, run or honor duplicate-host reconciliation and do not mark every duplicate entry healthy from the same HTTP response.</li>
+  <li>For devices with <code>kind="transport"</code>, let the existing refresh-and-retry helper run one mDNS reconciliation pass only when the per-device cooldown allows it.</li>
+  <li>If the failed device appears at a different host, retry the push once at the refreshed host.</li>
+  <li>If it does not appear, appears at the same host, is inside cooldown, or was removed while discovery was in flight, keep the failure result and leave current pairing state unchanged.</li>
+  <li>On success, reset that device's push failure counter.</li>
+  <li>On continued failure, increment the counter and write per-device status, but do not evict.</li>
+  <li>Keep <code>/summary</code> 401 eviction unchanged and limited to the affected <code>agent/device_id</code>.</li>
+</ul>
+
+<h3>6. Update Claude Statusline Policy</h3>
+
+<ul>
+  <li>Remove the <code>MAX_TRANSPORT_FAILURES</code> eviction path for transport failures (<code>client/src/burnscope_client/claude_statusline.py</code>; currently evicts at the fifth consecutive miss via <code>remove_paired_device</code>).</li>
+  <li>Continue persisting <code>consecutive_failures</code> via <code>bump_push_failures</code> / <code>reset_push_failures</code> in <code>host_cache.py</code> so <code>burnscope status</code> can show degraded devices across short-lived statusline child processes.</li>
+  <li>Keep <code>/summary</code> 401 eviction unchanged.</li>
+  <li>Use file-backed reconciliation throttling so frequent statusline fires do not overlap repeated mDNS browse windows for the same offline device.</li>
+  <li>Use the same file-backed throttling for duplicate-host reconciliation; frequent statusline fires should not repeatedly browse mDNS for an unresolved identity conflict.</li>
+  <li>Return non-zero from <code>--push</code> when any still-paired device fails, so the aggregate indicator remains honest.</li>
+</ul>
+
+<h3>7. Update Codex Push Policy</h3>
+
+<ul>
+  <li>Remove transport-based deletion from <code>_push_to_devices</code> (<code>client/src/burnscope_client/codex_daemon.py</code>; currently evicts at <code>MAX_TRANSPORT_FAILURES = 5</code>).</li>
+  <li>Run duplicate-host reconciliation before accepting a fan-out result as fully healthy. A duplicate-host group that cannot be resolved should keep aggregate status false.</li>
+  <li>Keep per-device failure counters in memory for logging/status, but treat them as diagnostics rather than eviction thresholds.</li>
+  <li>Persist the reconciliation throttle state to a file (e.g. <code>~/.burnscope/mdns-reconcile.codex.json</code>) so a daemon restart does not immediately launch a fresh browse for every offline device. Counter state can remain in memory — only the per-<code>device_id</code> cooldown timestamps need to survive a restart.</li>
+  <li>Keep <code>/summary</code> 401 deletion unchanged.</li>
+  <li>Continue advancing <code>_last_pushed_snapshot</code> on partial success so healthy peers are not pushed repeatedly for unchanged data.</li>
+</ul>
+
+<h3>8. Update Codex Health Policy</h3>
+
+<ul>
+  <li>Detect duplicate cached hosts during health polling. If two records point to the same host, reconcile by mDNS before treating repeated <code>/health</code> successes as proof that both physical devices are healthy.</li>
+  <li>On health failure, collect failed devices and run one shared, throttled mDNS reconciliation pass for the batch. Share the file-backed throttle from §7 so push and health failures cannot double-trigger a browse for the same <code>device_id</code> within the cooldown.</li>
+  <li>When firmware exposes <code>/health.device_id</code>, compare it to the expected paired <code>device_id</code>. A mismatch is a stale-host/identity conflict, not a success.</li>
+  <li>If a failed device is discovered at a new host, retry <code>/health</code> once at the refreshed host.</li>
+  <li>If the retry succeeds, clear the health counter and use the refreshed host for future probes.</li>
+  <li>If the retry fails or no mDNS record is found, mark the device unhealthy and keep it paired.</li>
+  <li>Treat generic <code>/health</code> 401 as an unhealthy probe result, not as permission to remove an agent pairing.</li>
+  <li>Do not remove devices after five health misses (today's <code>codex_daemon.py</code> evicts on the fifth miss).</li>
+</ul>
+
+<h3>9. Update mDNS Resolver Events</h3>
+
+<ul>
+  <li>Change discovery to resolve <code>ServiceStateChange.Added</code> and <code>ServiceStateChange.Updated</code>. Today <code>client/src/burnscope_client/discovery.py</code> short-circuits on anything other than <code>Added</code>.</li>
+  <li>Keep ignoring <code>Removed</code>; removal events should not delete pairings.</li>
+  <li>Continue deriving <code>device_id</code> from <code>info.server</code>, not the instance name.</li>
+</ul>
+
+<h3>10. Status Output Improvements</h3>
+
+<p>Optional but recommended: make <code>burnscope status</code> distinguish paired-but-unreachable from unpaired. Suggested fields:</p>
+
+<ul>
+  <li><code>paired</code>: the device is still owned locally.</li>
+  <li><code>last_ok</code>: timestamp of last success.</li>
+  <li><code>last_failure</code>: timestamp and count of consecutive failures.</li>
+  <li><code>host</code>: cached host, updated by mDNS reconciliation.</li>
+  <li><code>identity</code>: <code>verified</code>, <code>unverified</code>, or <code>conflict</code> when duplicate cached hosts prevent per-device proof.</li>
+  <li><code>visible_mdns</code>: optional, only if status chooses to perform a fresh browse.</li>
+</ul>
+
+<h3>11. Out of Scope but Tracked</h3>
+
+<p>Two follow-ups that share the same identity model and locking story but are explicitly out of scope for this pass:</p>
+
+<ul>
+  <li><strong>OTA path.</strong> <code>POST /ota</code> uses the same <code>X-BurnScope-Client-Id</code> slot match as <code>/summary</code> and trusts the cached host. A duplicate-host scenario could therefore flash the wrong device. Once the client carries a verified <code>device_id</code> from <code>/health</code>, the same identity check should run before any <code>/ota</code> dispatch.</li>
+  <li><strong>Agent-specific <code>/health</code> auth.</strong> Today the firmware authorises <code>/health</code> against <em>any</em> populated slot (<code>firmware/main/http_server.c</code>). A future firmware change should let the client specify which agent it is probing (query parameter or path), and have the firmware return 401 only when the client-id does not match that agent's slot. Until then, generic <code>/health</code> 401 stays an unhealthy-probe signal, not an ownership signal.</li>
+</ul>
+
+<h2 id="tests">Test Plan</h2>
+
+<h3>Unit Tests</h3>
+
+<table>
+  <thead>
+    <tr>
+      <th>Area</th>
+      <th>Test</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>pusher</code></td>
+      <td>Transport failure with no mDNS result keeps device paired and increments failure status only.</td>
+    </tr>
+    <tr>
+      <td><code>pusher</code></td>
+      <td>Transport failure with mDNS result at new host updates cache and retries once.</td>
+    </tr>
+    <tr>
+      <td><code>pusher</code> / <code>host_cache</code></td>
+      <td>Stale host refresh does not re-add a device removed from the current paired list while mDNS discovery was in flight.</td>
+    </tr>
+    <tr>
+      <td><code>pusher</code> / <code>host_cache</code></td>
+      <td>Repeated failures inside the reconciliation cooldown do not start another mDNS browse.</td>
+    </tr>
+    <tr>
+      <td><code>pusher</code> / <code>host_cache</code></td>
+      <td>Two paired devices with the same cached <code>host</code> trigger duplicate-host reconciliation even when HTTP push returns success.</td>
+    </tr>
+    <tr>
+      <td><code>pusher</code></td>
+      <td>Unresolved duplicate-host groups are kept paired but are not all marked healthy from one shared HTTP response.</td>
+    </tr>
+    <tr>
+      <td><code>pusher</code></td>
+      <td>mDNS sees unrelated devices during reconciliation; they are ignored and not auto-added.</td>
+    </tr>
+    <tr>
+      <td><code>claude_statusline</code></td>
+      <td>More than five consecutive transport failures do not remove the paired device.</td>
+    </tr>
+    <tr>
+      <td><code>claude_statusline</code></td>
+      <td><code>/summary</code> HTTP 401 still removes only that device for the Claude agent.</td>
+    </tr>
+    <tr>
+      <td><code>codex_daemon</code></td>
+      <td>More than five push failures do not remove the paired device.</td>
+    </tr>
+    <tr>
+      <td><code>codex_daemon</code></td>
+      <td>More than five health failures do not remove the paired device.</td>
+    </tr>
+    <tr>
+      <td><code>codex_daemon</code></td>
+      <td>Health failure caused by stale IP triggers mDNS refresh, updates cache, and clears health failure on retry success.</td>
+    </tr>
+    <tr>
+      <td><code>codex_daemon</code></td>
+      <td>Generic <code>/health</code> 401 marks the device unhealthy but does not remove the agent pairing.</td>
+    </tr>
+    <tr>
+      <td><code>codex_daemon</code></td>
+      <td><code>/health.device_id</code> mismatch is treated as a stale-host/identity conflict, not as a successful health probe.</td>
+    </tr>
+    <tr>
+      <td><code>discovery</code></td>
+      <td>Both <code>Added</code> and <code>Updated</code> service events are resolved into discovered devices.</td>
+    </tr>
+    <tr>
+      <td><code>firmware</code></td>
+      <td><code>/health</code> includes a stable <code>device_id</code> matching the advertised mDNS hostname-derived identifier.</td>
+    </tr>
+    <tr>
+      <td><code>host_cache</code> / <code>pusher</code></td>
+      <td><code>pair-reset</code> issued during an in-flight reconciliation pass causes <code>update_paired_device_host</code> to return <code>false</code>; the retry is dropped and no resurrected pairing is written back.</td>
+    </tr>
+    <tr>
+      <td><code>codex_daemon</code></td>
+      <td>Daemon restart with degraded devices in the paired list: per-device failure counters reset (in-memory) but the file-backed reconciliation throttle still suppresses a fresh mDNS browse for entries inside their cooldown window.</td>
+    </tr>
+    <tr>
+      <td><code>pusher</code></td>
+      <td>Duplicate-host group where the shared IP no longer hosts a BurnScope device (DHCP reassigned to an unrelated host): reconciliation completes without looping, leaves both records paired, and marks them identity-unverified.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>Integration Scenarios</h3>
+
+<ol>
+  <li>Pair two ESP32 devices. Power one off. Confirm the other keeps receiving updates and the powered-off device remains in <code>paired-devices</code> after more than five failed cycles.</li>
+  <li>Power the device back on. Confirm mDNS sees the same <code>device_id</code>, host is refreshed if needed, and pushes resume without running <code>burnscope pair</code>.</li>
+  <li>Change a device's DHCP reservation or force a new lease. Confirm the next push or health failure refreshes the cached host and recovers automatically.</li>
+  <li>Manually edit two paired-device entries to point at the same <code>ip:port</code>. Confirm the client runs duplicate-host reconciliation even if HTTP succeeds, updates records when mDNS can see both devices, and reports unresolved entries as identity conflicts when it cannot.</li>
+  <li>With firmware exposing <code>/health.device_id</code>, point one device record at another device's IP. Confirm the health probe detects the mismatch and does not mark the stale record healthy.</li>
+  <li>Factory-reset one paired device or bind it to another client. Confirm <code>/summary</code> HTTP <code>401</code> removes only that device and only for the affected agent.</li>
+  <li>Force a health auth failure without an agent-specific <code>/summary</code> rejection. Confirm the device is marked unhealthy but remains paired.</li>
+  <li>Block mDNS but leave HTTP reachable at cached IP. Confirm normal pushes/health still work and absence from mDNS does not remove pairing.</li>
+  <li>Block HTTP but leave mDNS visible. Confirm host refresh may update the cache, but pairing remains until HTTP recovers or <code>/summary</code> 401 is observed.</li>
+  <li>Leave one paired device powered off and trigger frequent Claude statusline pushes. Confirm mDNS browse attempts are throttled rather than launched for every failure.</li>
+</ol>
+
+<h2 id="rollout">Rollout Notes</h2>
+
+<div class="note">
+  <p><strong>Compatibility:</strong> This plan is backwards-compatible with the current firmware TXT records. The client still uses <code>paired_claude</code> and <code>paired_codex</code> for first-time claiming decisions, but paired-device reconciliation ignores those hints and trusts local pairing plus agent-specific <code>/summary</code> auth.</p>
+  <p><strong>Firmware identity field:</strong> Adding <code>/health.device_id</code> is backwards-compatible. Older firmware simply lacks the field; the client should then fall back to mDNS reconciliation and mark duplicate-host cases identity-unverified when it cannot prove which device responded.</p>
+  <p><strong>Risk:</strong> The main behavior change is that unreachable devices remain visible in local status instead of being deleted. That is intentional. It may require clearer status wording so users understand the difference between “paired but offline” and “unpaired.”</p>
+  <p><strong>Optional firmware follow-up:</strong> Add TXT fields such as <code>boot_id</code> or <code>pair_epoch_&lt;agent&gt;</code> later if we want richer diagnostics. (The firmware already advertises a <code>version</code> TXT field, so a separate <code>fw</code> field would be redundant.) The key identity field for duplicate-host correctness belongs in <code>/health</code>, where the client can validate the HTTP peer it actually reached.</p>
+</div>
+
+</body>
+</html>

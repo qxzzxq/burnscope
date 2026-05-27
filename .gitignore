@@ -59,6 +59,9 @@ local.yaml
 # *Demo
 build*/
 
+# Claude code
+scheduled_tasks.lock
+
 # Waveshare ESP32-S3-Touch-AMOLED-1.43 vendor demo bundle — local-only
 # reference (346 MB, ~3 800 files: LVGL source, Waveshare demos, Espressif
 # components). The bits we actually ship are trimmed-down ports under

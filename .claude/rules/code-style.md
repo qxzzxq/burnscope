@@ -45,7 +45,11 @@
   - How to test/verify the change.
   - Links to related issues or design docs.
 - Keep PRs small and reviewable (ideally under ~400 lines of diff).
+- When creating a PR, always request a Copilot review by adding `--reviewer @copilot` to the `gh pr create` command.
 - Address review comments with follow-up commits; do not force-push after review has started unless requested.
+- Before addressing review feedback, ensure you understand the comment. If unclear, ask for clarification rather than guessing.
+- Always verify the review feedback is a valid concern before making changes. If you disagree with the feedback, respectfully explain your reasoning in a comment rather than ignoring it.
+- After addressing review feedback, re-request review with `gh pr edit <PR> --add-reviewer @copilot`
 
 ## Before You Code
 - Confirm the requirements and acceptance criteria are clear. Ask for clarification when uncertain rather than guessing.

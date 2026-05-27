@@ -248,6 +248,18 @@ lv_display_t *amoled_sh8601_driver_init(void)
     return s_display;
 }
 
+/* The burn-in adapter's drain task and fade-step timer both call into
+ * panel-IO outside the LVGL flush pipeline. Without coordination, a
+ * brightness or DISPON/DISPOFF transaction can interleave with an
+ * in-flight pixel flush on the same `s_io_handle`/`s_panel_handle` —
+ * the SPI panel-IO driver's transaction-done callback gets associated
+ * with the wrong submitter, the flush done semaphore never gets given,
+ * and LVGL stalls. Once LVGL is stalled, subsequent panel-IO calls
+ * from the adapter also block, taking the wake-event drain down with
+ * them and leaving the device frozen at whatever brightness the last
+ * surviving write produced. Holding the same lock LVGL takes around
+ * its own panel-IO accesses serialises us against the flush callback
+ * and prevents the wedge. */
 void amoled_sh8601_set_brightness_pct(uint8_t pct)
 {
     if (s_io_handle == NULL) {
@@ -258,7 +270,12 @@ void amoled_sh8601_set_brightness_pct(uint8_t pct)
     }
     const uint8_t reg = (uint8_t)((uint32_t)pct * 255u / 100u);
     const uint32_t framed = SH8601_QSPI_TX_CMD(SH8601_CMD_BRIGHTNESS);
+    if (!lvgl_port_lock(0)) {
+        ESP_LOGW(TAG, "set_brightness_pct(%u): lvgl_port_lock failed", (unsigned)pct);
+        return;
+    }
     esp_err_t err = esp_lcd_panel_io_tx_param(s_io_handle, framed, &reg, 1);
+    lvgl_port_unlock();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "set_brightness_pct(%u): tx_param failed: %s",
                  (unsigned)pct, esp_err_to_name(err));
@@ -270,7 +287,12 @@ void amoled_sh8601_set_display_on(bool on)
     if (s_panel_handle == NULL) {
         return;
     }
+    if (!lvgl_port_lock(0)) {
+        ESP_LOGW(TAG, "set_display_on(%d): lvgl_port_lock failed", (int)on);
+        return;
+    }
     esp_err_t err = esp_lcd_panel_disp_on_off(s_panel_handle, on);
+    lvgl_port_unlock();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "set_display_on(%d): disp_on_off failed: %s",
                  (int)on, esp_err_to_name(err));

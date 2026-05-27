@@ -34,6 +34,8 @@
 #include "freertos/task.h"
 #include "sdkconfig.h"
 
+#include "burn_idle_adapter.h"
+#include "driver.h"
 #include "qmi8658.h"
 
 #ifdef CONFIG_BURNSCOPE_AMOLED_ORIENTATION_AUTO
@@ -43,8 +45,32 @@ static const char *TAG = "orientation";
 #define SAMPLE_PERIOD_MS    100      /* ~10 Hz */
 #define HYSTERESIS_MG       200      /* FR-1.3: 0.2 g band */
 #define DEBOUNCE_US         500000   /* FR-1.4: 500 ms */
-#define TASK_STACK          3072
+/* 8 KB: lv_refr_now in apply_rotation runs the full LVGL render
+ * pipeline on this task's stack (draw → sw_rotate → flush callback →
+ * panel-IO). The lvgl_port task uses 7 KB by default for the same
+ * work; we match it with a small safety margin. The earlier 3 KB
+ * sufficed only when this task did nothing but lv_display_set_rotation. */
+#define TASK_STACK          8192
 #define TASK_PRIORITY       2        /* below burn_idle's IMU sampler */
+/* Rotation-dip fade timings. The LVGL stripe-by-stripe redraw kicked
+ * off by lv_display_set_rotation is visibly ugly on a 466×466 panel
+ * with 40-row stripes (~12 visible bands). We fade the panel dark
+ * before the rotation, drain the redraw synchronously via lv_refr_now
+ * while the panel is at 0 %, then fade back up.
+ *
+ * The whole transition runs *under* lvgl_port_lock and writes the 0x51
+ * register directly from this task — not via the burn-in adapter's
+ * esp_timer fade engine. Holding the lock for the entire transition
+ * prevents any other LVGL work (1 Hz countdown tick, snapshot pushes,
+ * touch indev reads) from racing the fade, which was the root cause
+ * of the "brightness freezes then catches up" stutter — those
+ * contending lv_timer_handler calls used to hold the lock for tens of
+ * ms at a time, blocking adapter-driven fade callbacks queued behind
+ * them. FADE_STEP_MS sets the inline ramp's cadence; 16 ms ≈ 60 Hz so
+ * the human eye sees a continuous gradient. */
+#define FADE_DOWN_MS        300
+#define FADE_UP_MS          300
+#define FADE_STEP_MS        16
 /* Below the dominant axis's mg reading we treat the sample as
  * inconclusive (device lying flat, free fall, vigorous shake). The
  * QMI8658 reports ~1000 mg under steady gravity; 400 mg comfortably
@@ -120,13 +146,92 @@ static int16_t axis_reading(axis_t axis, int16_t ax, int16_t ay)
     return 0;
 }
 
+/* Run an inline brightness ramp from `from_pct` to `to_pct` over
+ * `duration_ms`, writing the 0x51 register directly each step. Must
+ * be called with lvgl_port_lock already held — `set_brightness_pct`
+ * re-takes the lock recursively, which is cheap, but the surrounding
+ * caller relies on holding the lock to keep other LVGL work out of
+ * the way (see apply_rotation's contract).
+ */
+static void ramp_brightness_locked(uint8_t from_pct, uint8_t to_pct, uint32_t duration_ms)
+{
+    const int steps = (int)(duration_ms / FADE_STEP_MS);
+    if (steps <= 0) {
+        amoled_sh8601_set_brightness_pct(to_pct);
+        return;
+    }
+    const int delta = (int)to_pct - (int)from_pct;
+    for (int i = 1; i <= steps; ++i) {
+        const int pct = (int)from_pct + (delta * i) / steps;
+        amoled_sh8601_set_brightness_pct((uint8_t)pct);
+        vTaskDelay(pdMS_TO_TICKS(FADE_STEP_MS));
+    }
+}
+
+/* Apply a new rotation, masked by a brightness dip so the LVGL
+ * stripe-by-stripe redraw isn't visible. Steps:
+ *   1. Snapshot the burn-in adapter's current brightness — the level
+ *      we'll restore to. May be ACTIVE (70 %) or DIMMED (20 %)
+ *      depending on idle state. If the panel is already off (0 %),
+ *      there's nothing to mask, so we apply the rotation cheaply and
+ *      return.
+ *   2. Take lvgl_port_lock for the whole transition. The lock is
+ *      held continuously through fade-down, rotation, redraw, and
+ *      fade-up — this is the key to a clean fade. The original
+ *      esp_timer-driven implementation released the lock between
+ *      each brightness step, letting LVGL's 1 Hz countdown tick
+ *      and snapshot pushes interleave with the ramp; those renders
+ *      held the lock for tens of ms each, queueing fade callbacks
+ *      behind them and producing the "freeze then catch up" stutter.
+ *   3. Anchor the burn-in adapter at the current brightness so its
+ *      fade engine stays dormant for the duration. Without this,
+ *      a TIME-tick state change mid-transition could fire a
+ *      competing fade whose esp_timer callbacks would queue behind
+ *      our lock and snap the panel to a different target the moment
+ *      we release.
+ *   4. Inline ramp from `restore_pct` → 0 % over FADE_DOWN_MS.
+ *   5. lv_display_set_rotation + lv_refr_now drains the full-screen
+ *      redraw synchronously while the panel is at 0 %.
+ *   6. Inline ramp from 0 % → `restore_pct` over FADE_UP_MS.
+ *   7. Re-anchor the adapter at restore_pct so the very next adapter
+ *      fade blends from the correct value.
+ *
+ * Cost: the LVGL lock is held for FADE_DOWN_MS + redraw + FADE_UP_MS
+ * (~750 ms at current timings). During that window other LVGL work
+ * (snapshot updates, touch indev reads, 1 Hz countdown) is deferred.
+ * Rotations are infrequent and the deferred work catches up
+ * immediately on release, so this is acceptable.
+ */
 static void apply_rotation(lv_display_rotation_t rot)
 {
+    const uint8_t restore_pct = burn_idle_adapter_current_brightness_pct();
+    if (restore_pct == 0) {
+        /* Panel is dark already (e.g. idle-OFF). Just flip the rotation
+         * flag and exit; the next wake-up's fade-in will render in the
+         * new orientation. */
+        if (lvgl_port_lock(0)) {
+            lv_display_set_rotation(s_display, rot);
+            lvgl_port_unlock();
+        }
+        return;
+    }
+
     if (!lvgl_port_lock(0)) {
         ESP_LOGW(TAG, "lvgl_port_lock failed; skipping rotation update");
         return;
     }
+
+    burn_idle_adapter_anchor_brightness_pct(restore_pct);
+
+    ramp_brightness_locked(restore_pct, 0, FADE_DOWN_MS);
+
     lv_display_set_rotation(s_display, rot);
+    lv_refr_now(s_display);
+
+    ramp_brightness_locked(0, restore_pct, FADE_UP_MS);
+
+    burn_idle_adapter_anchor_brightness_pct(restore_pct);
+
     lvgl_port_unlock();
 }
 

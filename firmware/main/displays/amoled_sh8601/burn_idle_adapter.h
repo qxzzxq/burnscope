@@ -36,3 +36,27 @@ void burn_idle_adapter_start(void);
  * (next tick will re-evaluate the SM anyway).
  */
 void burn_idle_adapter_notify_touch(void);
+
+#include <stdint.h>
+
+/**
+ * Read the panel brightness the adapter's fade engine currently has
+ * the panel at, in percent. Used by orientation.c to remember the
+ * level to fade back up to after a rotation-dip blackout.
+ */
+uint8_t burn_idle_adapter_current_brightness_pct(void);
+
+/**
+ * Force the fade engine into "idle at this brightness, no pending
+ * writes" state without touching the panel. Cancels any in-flight
+ * adapter-initiated fade (bumps the generation counter so its
+ * remaining fade_step_cb invocations drop their writes) and stops
+ * the periodic fade timer.
+ *
+ * Used by orientation.c to take exclusive control of the brightness
+ * register during a rotation transition: by anchoring at the value
+ * the panel is already at, the adapter's own fade engine stays
+ * dormant while orientation drives the dim/rotate/relight ramp
+ * inline.
+ */
+void burn_idle_adapter_anchor_brightness_pct(uint8_t pct);

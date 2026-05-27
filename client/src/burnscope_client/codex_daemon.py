@@ -63,6 +63,7 @@ from .pusher import (  # noqa: E402
     fetch_health,
     push,
     push_to_all,
+    reconcile_duplicate_hosts,
     refresh_and_retry_transport_failures,
 )
 from .schema import AgentSnapshot, SessionSnapshot  # noqa: E402
@@ -385,15 +386,38 @@ class CodexDaemon:
             snapshot, devices, results, self._client_id, client, AGENT_NAME,
             discovery_timeout=DISCOVERY_TIMEOUT_S,
         )
+        # Identity check: if two paired records share the same cached
+        # host after transport recovery, success against that host
+        # can't prove which physical device replied. Devices in an
+        # unresolved duplicate-host group are marked unverified below.
+        current_devices = host_cache.load_paired_devices(AGENT_NAME)
+        unverified = await reconcile_duplicate_hosts(
+            AGENT_NAME, current_devices, discovery_timeout=DISCOVERY_TIMEOUT_S,
+        )
         overall_ok = True
         any_ok = False
         kept = 0
         for device_id, result in results.items():
+            effective_ok = result.ok and device_id not in unverified
             host_cache.write_push_state(
-                AGENT_NAME, ok=result.ok, device_id=device_id
+                AGENT_NAME, ok=effective_ok, device_id=device_id
             )
-            if result.ok:
+            if effective_ok:
                 any_ok = True
+            elif device_id in unverified:
+                # Conflict unresolved this cycle. Bump the diagnostic
+                # counter and keep the pairing — never evict on identity
+                # ambiguity (plan §3).
+                log.warning(
+                    "device %s in unresolved duplicate-host group; marking unverified",
+                    device_id,
+                )
+                self._push_failures[device_id] = (
+                    self._push_failures.get(device_id, 0) + 1
+                )
+                overall_ok = False
+                kept += 1
+                continue
             if result.kind == "auth":
                 log.info("dropping %s from codex paired list (401)", device_id)
                 host_cache.remove_paired_device(AGENT_NAME, device_id)
@@ -492,22 +516,44 @@ class CodexDaemon:
                     continue
                 diverged_devices: list[PairedDevice] = []
                 failed_devices: list[PairedDevice] = []
-                any_ok = False
+                ok_devices: list[PairedDevice] = []
                 for device in devices:
                     body = await fetch_health(device.host, self._client_id, client)
                     if body is None:
                         failed_devices.append(device)
                         continue
-                    any_ok = True
+                    ok_devices.append(device)
                     self._mark_health_ok(device, body, diverged_devices)
+                healed: set[str] = set()
                 if failed_devices:
                     healed = await self._reconcile_health_failures(
-                        failed_devices, client, diverged_devices
+                        failed_devices, client, diverged_devices,
                     )
-                    if healed:
-                        any_ok = True
-                # Aggregate ok=False only when nothing was healthy in either
-                # round 1 (initial probe) or round 2 (post-reconcile retry).
+                # Identity check after round 2: if two paired records
+                # still share a cached host, success at that host can't
+                # prove which physical device replied. Mark each as
+                # ok=False so the aggregate is honest until reconciliation
+                # can split them (plan §8b).
+                current_devices = host_cache.load_paired_devices(AGENT_NAME)
+                unverified = await reconcile_duplicate_hosts(
+                    AGENT_NAME, current_devices,
+                    discovery_timeout=DISCOVERY_TIMEOUT_S,
+                )
+                if unverified:
+                    for device_id in unverified:
+                        log.warning(
+                            "health: device %s in unresolved duplicate-host group; marking unverified",
+                            device_id,
+                        )
+                        host_cache.write_push_state(
+                            AGENT_NAME, ok=False, device_id=device_id
+                        )
+                any_ok = (
+                    any(d.device_id not in unverified for d in ok_devices)
+                    or bool(healed - unverified)
+                )
+                # Aggregate ok=False when nothing was verifiably healthy
+                # in either round (initial probe or post-reconcile retry).
                 if not any_ok:
                     host_cache.write_push_state(AGENT_NAME, ok=False)
                 if diverged_devices and self._last_pushed_snapshot is not None:
@@ -565,21 +611,23 @@ class CodexDaemon:
         failed: list[PairedDevice],
         client: httpx.AsyncClient,
         diverged_devices: list[PairedDevice],
-    ) -> bool:
+    ) -> set[str]:
         """Run one throttled mDNS browse for the failed batch, retry
         `/health` at any refreshed host, and record outcomes.
 
-        Returns True iff at least one device healed in round 2 (so the
-        caller can keep aggregate ok=True). Devices inside their per-
-        device cooldown are recorded as failed without launching a new
-        browse — that's the whole point of `claim_reconcile_slots`.
+        Returns the set of device_ids that healed in round 2. The
+        caller uses it (minus any duplicate-host-unverified ids) to
+        decide whether the aggregate may remain ok. Devices inside
+        their per-device cooldown are recorded as failed without
+        launching a new browse — that's the whole point of
+        `claim_reconcile_slots`.
         """
         failed_ids = [d.device_id for d in failed]
         eligible = host_cache.claim_reconcile_slots(AGENT_NAME, failed_ids)
         if not eligible:
             for device in failed:
                 self._record_health_failure(device)
-            return False
+            return set()
 
         try:
             discovered = await discover_all(timeout=DISCOVERY_TIMEOUT_S)
@@ -588,10 +636,10 @@ class CodexDaemon:
             log.warning("mDNS browse during health reconcile failed: %s", exc)
             for device in failed:
                 self._record_health_failure(device)
-            return False
+            return set()
         by_id = {d.device_id: d for d in discovered}
 
-        any_healed = False
+        healed: set[str] = set()
         for device in failed:
             if device.device_id not in eligible:
                 # Inside cooldown — record failure, don't try mDNS.
@@ -623,12 +671,12 @@ class CodexDaemon:
             if retry is None:
                 self._record_health_failure(refreshed)
                 continue
-            any_healed = True
+            healed.add(refreshed.device_id)
             host_cache.write_push_state(
                 AGENT_NAME, ok=True, device_id=refreshed.device_id
             )
             self._mark_health_ok(refreshed, retry, diverged_devices)
-        return any_healed
+        return healed
 
     # ----------------------------------------------------------- device list
 

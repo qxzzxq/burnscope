@@ -57,6 +57,7 @@ from .pusher import (  # noqa: E402
     PushError,
     push,
     push_to_all,
+    reconcile_duplicate_hosts,
     refresh_and_retry_transport_failures,
 )
 from .schema import AgentSnapshot, SessionSnapshot  # noqa: E402
@@ -262,9 +263,30 @@ async def _do_fanout(snapshot: AgentSnapshot, client_id: str) -> int:
             snapshot, devices, results, client_id, client, AGENT_NAME,
             discovery_timeout=DISCOVERY_TIMEOUT_S,
         )
+        # Duplicate-host check runs against the post-transport-recovery
+        # paired list: if two records still share the same cached host
+        # after refresh, an HTTP success against that host can't tell
+        # which physical display replied — those device_ids cannot be
+        # marked healthy from a shared response.
+        current_devices = host_cache.load_paired_devices(AGENT_NAME)
+        unverified = await reconcile_duplicate_hosts(
+            AGENT_NAME, current_devices, discovery_timeout=DISCOVERY_TIMEOUT_S,
+        )
 
     overall_ok = True
     for device_id, result in results.items():
+        if device_id in unverified:
+            # Duplicate-host conflict unresolved this cycle — mark
+            # ok=False (and bump the diagnostic counter) without
+            # evicting. Next cycle will retry reconciliation once the
+            # cooldown expires.
+            log.warning(
+                "device %s in unresolved duplicate-host group; marking unverified",
+                device_id,
+            )
+            overall_ok = False
+            host_cache.bump_push_failures(AGENT_NAME, device_id)
+            continue
         if result.ok:
             host_cache.reset_push_failures(AGENT_NAME, device_id)
             continue

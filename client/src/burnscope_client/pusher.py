@@ -211,6 +211,86 @@ async def refresh_and_retry_transport_failures(
     return updated
 
 
+def _duplicate_host_groups(
+    devices: list[PairedDevice],
+) -> dict[str, list[str]]:
+    """Return `{host: [device_id, ...]}` for hosts shared by 2+ devices.
+
+    A unique cached `host` proves who replied to an HTTP request; a
+    shared `host` means we can't tell. The resilience plan calls this
+    an identity conflict and treats it like a reachability failure
+    until reconciliation can split the records.
+    """
+    by_host: dict[str, list[str]] = {}
+    for device in devices:
+        by_host.setdefault(device.host, []).append(device.device_id)
+    return {host: ids for host, ids in by_host.items() if len(ids) > 1}
+
+
+async def reconcile_duplicate_hosts(
+    agent: str,
+    devices: list[PairedDevice],
+    *,
+    discovery_timeout: float = 4.0,
+) -> set[str]:
+    """Resolve cached duplicate-host groups via one throttled mDNS pass.
+
+    A `host` in `paired-devices.<agent>.json` should normally identify a
+    single device. If two records share it, an HTTP success against
+    that host cannot identify which physical display replied — so the
+    caller must not declare per-device success. This helper:
+
+      * does nothing if no host is shared (short-circuit; no browse);
+      * gates the browse through `host_cache.claim_reconcile_slots`,
+        sharing the per-`(agent, device_id)` cooldown with the
+        transport-failure path so the two cannot double-trigger a
+        browse within the cooldown window;
+      * for each visible device with a new host, commits the refresh
+        via `host_cache.update_paired_device_host` (update-only — never
+        resurrects a pairing that was removed during the browse);
+      * reloads the paired list and returns the set of device_ids that
+        STILL share a cached host with another paired entry.
+
+    The returned "unverified" set is the caller's signal that those
+    devices may not be marked healthy from any shared HTTP response.
+    Pairings are NEVER removed by this helper.
+    """
+    groups = _duplicate_host_groups(devices)
+    if not groups:
+        return set()
+    affected_ids = [did for ids in groups.values() for did in ids]
+    eligible = host_cache.claim_reconcile_slots(agent, affected_ids)
+    if not eligible:
+        log.debug(
+            "duplicate-host reconcile for %d device(s) blocked by cooldown",
+            len(affected_ids),
+        )
+        return set(affected_ids)
+
+    try:
+        discovered = await discover_all(timeout=discovery_timeout)
+    except Exception as exc:
+        # mDNS failure on this path must not bubble up; keep the
+        # affected devices unverified so the caller doesn't claim
+        # spurious success, and let the next eligible cycle try again.
+        log.warning("mDNS browse during duplicate-host reconcile failed: %s", exc)
+        return set(affected_ids)
+
+    by_id = {d.device_id: d for d in discovered}
+    old_hosts = {d.device_id: d.host for d in devices}
+    for device_id in eligible:
+        found = by_id.get(device_id)
+        if found is None or found.host == old_hosts.get(device_id):
+            continue
+        host_cache.update_paired_device_host(agent, device_id, found.host)
+
+    # Recompute after refresh — devices whose hosts still alias another
+    # paired record remain unverified for this cycle.
+    refreshed = host_cache.load_paired_devices(agent)
+    still_conflicting = _duplicate_host_groups(refreshed)
+    return {did for ids in still_conflicting.values() for did in ids}
+
+
 async def fetch_health(
     host: str,
     client_id: str,

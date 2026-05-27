@@ -1401,6 +1401,99 @@ async def test_health_loop_keeps_pairing_when_unpaired_during_reconcile(monkeypa
     assert host_cache.load_paired_devices("codex") == []
 
 
+# ============================== mDNS resilience §5/§8b: duplicate-host conflict
+
+
+async def test_pusher_loop_marks_duplicate_host_devices_unverified(monkeypatch):
+    """Codex push: two records share the same cached host; HTTP returns
+    204 for both but we can't prove which device replied. Per plan §5
+    the per-device state must not be ok=True for either, and the
+    aggregate must reflect the unresolved conflict."""
+    from burnscope_client import pusher as pusher_mod
+
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+    host_cache.add_paired_device("codex", PairedDevice("dev-a", "10.0.0.5:80"))
+    host_cache.add_paired_device("codex", PairedDevice("dev-b", "10.0.0.5:80"))
+
+    async def fake_push_to_all(snapshot, devices, client_id, client):
+        return {d.device_id: PushResult(d.device_id, True, "ok") for d in devices}
+    monkeypatch.setattr(codex_daemon, "push_to_all", fake_push_to_all)
+
+    async def fake_discover_all(timeout=4.0, agent=None, zc=None):
+        return []
+    monkeypatch.setattr(pusher_mod, "discover_all", fake_discover_all)
+
+    daemon._enqueue_snapshot(
+        AgentSnapshot(
+            agent="codex",
+            captured_at=1,
+            sessions=[SessionSnapshot("primary", 0.5, 1779066600)],
+        )
+    )
+    await _drain_one_push(
+        daemon,
+        predicate=lambda: host_cache.read_push_state("codex") is not None,
+    )
+
+    # Both still paired (no eviction on conflict).
+    paired = {d.device_id for d in host_cache.load_paired_devices("codex")}
+    assert paired == {"dev-a", "dev-b"}
+    # Neither claimed healthy from the shared HTTP response.
+    assert host_cache.read_push_state("codex", device_id="dev-a")["ok"] is False
+    assert host_cache.read_push_state("codex", device_id="dev-b")["ok"] is False
+    assert host_cache.read_push_state("codex")["ok"] is False
+
+
+async def test_health_loop_marks_duplicate_host_devices_unverified(monkeypatch):
+    """Codex health: two paired records share the same cached host. Even
+    if /health succeeds at that host, neither device may be reported as
+    healthy — per plan §8b the loop must run a throttled reconciliation
+    and surface the unresolved conflict as ok=False."""
+    from burnscope_client import pusher as pusher_mod
+
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+    host_cache.add_paired_device("codex", PairedDevice("dev-a", "10.0.0.5:80"))
+    host_cache.add_paired_device("codex", PairedDevice("dev-b", "10.0.0.5:80"))
+
+    async def fake_fetch_health(host, client_id, client):
+        return {"agents": {}}
+    monkeypatch.setattr(codex_daemon, "fetch_health", fake_fetch_health)
+    monkeypatch.setattr(codex_daemon, "HEALTH_INTERVAL_S", 0.005)
+
+    async def fake_discover_all(timeout=4.0, agent=None, zc=None):
+        return []
+    # Stub both call sites: codex_daemon.discover_all for the health
+    # reconciliation path, pusher.discover_all for the duplicate-host
+    # reconciliation path. Without both, the dup-host helper performs
+    # a real ~4 s mDNS browse and the test times out.
+    monkeypatch.setattr(codex_daemon, "discover_all", fake_discover_all)
+    monkeypatch.setattr(pusher_mod, "discover_all", fake_discover_all)
+
+    task = asyncio.create_task(daemon._health_loop())
+    try:
+        for _ in range(200):
+            state_a = host_cache.read_push_state("codex", device_id="dev-a")
+            state_b = host_cache.read_push_state("codex", device_id="dev-b")
+            if state_a is not None and state_b is not None:
+                break
+            await asyncio.sleep(0.005)
+        else:
+            raise AssertionError("health loop never wrote per-device state")
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    # Both still paired.
+    paired = {d.device_id for d in host_cache.load_paired_devices("codex")}
+    assert paired == {"dev-a", "dev-b"}
+    # Neither marked ok=True from the shared health response.
+    assert host_cache.read_push_state("codex", device_id="dev-a")["ok"] is False
+    assert host_cache.read_push_state("codex", device_id="dev-b")["ok"] is False
+
+
 # ====================== mDNS resilience §7: push transport failures don't evict
 
 

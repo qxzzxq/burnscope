@@ -389,6 +389,45 @@ def test_push_migrates_legacy_host_file(monkeypatch, _isolate_state):
 # ============================ mDNS resilience §6: transport failures don't evict
 
 
+# ============================ mDNS resilience §5: duplicate-host hides identity
+
+
+def test_push_marks_duplicate_host_devices_unverified_even_on_http_success(
+    monkeypatch,
+):
+    """Two paired records share the same cached host. HTTP push to that
+    host returns 204 for both, but we can't tell which physical device
+    actually responded — per plan §3/§5, neither may be reported as
+    healthy. Both stay paired (no eviction), but the aggregate goes
+    ok=False until reconciliation can split them.
+    """
+    _stub_stdin(monkeypatch)
+    _stub_identity(monkeypatch)
+    host_cache.add_paired_device("claude", PairedDevice("dev-a", "10.0.0.5:80"))
+    host_cache.add_paired_device("claude", PairedDevice("dev-b", "10.0.0.5:80"))
+
+    _stub_push_to_all(
+        monkeypatch,
+        [
+            PushResult("dev-a", True, "ok"),
+            PushResult("dev-b", True, "ok"),
+        ],
+    )
+    # mDNS finds nothing → duplicate-host conflict unresolved.
+    _stub_discover_none(monkeypatch)
+
+    rc = claude_statusline.main(["--push"])
+
+    # Both still paired — plan §3 forbids removal here.
+    paired = {d.device_id for d in host_cache.load_paired_devices("claude")}
+    assert paired == {"dev-a", "dev-b"}
+    # Aggregate dishonest if we marked them healthy.
+    assert rc == 1
+    assert host_cache.read_push_state("claude")["ok"] is False
+    assert host_cache.read_push_state("claude", device_id="dev-a")["ok"] is False
+    assert host_cache.read_push_state("claude", device_id="dev-b")["ok"] is False
+
+
 def test_push_keeps_device_after_many_consecutive_transport_failures(monkeypatch):
     """Reachability failure is NOT ownership loss. Per the mDNS resilience
     plan, only `/summary` HTTP 401 and explicit `pair-reset` may remove a

@@ -279,7 +279,12 @@ async def _do_fanout(snapshot: AgentSnapshot, client_id: str) -> int:
             # Duplicate-host conflict unresolved this cycle — mark
             # ok=False (and bump the diagnostic counter) without
             # evicting. Next cycle will retry reconciliation once the
-            # cooldown expires.
+            # cooldown expires. This check runs BEFORE the 401 branch
+            # below on purpose: a 401 from a host that still aliases
+            # another paired record can't be attributed to a single
+            # physical device, so it is suppressed here rather than
+            # evicting the (possibly wrong) pairing. It self-heals once
+            # mDNS splits the records and the 401 becomes attributable.
             log.warning(
                 "device %s in unresolved duplicate-host group; marking unverified",
                 device_id,
@@ -292,11 +297,10 @@ async def _do_fanout(snapshot: AgentSnapshot, client_id: str) -> int:
             continue
         if result.kind == "auth":
             # Device is no longer ours — don't let it tip the aggregate.
-            # `remove_paired_device` also unlinks the per-device file.
+            # `remove_paired_device` unlinks the per-device file too, so no
+            # per-device write here: a 401 leaves no state attributable to
+            # this device.
             log.info("dropping %s from claude paired list (401)", device_id)
-            host_cache.write_push_state(
-                AGENT_NAME, ok=False, device_id=device_id
-            )
             host_cache.remove_paired_device(AGENT_NAME, device_id)
             continue
         # Transport (or any other non-auth) failure: persist the bump

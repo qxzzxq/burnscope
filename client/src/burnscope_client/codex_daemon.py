@@ -889,6 +889,10 @@ def main(argv: list[str] | None = None) -> int:
     # via the supervisor's stdout/stderr redirect. BURNSCOPE_LOG_FILE wins
     # when set.
     configure_logging(fallback_stderr=True)
+    # Log the loaded source path so a stale daemon (supervisor never
+    # restarted after a code update) is grep-able from the log file.
+    from . import __version__
+    log.info("codex daemon starting (v%s, source=%s)", __version__, __file__)
     daemon = CodexDaemon()
     try:
         asyncio.run(daemon.run())

@@ -12,6 +12,7 @@ choice BURNSCOPE_DISPLAY
 
     rsource "displays/cyd2usb_st7789/Kconfig"
     rsource "displays/amoled_sh8601/Kconfig"
+    rsource "displays/amoled_co5300_175/Kconfig"
 
 endchoice
 

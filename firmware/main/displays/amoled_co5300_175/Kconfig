@@ -1,0 +1,115 @@
+config BURNSCOPE_DISPLAY_AMOLED_CO5300_175
+    bool "Waveshare ESP32-S3 1.75\" Round AMOLED (CO5300 466x466)"
+    depends on IDF_TARGET_ESP32S3
+    help
+        The Waveshare ESP32-S3-Touch-AMOLED-1.75" board: a 466x466 round
+        AMOLED on a CO5300 controller over QSPI. Same pixel grid and UI
+        as the 1.43" profile, but CO5300-only (no SH8601 fallback),
+        different GPIO pins, and no IMU. Touch (CST9217) and the AXP2101
+        PMIC are not driven by this profile pass. Links against the same
+        `esp_lcd_sh8601` managed component (it frames QSPI for the whole
+        SH8601/CO5300 family).
+
+# Demo + burn-in options below reuse the same CONFIG symbol names as the
+# amoled_sh8601 (1.43") profile. The two profiles are mutually exclusive
+# (selected via the BURNSCOPE_DISPLAY choice), so at most one definition
+# of each symbol is ever visible — and the defaults are identical — so
+# the shared adapter/main.c code reads one consistent set of values
+# regardless of which AMOLED board is built. This board has a QMI8658
+# IMU (like the 1.43"), so the motion-wake and auto-rotate options apply.
+
+config BURNSCOPE_AMOLED_DEMO
+    bool "AMOLED driver-verification demo (no Wi-Fi, static test pattern)"
+    default n
+    depends on BURNSCOPE_DISPLAY_AMOLED_CO5300_175
+    help
+        When enabled, app_main bypasses NVS / Wi-Fi / HTTP / NTP entirely
+        and just renders a static test pattern (color bars + corner
+        markers + centre crosshair) on the AMOLED. Use this to verify
+        the CO5300 panel driver: SLPOUT/DISPON, RGB565 byte order, and
+        the CASET/RASET column/row gap. Disable for normal builds.
+
+menu "AMOLED burn-in mitigation"
+    depends on BURNSCOPE_DISPLAY_AMOLED_CO5300_175
+
+    config BURNSCOPE_AMOLED_IDLE_DIM_MINUTES
+        int "Minutes of idle before dimming the panel"
+        default 5
+        range 1 60
+        help
+            After this many minutes with no activity event (button or
+            qualifying POST /summary push) the burn-in adapter dims the
+            panel from BURNSCOPE_AMOLED_ACTIVE_BRIGHTNESS_PCT down to
+            BURNSCOPE_AMOLED_DIMMED_BRIGHTNESS_PCT.
+
+    config BURNSCOPE_AMOLED_IDLE_OFF_MINUTES
+        int "Minutes of idle before turning the panel off"
+        default 30
+        range 1 240
+        help
+            After this many minutes idle the burn-in adapter issues
+            DISPOFF (MIPI DCS 0x28). The HTTP server keeps running so
+            an incoming push wakes the panel within ~200 ms. Must be
+            >= BURNSCOPE_AMOLED_IDLE_DIM_MINUTES; equal values mean
+            "no dim phase, jump straight to off."
+
+    config BURNSCOPE_AMOLED_ACTIVE_BRIGHTNESS_PCT
+        int "Active-state brightness, % of panel maximum"
+        default 70
+        range 0 100
+        help
+            Brightness used in the ACTIVE state, as a percentage of the
+            CO5300 0x51 register's 8-bit range. The 70 % default matches
+            the catalog's recommended luminance cap.
+
+    config BURNSCOPE_AMOLED_DIMMED_BRIGHTNESS_PCT
+        int "Dimmed-state brightness, % of panel maximum"
+        default 20
+        range 0 100
+        help
+            Brightness used in the DIMMED state. Should be <=
+            BURNSCOPE_AMOLED_ACTIVE_BRIGHTNESS_PCT. Set to 0 to make
+            the dim phase visually identical to off (panel still
+            powered).
+
+    config BURNSCOPE_AMOLED_WAKE_FADE_MS
+        int "Brightness fade-up duration (ms)"
+        default 300
+        range 0 5000
+        help
+            Duration of the linear brightness ramp when the panel is
+            waking or transitioning to a brighter state. The CO5300 has
+            no hardware fade primitive, so the adapter writes intermediate
+            0x51 register values at ~30 Hz over this interval. Set to 0
+            for instantaneous wake.
+
+    config BURNSCOPE_AMOLED_SLEEP_FADE_MS
+        int "Brightness fade-down duration (ms)"
+        default 1500
+        range 0 5000
+        help
+            Duration of the linear brightness ramp when the panel is
+            dimming or powering down. For DIMMED->OFF transitions the
+            DISPOFF command runs after the fade reaches 0. Set to 0 for
+            instantaneous dim/off.
+
+    config BURNSCOPE_AMOLED_MOTION_THRESHOLD_MG
+        int "Motion-wake threshold (milli-g)"
+        default 50
+        range 1 2000
+        help
+            Per-sample accelerometer delta-magnitude (mg) that the
+            QMI8658 sampler treats as motion. Above this, the burn-in
+            adapter posts EV_MOTION and the panel wakes from dim/off.
+
+    config BURNSCOPE_AMOLED_ORIENTATION_AUTO
+        bool "Auto-rotate the UI to follow the device's orientation"
+        default y
+        help
+            When enabled, a background task samples the QMI8658
+            accelerometer and rotates the LVGL display in 90°
+            quadrants to match the gravity vector. Disable for
+            diagnostic builds that need a fixed orientation; the
+            burn-in adapter's motion-wake path stays active either way.
+
+endmenu

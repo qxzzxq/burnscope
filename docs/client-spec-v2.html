@@ -1024,12 +1024,22 @@ flowchart LR
         <li><code>device_id ∈ unverified</code> (identity conflict
             unresolved) → <code>bump_push_failures(…)</code>; aggregate
             <code>ok=False</code>. Pairing preserved (plan §3 forbids
-            removal on identity ambiguity).</li>
+            removal on identity ambiguity). <strong>This branch is
+            evaluated first, ahead of <code>kind="auth"</code>:</strong> a
+            <code>401</code> from a device whose cached host still aliases
+            another paired entry cannot be attributed to a single physical
+            device, so it is suppressed here rather than evicting a
+            (possibly wrong) pairing. It self-heals once
+            <code>reconcile_duplicate_hosts</code> splits the records via
+            mDNS and the <code>401</code> becomes attributable on a later
+            fire.</li>
         <li><code>kind="ok"</code> → <code>reset_push_failures(…)</code>
             (clears the diagnostic counter, writes <code>ok=True</code>).</li>
         <li><code>kind="auth"</code> → silently drop via
             <code>remove_paired_device("claude", device_id)</code>;
-            no aggregate state change attributable to this device.</li>
+            no aggregate state change attributable to this device. (Only
+            reached when the device's host is <em>not</em> aliased — see
+            the <code>unverified</code> branch above.)</li>
         <li><code>kind="transport"</code> → keep in list;
             <code>bump_push_failures(…)</code> for visibility in
             <code>burnscope status</code>; aggregate <code>ok=False</code>.

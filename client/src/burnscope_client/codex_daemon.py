@@ -527,11 +527,13 @@ class CodexDaemon:
                     if body is HEALTH_AUTH_REJECTED:
                         # Reachable, but our slot isn't bound — the device
                         # rebooted / wiped NVS while we were idle, or another
-                        # agent's slot is the only one populated. Re-push
-                        # `_last_pushed_snapshot` below so /summary TOFU
-                        # re-binds an empty slot; a slot owned by a different
-                        # client_id 401s on that push and is dropped by the
-                        # normal auth path (issue #66). Mark ok=False now so
+                        # agent's slot is the only one populated. Schedule a
+                        # re-bind, but DON'T trust this cached host yet: a 401
+                        # can also come from a *different* display answering at
+                        # a stale host (DHCP reassigned the IP). Re-binding
+                        # blind would TOFU-claim the wrong device. The host is
+                        # confirmed via mDNS in `_verify_rebind_hosts` before
+                        # any /summary push (issue #66). Mark ok=False now so
                         # state is honest if there's nothing yet to re-push.
                         log.info(
                             "health: %s returned 401 for codex; scheduling re-bind",
@@ -570,6 +572,14 @@ class CodexDaemon:
                     healed = await self._reconcile_health_failures(
                         failed_devices, client, diverged_devices,
                     )
+                # Confirm each 401 device's host via mDNS before re-binding,
+                # so a stale cached host can't bind us to the wrong display.
+                # Skipped entirely when there's nothing to re-push with.
+                verified_rebind: list[PairedDevice] = []
+                if rebind_devices and self._last_pushed_snapshot is not None:
+                    verified_rebind = await self._verify_rebind_hosts(
+                        rebind_devices, client
+                    )
                 # Identity check after round 2: if two paired records
                 # still share a cached host, success at that host can't
                 # prove which physical device replied. Mark each as
@@ -595,20 +605,21 @@ class CodexDaemon:
                 )
                 # Re-push `_last_pushed_snapshot` to the device(s) that need
                 # it — those that diverged (firmware lost state) and those
-                # that 401'd (slot wiped, needs a TOFU re-bind). Both are
-                # disjoint per cycle (a device returns either a body or a
-                # 401), and both want the same targeted push: only the
-                # affected devices, never the whole fleet, so idle peers
-                # aren't woken (deep-review L-6). The push handles the
-                # re-bind guard for free — /summary TOFU binds an empty
-                # slot and 401s (→ drop) on one owned by a different id.
-                repush_devices = diverged_devices + rebind_devices
+                # that 401'd at an mDNS-confirmed host (slot wiped, needs a
+                # TOFU re-bind). Both are disjoint per cycle (a device returns
+                # either a body or a 401), and both want the same targeted
+                # push: only the affected devices, never the whole fleet, so
+                # idle peers aren't woken (deep-review L-6). For the re-bind,
+                # `_verify_rebind_hosts` already confirmed the host belongs to
+                # this device_id; /summary then TOFU-binds an empty slot and
+                # 401s (→ drop) on one owned by a different id.
+                repush_devices = diverged_devices + verified_rebind
                 if repush_devices and self._last_pushed_snapshot is not None:
                     log.info(
                         "re-pushing to %d device(s): diverged=%s rebind=%s",
                         len(repush_devices),
                         [d.device_id for d in diverged_devices],
-                        [d.device_id for d in rebind_devices],
+                        [d.device_id for d in verified_rebind],
                     )
                     await self._push_to_devices(
                         self._last_pushed_snapshot, repush_devices, client
@@ -731,6 +742,79 @@ class CodexDaemon:
             )
             self._mark_health_ok(refreshed, retry, diverged_devices)
         return healed
+
+    async def _verify_rebind_hosts(
+        self,
+        rebind_devices: list[PairedDevice],
+        client: httpx.AsyncClient,
+    ) -> list[PairedDevice]:
+        """Confirm via mDNS that each 401 device's host still maps to its
+        `device_id`, returning the subset safe to TOFU-rebind (at the
+        confirmed host).
+
+        A health 401 at a *stale* cached host can be a *different* display
+        answering after a DHCP reassignment. Posting `/summary` to that host
+        would TOFU-bind us to the wrong physical device — older firmware
+        (no `health.device_id`) never corrects it, newer firmware only after
+        one wrong push. mDNS resolves the stable `device_id` to the device's
+        current address, so this is the authoritative check: only rebind at a
+        host mDNS still advertises for that id; a device mDNS can't see is left
+        unbound (no rebind at an unverified host) until a later cycle.
+
+        Shares the per-`(agent, device_id)` reconcile cooldown with the
+        transport-failure path via `claim_reconcile_slots`, so a flapping
+        device can't force a browse every cycle. Returns devices carrying the
+        mDNS-confirmed host; a moved host is committed update-only (never
+        resurrects a pairing removed during the browse).
+        """
+        ids = [d.device_id for d in rebind_devices]
+        eligible = host_cache.claim_reconcile_slots(AGENT_NAME, ids)
+        if not eligible:
+            log.debug(
+                "401 re-bind for %d device(s) blocked by mDNS reconcile cooldown",
+                len(ids),
+            )
+            return []
+        try:
+            discovered = await discover_all(timeout=DISCOVERY_TIMEOUT_S)
+        except Exception as exc:
+            # mDNS failure must not kill the health loop; leave the devices
+            # unbound this cycle and retry when eligible again.
+            log.warning("mDNS browse during 401 re-bind verification failed: %s", exc)
+            return []
+        by_id = {d.device_id: d for d in discovered}
+
+        verified: list[PairedDevice] = []
+        for device in rebind_devices:
+            if device.device_id not in eligible:
+                continue
+            found = by_id.get(device.device_id)
+            if found is None:
+                # Not visible via mDNS — the cached host may now belong to a
+                # different display. Do NOT rebind at an unverified host.
+                log.info(
+                    "health 401 re-bind skipped for %s — not visible via mDNS",
+                    device.device_id,
+                )
+                continue
+            if found.host != device.host and not host_cache.update_paired_device_host(
+                AGENT_NAME, device.device_id, found.host
+            ):
+                # Pairing removed during the browse — don't resurrect it.
+                log.info(
+                    "skipped 401 re-bind for %s — pairing was removed during reconcile",
+                    device.device_id,
+                )
+                continue
+            if found.host != device.host:
+                log.info(
+                    "health 401 re-bind: %s host %s -> %s (mDNS-confirmed)",
+                    device.device_id, device.host, found.host,
+                )
+            verified.append(
+                PairedDevice(device_id=device.device_id, host=found.host)
+            )
+        return verified
 
     # ----------------------------------------------------------- device list
 

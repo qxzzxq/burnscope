@@ -75,9 +75,9 @@ Path: `~/.espressif/v6.0.1/esp-idf`
 
 This project follows [semantic versioning](https://semver.org/) (MAJOR.MINOR.PATCH):
 
-- **MAJOR** (`1.0.0`): bumped when a milestone is completed
-- **MINOR** (`0.1.0`): bumped when a feature PR is accepted
-- **PATCH** (`0.0.1`): bumped when a bug fix PR is accepted
+- **MAJOR** (`1.0.0`): bumped in Milestone PR
+- **MINOR** (`0.1.0`): bumped in Feature PR
+- **PATCH** (`0.0.1`): bumped in Bug Fix PR
 
 ## Pointers
 

@@ -69,3 +69,10 @@ scheduled_tasks.lock
 # Download:
 #   https://files.waveshare.com/wiki/ESP32-S3-Touch-AMOLED-1.43/ESP32-S3-AMOLED-1.43-Demo-V3.zip
 docs/ESP32-S3-AMOLED-1.43-Demo/
+
+# Waveshare ESP32-S3-Touch-AMOLED-1.75 vendor demo bundle — local-only
+# reference (344 MB: ESP-IDF/Arduino examples, the CO5300 BSP, schematic).
+# The bits we actually ship are trimmed-down ports under
+# firmware/main/displays/amoled_co5300_175/ with attribution preserved.
+# Download from the board's Waveshare product page.
+docs/ESP32-S3-Touch-AMOLED-1.75/

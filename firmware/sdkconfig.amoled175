@@ -1,0 +1,32 @@
+# Build fragment for the Waveshare ESP32-S3-Touch-AMOLED-1.75" (CO5300).
+#
+# Layer this on top of the target defaults so it wins the profile choice.
+# It shares the esp32s3 target with the 1.43" board, whose
+# sdkconfig.defaults.esp32s3 forces the 1.43" profile on — this fragment
+# flips that to the 1.75" profile and isolates PSRAM differences.
+#
+# Usage — a dedicated build dir AND a dedicated sdkconfig inside it, so
+# this build doesn't share (and overwrite the profile in) the project's
+# default firmware/sdkconfig that the 1.43" / CYD builds use. The
+# -DSDKCONFIG override is required: SDKCONFIG_DEFAULTS only seeds a *new*
+# sdkconfig, so without pointing SDKCONFIG at a fresh path an existing
+# firmware/sdkconfig (e.g. SH8601=y) would silently win the profile choice.
+#
+#   idf.py -B build-amoled175 -DIDF_TARGET=esp32s3 \
+#     -DSDKCONFIG=build-amoled175/sdkconfig \
+#     -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.amoled175" \
+#     build
+#
+# Inherits 16 MB flash, partitions-16mb.csv, OTA rollback, and the
+# Montserrat fonts from sdkconfig.defaults.esp32s3.
+
+# Select the 1.75" CO5300 profile over the esp32s3 default (1.43").
+CONFIG_BURNSCOPE_DISPLAY_AMOLED_SH8601=
+CONFIG_BURNSCOPE_DISPLAY_AMOLED_CO5300_175=y
+
+# PSRAM: safe default OFF until the 1.75" module's PSRAM is confirmed.
+# The AMOLED pipeline is stripe-buffered (DRAM), so PSRAM is not required
+# to drive the panel. Enabling octal PSRAM on a module that lacks it (or
+# has a different type) fails the boot-time PSRAM probe, so leave it off
+# until the schematic / module marking is verified, then flip on.
+CONFIG_SPIRAM=

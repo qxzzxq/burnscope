@@ -1728,3 +1728,345 @@ async def test_health_divergence_pushes_only_to_diverged_device(monkeypatch):
 
     # Re-push went to dev-diverged ONLY — not the healthy dev-good.
     assert pushed_to[0] == ["dev-diverged"]
+
+
+# ---------------------------------------------- health-loop 401 re-bind (#66)
+
+
+async def _rebind_snapshot() -> AgentSnapshot:
+    return AgentSnapshot(
+        agent="codex",
+        captured_at=1,
+        sessions=[
+            SessionSnapshot(
+                type="primary",
+                used_pct=0.5,
+                resets_at=1779066600,
+                rolling=True,
+                window_duration_mins=300,
+            )
+        ],
+    )
+
+
+async def test_health_loop_rebinds_slot_on_401(monkeypatch):
+    """An idle codex daemon whose paired device rebooted / wiped NVS gets a
+    401 from /health (its slot is empty, another agent's slot is populated).
+    The loop must re-push `_last_pushed_snapshot` so /summary TOFU re-binds
+    the empty slot — issue #66. Without this the slot never re-binds until
+    codex usage changes or the daemon restarts.
+    """
+    from burnscope_client.discovery import DiscoveredDevice
+
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+    host_cache.add_paired_device("codex", PairedDevice("dev-reboot", "10.0.0.5:80"))
+    daemon._last_pushed_snapshot = await _rebind_snapshot()
+
+    async def fake_fetch_health(host, client_id, client):
+        return codex_daemon.HEALTH_AUTH_REJECTED
+
+    monkeypatch.setattr(codex_daemon, "fetch_health", fake_fetch_health)
+    monkeypatch.setattr(codex_daemon, "HEALTH_INTERVAL_S", 0.005)
+
+    pushed_to: list[list[tuple[str, str]]] = []
+
+    async def fake_push_to_all(snapshot, devices, client_id, client):
+        pushed_to.append([(d.device_id, d.host) for d in devices])
+        return {d.device_id: PushResult(d.device_id, True, "ok") for d in devices}
+
+    monkeypatch.setattr(codex_daemon, "push_to_all", fake_push_to_all)
+
+    from burnscope_client import pusher as pusher_mod
+
+    # mDNS confirms the device is still at its cached host (rebooted in place).
+    async def fake_discover_all(timeout=4.0, agent=None, zc=None):
+        return [DiscoveredDevice("dev-reboot", "10.0.0.5:80", True, False)]
+    monkeypatch.setattr(pusher_mod, "discover_all", fake_discover_all)
+    monkeypatch.setattr(codex_daemon, "discover_all", fake_discover_all)
+
+    task = asyncio.create_task(daemon._health_loop())
+    try:
+        for _ in range(200):
+            if pushed_to:
+                break
+            await asyncio.sleep(0.005)
+        else:
+            raise AssertionError("health loop never re-pushed to re-bind the slot")
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    # The re-bind push targeted the 401 device at its mDNS-confirmed host.
+    assert pushed_to[0] == [("dev-reboot", "10.0.0.5:80")]
+    # Device stays paired (TOFU re-claim succeeded).
+    paired = {d.device_id for d in host_cache.load_paired_devices("codex")}
+    assert paired == {"dev-reboot"}
+
+
+async def test_health_loop_skips_rebind_when_no_last_pushed_snapshot(monkeypatch):
+    """A 401 with nothing to re-push (daemon never pushed yet) must not
+    fabricate a push — there's no snapshot to TOFU-bind with. The pusher /
+    poll loop reclaims once it produces a snapshot. Per-device state still
+    reflects the unbound slot (ok=False).
+    """
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+    daemon._last_pushed_snapshot = None
+    host_cache.add_paired_device("codex", PairedDevice("dev-reboot", "10.0.0.5:80"))
+
+    async def fake_fetch_health(host, client_id, client):
+        return codex_daemon.HEALTH_AUTH_REJECTED
+
+    monkeypatch.setattr(codex_daemon, "fetch_health", fake_fetch_health)
+    monkeypatch.setattr(codex_daemon, "HEALTH_INTERVAL_S", 0.005)
+
+    pushed = False
+
+    async def fake_push_to_all(snapshot, devices, client_id, client):
+        nonlocal pushed
+        pushed = True
+        return {d.device_id: PushResult(d.device_id, True, "ok") for d in devices}
+
+    monkeypatch.setattr(codex_daemon, "push_to_all", fake_push_to_all)
+
+    from burnscope_client import pusher as pusher_mod
+
+    async def fake_discover_all(timeout=4.0, agent=None, zc=None):
+        return []
+    monkeypatch.setattr(pusher_mod, "discover_all", fake_discover_all)
+    monkeypatch.setattr(codex_daemon, "discover_all", fake_discover_all)
+
+    task = asyncio.create_task(daemon._health_loop())
+    try:
+        # Let several cycles run.
+        for _ in range(40):
+            state = host_cache.read_push_state("codex", device_id="dev-reboot")
+            if state is not None and state.get("ok") is False:
+                break
+            await asyncio.sleep(0.005)
+        else:
+            raise AssertionError("per-device ok=False never recorded for 401 device")
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert pushed is False
+    # Pairing is preserved — a 401 on /health is not an eviction signal.
+    paired = {d.device_id for d in host_cache.load_paired_devices("codex")}
+    assert paired == {"dev-reboot"}
+
+
+async def test_health_loop_401_rebind_drops_device_on_summary_conflict(monkeypatch):
+    """Guard #3 (issue #66): a slot owned by a *different* client_id is a
+    genuine ownership conflict, not a reclaimable empty slot. The re-bind
+    push routes through /summary, whose TOFU only binds an empty slot; an
+    owned slot returns 401 and the existing auth path drops the pairing
+    rather than overwriting it.
+    """
+    from burnscope_client.discovery import DiscoveredDevice
+
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+    host_cache.add_paired_device("codex", PairedDevice("dev-owned", "10.0.0.5:80"))
+    daemon._last_pushed_snapshot = await _rebind_snapshot()
+
+    async def fake_fetch_health(host, client_id, client):
+        return codex_daemon.HEALTH_AUTH_REJECTED
+
+    monkeypatch.setattr(codex_daemon, "fetch_health", fake_fetch_health)
+    monkeypatch.setattr(codex_daemon, "HEALTH_INTERVAL_S", 0.005)
+
+    async def fake_push_to_all(snapshot, devices, client_id, client):
+        # The slot is owned by someone else → /summary 401.
+        return {d.device_id: PushResult(d.device_id, False, "auth") for d in devices}
+
+    monkeypatch.setattr(codex_daemon, "push_to_all", fake_push_to_all)
+
+    from burnscope_client import pusher as pusher_mod
+
+    # mDNS confirms the device at its host, so the re-bind push proceeds and
+    # gets the 401 that drops it.
+    async def fake_discover_all(timeout=4.0, agent=None, zc=None):
+        return [DiscoveredDevice("dev-owned", "10.0.0.5:80", True, False)]
+    monkeypatch.setattr(pusher_mod, "discover_all", fake_discover_all)
+    monkeypatch.setattr(codex_daemon, "discover_all", fake_discover_all)
+
+    task = asyncio.create_task(daemon._health_loop())
+    try:
+        for _ in range(200):
+            if not host_cache.load_paired_devices("codex"):
+                break
+            await asyncio.sleep(0.005)
+        else:
+            raise AssertionError("genuine-conflict device was never dropped")
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert host_cache.load_paired_devices("codex") == []
+
+
+async def test_health_loop_401_does_not_rebind_at_unverified_stale_host(monkeypatch):
+    """Codex P2: a health 401 can be a *different* display answering at a
+    stale cached host (DHCP reassigned the IP). Re-binding blind would
+    TOFU-claim the wrong device. When mDNS can't confirm the device_id is
+    still at the cached host, the loop must NOT push /summary there.
+    """
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+    host_cache.add_paired_device("codex", PairedDevice("dev-A", "10.0.0.5:80"))
+    daemon._last_pushed_snapshot = await _rebind_snapshot()
+
+    async def fake_fetch_health(host, client_id, client):
+        return codex_daemon.HEALTH_AUTH_REJECTED
+
+    monkeypatch.setattr(codex_daemon, "fetch_health", fake_fetch_health)
+    monkeypatch.setattr(codex_daemon, "HEALTH_INTERVAL_S", 0.005)
+
+    pushed = False
+
+    async def fake_push_to_all(snapshot, devices, client_id, client):
+        nonlocal pushed
+        pushed = True
+        return {d.device_id: PushResult(d.device_id, True, "ok") for d in devices}
+
+    monkeypatch.setattr(codex_daemon, "push_to_all", fake_push_to_all)
+
+    from burnscope_client import pusher as pusher_mod
+
+    # mDNS does NOT see dev-A (offline / moved); the cached host belongs to
+    # someone else now.
+    async def fake_discover_all(timeout=4.0, agent=None, zc=None):
+        return []
+    monkeypatch.setattr(pusher_mod, "discover_all", fake_discover_all)
+    monkeypatch.setattr(codex_daemon, "discover_all", fake_discover_all)
+
+    task = asyncio.create_task(daemon._health_loop())
+    try:
+        # Let several cycles run so a rogue push would have fired.
+        for _ in range(40):
+            await asyncio.sleep(0.005)
+            if pushed:
+                break
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    # No /summary push at the unverified stale host → no wrong-device bind.
+    assert pushed is False
+    # Pairing preserved and host untouched.
+    assert host_cache.load_paired_devices("codex") == [
+        PairedDevice("dev-A", "10.0.0.5:80")
+    ]
+
+
+async def test_health_loop_401_rebinds_at_mdns_corrected_host(monkeypatch):
+    """When mDNS locates the 401 device at a *new* host, the re-bind must
+    target that mDNS-confirmed host (and refresh the cache) — never the
+    stale cached host.
+    """
+    from burnscope_client.discovery import DiscoveredDevice
+
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+    host_cache.add_paired_device("codex", PairedDevice("dev-A", "10.0.0.5:80"))
+    daemon._last_pushed_snapshot = await _rebind_snapshot()
+
+    async def fake_fetch_health(host, client_id, client):
+        return codex_daemon.HEALTH_AUTH_REJECTED
+
+    monkeypatch.setattr(codex_daemon, "fetch_health", fake_fetch_health)
+    monkeypatch.setattr(codex_daemon, "HEALTH_INTERVAL_S", 0.005)
+
+    pushed_hosts: list[str] = []
+
+    async def fake_push_to_all(snapshot, devices, client_id, client):
+        pushed_hosts.extend(d.host for d in devices)
+        return {d.device_id: PushResult(d.device_id, True, "ok") for d in devices}
+
+    monkeypatch.setattr(codex_daemon, "push_to_all", fake_push_to_all)
+
+    from burnscope_client import pusher as pusher_mod
+
+    # dev-A actually lives at 10.0.0.9 now.
+    async def fake_discover_all(timeout=4.0, agent=None, zc=None):
+        return [DiscoveredDevice("dev-A", "10.0.0.9:80", True, False)]
+    monkeypatch.setattr(pusher_mod, "discover_all", fake_discover_all)
+    monkeypatch.setattr(codex_daemon, "discover_all", fake_discover_all)
+
+    task = asyncio.create_task(daemon._health_loop())
+    try:
+        for _ in range(200):
+            if pushed_hosts:
+                break
+            await asyncio.sleep(0.005)
+        else:
+            raise AssertionError("health loop never re-pushed at the corrected host")
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    # Re-bind targeted the mDNS host, never the stale one.
+    assert pushed_hosts[0] == "10.0.0.9:80"
+    assert "10.0.0.5:80" not in pushed_hosts
+    # Cache was refreshed to the confirmed host.
+    assert host_cache.load_paired_devices("codex") == [
+        PairedDevice("dev-A", "10.0.0.9:80")
+    ]
+
+
+async def test_reconcile_health_retry_401_does_not_crash(monkeypatch):
+    """Compound case: a transport-failed device is rediscovered at a new
+    host via mDNS, but the retry there returns 401 (slot unbound at the new
+    host too). The retry must not be mistaken for a healthy body — passing
+    the auth sentinel into the divergence comparison would crash the health
+    loop. It's recorded as a miss and re-bound on the next cycle's initial
+    probe (issue #66).
+    """
+    from burnscope_client.discovery import DiscoveredDevice
+
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+    host_cache.add_paired_device("codex", PairedDevice("dev-moved", "10.0.0.5:80"))
+
+    async def fake_fetch_health(host, client_id, client):
+        if host == "10.0.0.5:80":
+            return None  # initial probe: transport failure
+        return codex_daemon.HEALTH_AUTH_REJECTED  # retry at new host: 401
+
+    monkeypatch.setattr(codex_daemon, "fetch_health", fake_fetch_health)
+    monkeypatch.setattr(codex_daemon, "HEALTH_INTERVAL_S", 0.005)
+
+    async def fake_discover_all(timeout=4.0, agent=None, zc=None):
+        return [DiscoveredDevice("dev-moved", "10.0.0.9:80", True, False)]
+    monkeypatch.setattr(codex_daemon, "discover_all", fake_discover_all)
+
+    from burnscope_client import pusher as pusher_mod
+    monkeypatch.setattr(pusher_mod, "discover_all", fake_discover_all)
+
+    task = asyncio.create_task(daemon._health_loop())
+    try:
+        for _ in range(400):
+            cached = host_cache.load_paired_devices("codex")
+            if cached and cached[0].host == "10.0.0.9:80":
+                break
+            await asyncio.sleep(0.005)
+        else:
+            raise AssertionError("health loop never refreshed cached host")
+    finally:
+        task.cancel()
+        # A clean cancel proves the loop survived the auth sentinel without
+        # raising (a crash would surface here as a non-CancelledError).
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    # Host was refreshed; pairing preserved for the next-cycle re-bind.
+    assert host_cache.load_paired_devices("codex") == [
+        PairedDevice("dev-moved", "10.0.0.9:80")
+    ]

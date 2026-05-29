@@ -291,17 +291,42 @@ async def reconcile_duplicate_hosts(
     return {did for ids in still_conflicting.values() for did in ids}
 
 
+class _HealthAuthRejected:
+    """Sentinel: GET /health returned 401 — device reachable, slot unbound.
+
+    Distinct from `None` (transport / other failure) so the daemon can treat
+    a reachable-but-unbound slot as a re-bind trigger rather than a
+    reachability miss. See `fetch_health` and issue #66.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid only
+        return "HEALTH_AUTH_REJECTED"
+
+
+HEALTH_AUTH_REJECTED = _HealthAuthRejected()
+
+
 async def fetch_health(
     host: str,
     client_id: str,
     client: httpx.AsyncClient,
-) -> dict | None:
-    """GET /health and return the parsed JSON body, or None on failure.
+) -> dict | _HealthAuthRejected | None:
+    """GET /health and return the parsed JSON body, or a failure signal.
 
-    None covers transport errors, non-2xx, and invalid JSON. The caller treats
-    None as "device unreachable" and invalidates the host cache. 401 is
-    distinct: it returns None too, but the daemon learns about auth issues
-    through the push path, not health.
+    Three outcomes:
+      - dict                  → the parsed JSON body (a reachable, authorised
+                                probe).
+      - HEALTH_AUTH_REJECTED  → 401: the device is reachable but our client_id
+                                matches no populated slot — the slot was wiped
+                                by a reboot/reflash, or is bound to a different
+                                id. The caller treats this as a re-bind
+                                trigger, not a reachability failure (issue #66).
+      - None                  → transport error, any other non-2xx, or invalid
+                                JSON. The caller treats None as "device
+                                unreachable" and reconciles the host cache
+                                via mDNS.
     """
     url = f"http://{host}/health"
     headers = {CLIENT_ID_HEADER: client_id}
@@ -310,6 +335,9 @@ async def fetch_health(
     except httpx.HTTPError as exc:
         log.warning("health %s failed: %s", url, exc)
         return None
+    if response.status_code == 401:
+        log.info("health %s returned 401 — slot unbound at this device", url)
+        return HEALTH_AUTH_REJECTED
     if response.status_code >= 300:
         log.warning("health %s returned %d", url, response.status_code)
         return None

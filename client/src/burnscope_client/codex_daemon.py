@@ -12,8 +12,11 @@ Four coroutines run for the lifetime of one app-server connection:
               writes the per-agent last-push state file.
   * Health  — periodic GET /health. On transport failure invalidates the
               host cache; on body/snapshot divergence (firmware lost state)
-              re-enqueues the latest snapshot. Mirrors v1's edge-triggered
-              reconciliation.
+              re-enqueues the latest snapshot. On 401 (reachable but our
+              slot was wiped by a reboot/reflash) re-pushes the last
+              snapshot so /summary TOFU re-binds the empty slot — an idle
+              agent otherwise never reclaims it (issue #66). Mirrors v1's
+              edge-triggered reconciliation.
   * Poll    — every POLL_INTERVAL_S, calls `account/rateLimits/read`
               against our own app-server and enqueues a push only when
               the freshly-read snapshot differs from `_last_pushed_snapshot`.
@@ -58,6 +61,7 @@ from .discovery import discover_all  # noqa: E402
 from .host_cache import PairedDevice  # noqa: E402
 from .identity import redact_client_id  # noqa: E402
 from .pusher import (  # noqa: E402
+    HEALTH_AUTH_REJECTED,
     PushAuthError,
     PushError,
     fetch_health,
@@ -516,9 +520,30 @@ class CodexDaemon:
                     continue
                 diverged_devices: list[PairedDevice] = []
                 failed_devices: list[PairedDevice] = []
+                rebind_devices: list[PairedDevice] = []
                 ok_devices: list[PairedDevice] = []
                 for device in devices:
                     body = await fetch_health(device.host, self._client_id, client)
+                    if body is HEALTH_AUTH_REJECTED:
+                        # Reachable, but our slot isn't bound — the device
+                        # rebooted / wiped NVS while we were idle, or another
+                        # agent's slot is the only one populated. Schedule a
+                        # re-bind, but DON'T trust this cached host yet: a 401
+                        # can also come from a *different* display answering at
+                        # a stale host (DHCP reassigned the IP). Re-binding
+                        # blind would TOFU-claim the wrong device. The host is
+                        # confirmed via mDNS in `_verify_rebind_hosts` before
+                        # any /summary push (issue #66). Mark ok=False now so
+                        # state is honest if there's nothing yet to re-push.
+                        log.info(
+                            "health: %s returned 401 for codex; scheduling re-bind",
+                            device.host,
+                        )
+                        rebind_devices.append(device)
+                        host_cache.write_push_state(
+                            AGENT_NAME, ok=False, device_id=device.device_id
+                        )
+                        continue
                     if body is None:
                         failed_devices.append(device)
                         continue
@@ -547,6 +572,14 @@ class CodexDaemon:
                     healed = await self._reconcile_health_failures(
                         failed_devices, client, diverged_devices,
                     )
+                # Confirm each 401 device's host via mDNS before re-binding,
+                # so a stale cached host can't bind us to the wrong display.
+                # Skipped entirely when there's nothing to re-push with.
+                verified_rebind: list[PairedDevice] = []
+                if rebind_devices and self._last_pushed_snapshot is not None:
+                    verified_rebind = await self._verify_rebind_hosts(
+                        rebind_devices, client
+                    )
                 # Identity check after round 2: if two paired records
                 # still share a cached host, success at that host can't
                 # prove which physical device replied. Mark each as
@@ -570,23 +603,31 @@ class CodexDaemon:
                     any(d.device_id not in unverified for d in ok_devices)
                     or bool(healed - unverified)
                 )
-                # Aggregate ok=False when nothing was verifiably healthy
-                # in either round (initial probe or post-reconcile retry).
-                if not any_ok:
-                    host_cache.write_push_state(AGENT_NAME, ok=False)
-                if diverged_devices and self._last_pushed_snapshot is not None:
-                    # Re-push only to the device(s) that actually diverged,
-                    # not the whole fleet. Non-diverged peers don't need
-                    # the update; pushing to them would wake their idle
-                    # state machine and waste bandwidth.
+                # Re-push `_last_pushed_snapshot` to the device(s) that need
+                # it — those that diverged (firmware lost state) and those
+                # that 401'd at an mDNS-confirmed host (slot wiped, needs a
+                # TOFU re-bind). Both are disjoint per cycle (a device returns
+                # either a body or a 401), and both want the same targeted
+                # push: only the affected devices, never the whole fleet, so
+                # idle peers aren't woken (deep-review L-6). For the re-bind,
+                # `_verify_rebind_hosts` already confirmed the host belongs to
+                # this device_id; /summary then TOFU-binds an empty slot and
+                # 401s (→ drop) on one owned by a different id.
+                repush_devices = diverged_devices + verified_rebind
+                if repush_devices and self._last_pushed_snapshot is not None:
                     log.info(
-                        "firmware diverged on %d device(s); re-pushing to %s",
-                        len(diverged_devices),
+                        "re-pushing to %d device(s): diverged=%s rebind=%s",
+                        len(repush_devices),
                         [d.device_id for d in diverged_devices],
+                        [d.device_id for d in verified_rebind],
                     )
                     await self._push_to_devices(
-                        self._last_pushed_snapshot, diverged_devices, client
+                        self._last_pushed_snapshot, repush_devices, client
                     )
+                elif not any_ok:
+                    # Aggregate ok=False when nothing was verifiably healthy
+                    # in either round and there's no re-push to fix it up.
+                    host_cache.write_push_state(AGENT_NAME, ok=False)
 
     def _mark_health_ok(
         self,
@@ -686,7 +727,13 @@ class CodexDaemon:
                 device_id=device.device_id, host=found.host
             )
             retry = await fetch_health(refreshed.host, self._client_id, client)
-            if retry is None:
+            if retry is None or retry is HEALTH_AUTH_REJECTED:
+                # None: still unreachable at the new host. Sentinel: reachable
+                # there but our slot isn't bound — the cache now points at the
+                # right host, so the next cycle's initial probe will 401 again
+                # and route it through the /summary re-bind path (issue #66).
+                # Record a miss either way and never pass the sentinel into the
+                # divergence comparison (it isn't a body).
                 self._record_health_failure(refreshed)
                 continue
             healed.add(refreshed.device_id)
@@ -695,6 +742,79 @@ class CodexDaemon:
             )
             self._mark_health_ok(refreshed, retry, diverged_devices)
         return healed
+
+    async def _verify_rebind_hosts(
+        self,
+        rebind_devices: list[PairedDevice],
+        client: httpx.AsyncClient,
+    ) -> list[PairedDevice]:
+        """Confirm via mDNS that each 401 device's host still maps to its
+        `device_id`, returning the subset safe to TOFU-rebind (at the
+        confirmed host).
+
+        A health 401 at a *stale* cached host can be a *different* display
+        answering after a DHCP reassignment. Posting `/summary` to that host
+        would TOFU-bind us to the wrong physical device — older firmware
+        (no `health.device_id`) never corrects it, newer firmware only after
+        one wrong push. mDNS resolves the stable `device_id` to the device's
+        current address, so this is the authoritative check: only rebind at a
+        host mDNS still advertises for that id; a device mDNS can't see is left
+        unbound (no rebind at an unverified host) until a later cycle.
+
+        Shares the per-`(agent, device_id)` reconcile cooldown with the
+        transport-failure path via `claim_reconcile_slots`, so a flapping
+        device can't force a browse every cycle. Returns devices carrying the
+        mDNS-confirmed host; a moved host is committed update-only (never
+        resurrects a pairing removed during the browse).
+        """
+        ids = [d.device_id for d in rebind_devices]
+        eligible = host_cache.claim_reconcile_slots(AGENT_NAME, ids)
+        if not eligible:
+            log.debug(
+                "401 re-bind for %d device(s) blocked by mDNS reconcile cooldown",
+                len(ids),
+            )
+            return []
+        try:
+            discovered = await discover_all(timeout=DISCOVERY_TIMEOUT_S)
+        except Exception as exc:
+            # mDNS failure must not kill the health loop; leave the devices
+            # unbound this cycle and retry when eligible again.
+            log.warning("mDNS browse during 401 re-bind verification failed: %s", exc)
+            return []
+        by_id = {d.device_id: d for d in discovered}
+
+        verified: list[PairedDevice] = []
+        for device in rebind_devices:
+            if device.device_id not in eligible:
+                continue
+            found = by_id.get(device.device_id)
+            if found is None:
+                # Not visible via mDNS — the cached host may now belong to a
+                # different display. Do NOT rebind at an unverified host.
+                log.info(
+                    "health 401 re-bind skipped for %s — not visible via mDNS",
+                    device.device_id,
+                )
+                continue
+            if found.host != device.host and not host_cache.update_paired_device_host(
+                AGENT_NAME, device.device_id, found.host
+            ):
+                # Pairing removed during the browse — don't resurrect it.
+                log.info(
+                    "skipped 401 re-bind for %s — pairing was removed during reconcile",
+                    device.device_id,
+                )
+                continue
+            if found.host != device.host:
+                log.info(
+                    "health 401 re-bind: %s host %s -> %s (mDNS-confirmed)",
+                    device.device_id, device.host, found.host,
+                )
+            verified.append(
+                PairedDevice(device_id=device.device_id, host=found.host)
+            )
+        return verified
 
     # ----------------------------------------------------------- device list
 

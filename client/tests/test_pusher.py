@@ -104,6 +104,31 @@ async def test_fetch_health_returns_none_on_transport_failure():
         assert await fetch_health("esp.local", CLIENT_ID, client) is None
 
 
+@respx.mock
+async def test_fetch_health_returns_auth_sentinel_on_401():
+    # A reachable device whose slot our client_id doesn't match returns 401.
+    # This must be distinguishable from a transport failure so the daemon
+    # can treat it as a re-bind trigger rather than a reachability miss
+    # (issue #66).
+    respx.get("http://esp.local/health").mock(
+        return_value=httpx.Response(401, json={"error": "client id mismatch"})
+    )
+    async with httpx.AsyncClient() as client:
+        result = await fetch_health("esp.local", CLIENT_ID, client)
+    assert result is pusher.HEALTH_AUTH_REJECTED
+
+
+@respx.mock
+async def test_fetch_health_returns_none_on_non_401_error():
+    # Only 401 is special; every other non-2xx still collapses to None so
+    # the existing "treat as unreachable" path is unchanged.
+    respx.get("http://esp.local/health").mock(
+        return_value=httpx.Response(503)
+    )
+    async with httpx.AsyncClient() as client:
+        assert await fetch_health("esp.local", CLIENT_ID, client) is None
+
+
 # ----------------------------------------------------------- push_to_all
 
 async def test_push_to_all_returns_empty_for_no_devices():

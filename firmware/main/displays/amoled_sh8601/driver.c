@@ -135,6 +135,23 @@ static esp_lcd_panel_io_handle_t  s_io_handle    = NULL;
 #define SH8601_QSPI_TX_CMD(cmd)  (((uint32_t)0x02 << 24) | ((uint32_t)(cmd) << 8))
 #define SH8601_CMD_BRIGHTNESS    0x51
 
+/* SH8601/CO5300 address columns & rows in 2-pixel groups: every
+ * CASET/RASET window must start on an even coordinate and end on an odd
+ * one. LVGL renders in partial mode and invalidates arbitrary rectangles,
+ * so expand each flush area to the enclosing 2-px-aligned box before it
+ * reaches the panel — otherwise incremental updates (labels, arcs, the
+ * 1 Hz countdown) after the initial full-screen load can render shifted by
+ * a column. Mirrors the Waveshare BSP rounder. vres=466 is even, so the
+ * 270° sw-rotation below preserves this parity, and the CO5300 x_gap of 6
+ * (even) preserves it when the component adds it on each flush. */
+static void sh8601_lvgl_rounder_cb(lv_area_t *area)
+{
+    area->x1 = (area->x1 >> 1) << 1;
+    area->y1 = (area->y1 >> 1) << 1;
+    area->x2 = ((area->x2 >> 1) << 1) + 1;
+    area->y2 = ((area->y2 >> 1) << 1) + 1;
+}
+
 lv_display_t *amoled_sh8601_driver_init(void)
 {
     if (s_display != NULL) {
@@ -212,6 +229,7 @@ lv_display_t *amoled_sh8601_driver_init(void)
     const lvgl_port_display_cfg_t disp_cfg = {
         .io_handle = io_handle,
         .panel_handle = panel_handle,
+        .rounder_cb = sh8601_lvgl_rounder_cb,
         .buffer_size = LCD_H_RES * 40,
         .double_buffer = true,
         .hres = LCD_H_RES,

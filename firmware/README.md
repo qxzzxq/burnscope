@@ -90,8 +90,9 @@ under `main/displays/<name>/`. The active profile is chosen via Kconfig
 
 | Kconfig symbol                            | Target chip | Profile path                       |
 |-------------------------------------------|-------------|------------------------------------|
-| `CONFIG_BURNSCOPE_DISPLAY_CYD2USB_ST7789` | esp32       | `main/displays/cyd2usb_st7789/`    |
-| `CONFIG_BURNSCOPE_DISPLAY_AMOLED_SH8601`  | esp32s3     | `main/displays/amoled_sh8601/`     |
+| `CONFIG_BURNSCOPE_DISPLAY_CYD2USB_ST7789`   | esp32       | `main/displays/cyd2usb_st7789/`    |
+| `CONFIG_BURNSCOPE_DISPLAY_AMOLED_SH8601`    | esp32s3     | `main/displays/amoled_sh8601/`     |
+| `CONFIG_BURNSCOPE_DISPLAY_AMOLED_CO5300_175`| esp32s3     | `main/displays/amoled_co5300_175/` |
 
 The AMOLED profile targets the Waveshare ESP32-S3-Touch-AMOLED-1.43
 (466×466 round AMOLED via QSPI; FT3168 capacitive touch wired as a
@@ -102,6 +103,34 @@ protocol — and we link against Espressif's `esp_lcd_sh8601` managed
 component, hence the profile name. It shares the wire format and
 snapshot store with the CYD profile; only the rendering changes
 (concentric arcs vs. linear bars).
+
+The `amoled_co5300_175` profile targets the Waveshare
+ESP32-S3-Touch-AMOLED-1.75 — the same 466×466 round geometry (so it
+reuses the 1.43"'s UI verbatim) but a CO5300-only panel, different QSPI
+pins, and an AXP2101 PMIC + TCA9554 expander. It is a clone of
+`amoled_sh8601` adapted to the CO5300 (no runtime SH8601 detection). It
+shares the 1.43"'s QMI8658 IMU stack — auto-rotate (`orientation.c`) and
+motion-wake — but runs the accelerometer in **normal `ODR_250Hz` mode**,
+not the 1.43"'s duty-cycled `LowPower_21Hz`: on this board the low-power
+mode injected a ~0.8 g DC offset on the accel X axis that broke axis
+detection, and normal mode reads true gravity (no calibration needed).
+The IMU is on the shared I²C bus (SDA 15 / SCL 14, addr 0x6A/0x6B); since
+touch is deferred the IMU init installs the bus itself. The
+axis→rotation table in `orientation.c` is calibrated for this board's IMU
+mounting (down=90°, left=180°, up=270°, right=0°). Touch (CST9217) and
+the PMIC are not yet driven — RST is a direct GPIO and the panel rail is
+on by power-on defaults (verified; first light works with no PMIC code).
+Because it shares the esp32s3 target with the 1.43", select it with a
+dedicated sdkconfig (the `sdkconfig.amoled175` fragment) rather than the
+target overlay's default:
+
+```sh
+idf.py -B build-amoled175 -DIDF_TARGET=esp32s3 \
+  -DSDKCONFIG=build-amoled175/sdkconfig \
+  -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.amoled175" \
+  build
+idf.py -B build-amoled175 -p <PORT> flash monitor
+```
 
 The Waveshare vendor demo bundle (LVGL source, Waveshare demos, and
 Espressif reference components) is **not vendored** in this repo —

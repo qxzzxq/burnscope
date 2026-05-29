@@ -1,8 +1,8 @@
 /*
  * AMOLED idle adapter (Waveshare 1.75" / CO5300) — see
  * burn_idle_adapter.h for the role and event topology. Clone of the
- * amoled_sh8601 (1.43") adapter with the IMU motion sampler and touch
- * event source removed (this board has neither). Implementation notes:
+ * 1.43" adapter (the driver calls are renamed amoled_co5300_175_*).
+ * Implementation notes:
  *
  *  - Brightness/sleep changes apply only when the SM reports
  *    `output.changed`; ordering is wake-first (DISPON before the
@@ -24,8 +24,11 @@
 
 #include "burn_idle_adapter.h"
 
+#include <string.h>
+
 #include "burn_protection/burn_idle.h"
 #include "driver.h"
+#include "qmi8658.h"
 #include "snapshot.h"
 
 #include "driver/gpio.h"
@@ -45,6 +48,10 @@ static const char *TAG = "burn_idle_ad";
 #define BUTTON_DEBOUNCE_US      100000       /* 100 ms */
 #define DRAIN_TASK_STACK        4096
 #define DRAIN_TASK_PRIORITY     5
+#define IMU_SAMPLE_PERIOD_MS    48           /* ~21 Hz, matches Qmi8658AccOdr_LowPower_21Hz */
+#define IMU_POST_DEBOUNCE_US    200000       /* 200 ms between consecutive EV_MOTION posts */
+#define IMU_TASK_STACK          2560
+#define IMU_TASK_PRIORITY       3            /* below drain task */
 #define FADE_STEP_PERIOD_US     33000        /* ~30 Hz brightness ramp */
 
 static burn_idle_t        s_sm;
@@ -54,17 +61,28 @@ static volatile int64_t   s_last_button_us = 0;
 static bool               s_prev_panel_on = true;  /* matches SM init baseline */
 static bool               s_started        = false;
 
+/* IMU state. `s_imu_threshold_mg` is cached from cfg at start so the
+ * sampler task doesn't reach into the SM's internal config copy. The
+ * debounce compares against the *last posted* sample, not the previous
+ * raw sample, so a slow continuous drift doesn't fire EV_MOTION on
+ * every tick — only when the cumulative displacement crosses the
+ * threshold and 200 ms have elapsed since the last post. */
+static int16_t            s_imu_last_posted_mg[3] = { 0, 0, 0 };
+static int64_t            s_imu_last_posted_us    = INT64_MIN;
+static bool               s_imu_baseline_set      = false;
+static int16_t            s_imu_threshold_mg      = 0;
+
 /* Fade engine state. `current_pct` is the last value we wrote to the
  * 0x51 register and is the only source-of-truth for the panel's actual
  * brightness — start_fade() anchors a new ramp here so preempting
  * events never produce a visible step. `pending_panel_off` carries the
  * sleep-last contract: the DISPOFF command runs only after the fade
  * reaches 0, and is cleared whenever a subsequent fade redirects the
- * panel back toward ON (e.g. button mid-sleep). `generation` bumps on
- * every start_fade so an in-flight fade_step_cb that already snapshot
- * the previous fade's parameters can drop its hardware writes after a
- * preemption. All fields are read and written from two contexts (drain
- * task and esp_timer task) so accesses are guarded by `s_fade_mux`. */
+ * panel back toward ON. `generation` bumps on every start_fade so an
+ * in-flight fade_step_cb that already snapshot the previous fade's
+ * parameters can drop its hardware writes after a preemption. All
+ * fields are read and written from two contexts (drain task and
+ * esp_timer task) so accesses are guarded by `s_fade_mux`. */
 static struct {
     uint8_t  start_pct;
     uint8_t  target_pct;
@@ -121,6 +139,11 @@ static void on_snapshot_push(const agent_snapshot_t *snap, void *user)
     (void)snap;
     (void)user;
     post_event(BURN_IDLE_EV_PUSH);
+}
+
+void burn_idle_adapter_notify_touch(void)
+{
+    post_event(BURN_IDLE_EV_TOUCH);
 }
 
 static void fade_step_cb(void *arg)
@@ -322,6 +345,52 @@ static void drain_task(void *arg)
     }
 }
 
+static int16_t abs_i16(int16_t v) { return v < 0 ? (int16_t)-v : v; }
+
+static void imu_sampler_task(void *arg)
+{
+    (void)arg;
+    /* xTaskDelayUntil keeps the sample cadence anchored to an absolute
+     * tick reference, so the I²C read + threshold work below doesn't
+     * accumulate phase drift across iterations. */
+    const TickType_t period = pdMS_TO_TICKS(IMU_SAMPLE_PERIOD_MS);
+    TickType_t last_wake = xTaskGetTickCount();
+    int16_t samp[3];
+    for (;;) {
+        xTaskDelayUntil(&last_wake, period);
+        if (!qmi8658_read_accel_mg(samp)) {
+            continue;
+        }
+        if (!s_imu_baseline_set) {
+            /* First successful read becomes the baseline so the
+             * initial ~1 g gravity vector doesn't fire a spurious
+             * EV_MOTION at startup. */
+            memcpy(s_imu_last_posted_mg, samp, sizeof samp);
+            s_imu_last_posted_us = esp_timer_get_time();
+            s_imu_baseline_set = true;
+            continue;
+        }
+        const int64_t now = esp_timer_get_time();
+        if (now - s_imu_last_posted_us < IMU_POST_DEBOUNCE_US) {
+            /* Within debounce window — keep reading but don't post.
+             * Intentionally skip the threshold check so we don't
+             * advance the baseline; that would let a slow drift
+             * through unnoticed. */
+            continue;
+        }
+        const int16_t dx = abs_i16(samp[0] - s_imu_last_posted_mg[0]);
+        const int16_t dy = abs_i16(samp[1] - s_imu_last_posted_mg[1]);
+        const int16_t dz = abs_i16(samp[2] - s_imu_last_posted_mg[2]);
+        int16_t max_delta = dx > dy ? dx : dy;
+        if (dz > max_delta) max_delta = dz;
+        if (max_delta > s_imu_threshold_mg) {
+            post_event(BURN_IDLE_EV_MOTION);
+            memcpy(s_imu_last_posted_mg, samp, sizeof samp);
+            s_imu_last_posted_us = now;
+        }
+    }
+}
+
 static void install_button_isr(void)
 {
     /* Configure the pin ourselves. factory_reset.c also configures it
@@ -348,6 +417,25 @@ static void install_button_isr(void)
     ESP_ERROR_CHECK(gpio_isr_handler_add(BUTTON_GPIO, button_isr, NULL));
 }
 
+uint8_t burn_idle_adapter_current_brightness_pct(void)
+{
+    uint8_t pct;
+    portENTER_CRITICAL(&s_fade_mux);
+    pct = s_fade.current_pct;
+    portEXIT_CRITICAL(&s_fade_mux);
+    return pct;
+}
+
+void burn_idle_adapter_anchor_brightness_pct(uint8_t pct)
+{
+    /* Duration 0 → start_fade's short-circuit path: sets
+     * current_pct = pct, active = false, stops the fade timer, bumps
+     * generation. If pct matches the current anchor (typical case
+     * when orientation.c just snapshotted it), brightness_changed is
+     * false and no 0x51 write hits the panel. */
+    start_fade(pct, /*duration_us=*/0, /*pending_panel_off=*/false);
+}
+
 void burn_idle_adapter_start(void)
 {
     if (s_started) {
@@ -361,10 +449,7 @@ void burn_idle_adapter_start(void)
             = (int64_t)CONFIG_BURNSCOPE_AMOLED_IDLE_OFF_MINUTES * 60LL * 1000000LL,
         .active_brightness_pct = CONFIG_BURNSCOPE_AMOLED_ACTIVE_BRIGHTNESS_PCT,
         .dimmed_brightness_pct = CONFIG_BURNSCOPE_AMOLED_DIMMED_BRIGHTNESS_PCT,
-        /* No IMU on this board — motion wake is not a source. The SM
-         * ignores this field (it's carried for the adapter's sampler,
-         * which we don't run); 0 keeps burn_idle_config_valid happy. */
-        .motion_threshold_mg   = 0,
+        .motion_threshold_mg   = CONFIG_BURNSCOPE_AMOLED_MOTION_THRESHOLD_MG,
     };
     if (!burn_idle_config_valid(&cfg)) {
         ESP_LOGE(TAG, "invalid burn-in config — adapter not started");
@@ -377,9 +462,9 @@ void burn_idle_adapter_start(void)
      * (CO5300_DEFAULT_BRIGHTNESS ≈ 70 %) that matches the Kconfig default
      * by design. If a deployment tunes BURNSCOPE_AMOLED_ACTIVE_BRIGHTNESS_PCT
      * to a different value, the SM alone would never write the brightness
-     * register at startup — so write it explicitly here.
-     * s_prev_panel_on is already true (matches the panel's post-init
-     * state), so apply_output's wake-first guard stays consistent. */
+     * register at startup — so write it explicitly here. s_prev_panel_on is
+     * already true (matches the panel's post-init state), so apply_output's
+     * wake-first guard stays consistent. */
     amoled_co5300_175_set_display_on(true);
     amoled_co5300_175_set_brightness_pct(cfg.active_brightness_pct);
     /* Seed the fade engine with the actual brightness we just wrote so
@@ -400,6 +485,22 @@ void burn_idle_adapter_start(void)
     snapshot_store_register_listener(on_snapshot_push, NULL);
 
     install_button_isr();
+
+    /* Bring up the QMI8658 accel for motion-wake. Failure is non-fatal —
+     * the adapter just loses the motion wake source. The others (push,
+     * button) still keep the panel responsive, and orientation.c likewise
+     * degrades to a fixed rotation. */
+    s_imu_threshold_mg = cfg.motion_threshold_mg;
+    if (qmi8658_init()) {
+        BaseType_t imu_ok = xTaskCreate(imu_sampler_task, "burn_idle_imu",
+                                        IMU_TASK_STACK, NULL,
+                                        IMU_TASK_PRIORITY, NULL);
+        if (imu_ok != pdPASS) {
+            ESP_LOGW(TAG, "IMU sampler task spawn failed — motion wake disabled");
+        }
+    } else {
+        ESP_LOGW(TAG, "QMI8658 init failed — motion wake disabled");
+    }
 
     const esp_timer_create_args_t tick_args = {
         .callback        = tick_timer_cb,
@@ -428,12 +529,13 @@ void burn_idle_adapter_start(void)
 
     s_started = true;
     ESP_LOGI(TAG,
-             "started: dim=%d min, off=%d min, br=%d%%/%d%%, "
-             "fade wake=%d ms / sleep=%d ms (no IMU/touch)",
+             "started: dim=%d min, off=%d min, br=%d%%/%d%%, motion=%d mg, "
+             "fade wake=%d ms / sleep=%d ms",
              CONFIG_BURNSCOPE_AMOLED_IDLE_DIM_MINUTES,
              CONFIG_BURNSCOPE_AMOLED_IDLE_OFF_MINUTES,
              CONFIG_BURNSCOPE_AMOLED_ACTIVE_BRIGHTNESS_PCT,
              CONFIG_BURNSCOPE_AMOLED_DIMMED_BRIGHTNESS_PCT,
+             CONFIG_BURNSCOPE_AMOLED_MOTION_THRESHOLD_MG,
              CONFIG_BURNSCOPE_AMOLED_WAKE_FADE_MS,
              CONFIG_BURNSCOPE_AMOLED_SLEEP_FADE_MS);
 }

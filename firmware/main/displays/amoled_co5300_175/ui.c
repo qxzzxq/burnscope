@@ -40,6 +40,7 @@
 #include "burn_idle_adapter.h"
 #include "driver.h"
 #include "nvs_store.h"
+#include "orientation.h"
 #include "snapshot.h"
 #include "version.h"
 
@@ -647,11 +648,15 @@ void display_profile_init(void)
     lv_timer_create(tick_lvgl_cb, 1000, NULL);
     lvgl_port_unlock();
 
-    /* No touch indev and no orientation watcher: this board ships no IMU
-     * (so there's nothing to auto-rotate to) and touch is out of scope
-     * for this profile pass. Wake sources are the GPIO0 button and
-     * incoming /summary pushes (see burn_idle_adapter). */
+    /* No touch indev: the CST9217 touch driver is deferred on this
+     * profile, so there's no LVGL pointer device. Wake sources are the
+     * GPIO0 button, the QMI8658 motion sampler, and incoming /summary
+     * pushes (all in burn_idle_adapter). */
     burn_idle_adapter_start();
+    /* Orientation watcher runs after the burn-in adapter so its
+     * qmi8658_init has already brought up the IMU; the watcher's task
+     * short-circuits gracefully if the chip was missing or init failed. */
+    orientation_start(disp);
     s_initialized = true;
 }
 

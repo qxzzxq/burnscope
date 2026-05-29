@@ -17,10 +17,11 @@
  * command) that this AMOLED family — SH8601 and CO5300 alike — expects.
  * The 1.43" profile already drives CO5300 silicon through it.
  *
- * Touch (CST9217) and the AXP2101 PMIC are out of scope for this profile
- * pass; RST is a direct GPIO (39) and the panel rail is expected to be on
- * by the board's power-on defaults. If the panel comes up dark, a minimal
- * AXP2101 rail-enable belongs at the top of the init below.
+ * The board carries a QMI8658 IMU (see qmi8658.c / orientation.c) for
+ * auto-rotate + motion-wake. Touch (CST9217) and the AXP2101 PMIC are
+ * out of scope for this profile pass; RST is a direct GPIO (39) and the
+ * panel rail is on by the board's power-on defaults (verified — first
+ * light works with no PMIC code).
  */
 
 #include "driver.h"
@@ -189,10 +190,12 @@ lv_display_t *amoled_co5300_175_driver_init(void)
         return NULL;
     }
 
-    /* Fixed orientation — this board has no IMU, so unlike the 1.43"
-     * profile there is no auto-rotate. ROTATION_0 is the starting point;
-     * tune to match the 1.75" board's physical mounting once the panel
-     * lights (the 1.43" board uses 270° for its USB-C-at-bottom layout). */
+    /* Boot rotation baseline. orientation.c (QMI8658 auto-rotate) drives
+     * this at runtime once the IMU is up; ROTATION_0 is the pose the
+     * panel renders upright at on this board (verified on hardware), and
+     * also the fixed orientation when CONFIG_BURNSCOPE_AMOLED_ORIENTATION_AUTO
+     * is disabled. The orientation task seeds its state machine to match
+     * (AXIS_Y_NEG → ROTATION_0). */
     if (lvgl_port_lock(0)) {
         lv_display_set_rotation(s_display, LV_DISPLAY_ROTATION_0);
         lvgl_port_unlock();

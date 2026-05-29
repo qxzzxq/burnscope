@@ -59,11 +59,16 @@ static const char *TAG = "amoled175_drv";
 #define CO5300_DEFAULT_BRIGHTNESS  0xB2
 
 /* CO5300 init sequence mirrored from the Waveshare 1.75" BSP
- * (`esp32_s3_touch_amoled_1_75.c` lcd_init_cmds), with two deviations:
+ * (`esp32_s3_touch_amoled_1_75.c` lcd_init_cmds), with these deviations:
  *   - The 0x2A/0x2B column/row address window is dropped: the
  *     esp_lcd_sh8601 component programs CASET/RASET itself on each flush
  *     from the panel gap (set below), so a fixed window here would just
  *     be overwritten.
+ *   - The 0x3A pixel-format command is dropped: the component sets it
+ *     from `bits_per_pixel` (16 → RGB565), and warns if the init table
+ *     also carries one. The 1.43" CO5300 table omits it for the same
+ *     reason; the vendor BSP includes it because it drives the panel via
+ *     the separate esp_lcd_co5300 component, which doesn't auto-set it.
  *   - Brightness ramps 0x00 → CO5300_DEFAULT_BRIGHTNESS around DISPON
  *     (instead of a single 0xFF) to suppress the first-frame junk flash
  *     and avoid full-brightness burn-in.
@@ -74,7 +79,6 @@ static const sh8601_lcd_init_cmd_t s_co5300_init_cmds[] = {
     { 0x1C, (uint8_t[]){ 0xA0 }, 1, 0 },
     { 0xFE, (uint8_t[]){ 0x00 }, 1, 0 },   /* page select 0x00 (user)     */
     { 0xC4, (uint8_t[]){ 0x80 }, 1, 0 },   /* SPIMODECTL: stay in QSPI    */
-    { 0x3A, (uint8_t[]){ 0x55 }, 1, 0 },   /* pixel format RGB565         */
     { 0x35, (uint8_t[]){ 0x00 }, 1, 0 },   /* TE on (line unused, benign) */
     { 0x53, (uint8_t[]){ 0x20 }, 1, 0 },   /* WCTRLD1: brightness ctl on  */
     { 0x63, (uint8_t[]){ 0xFF }, 1, 0 },   /* HBM ceiling max             */

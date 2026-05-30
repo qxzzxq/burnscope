@@ -18,10 +18,11 @@
  * The 1.43" profile already drives CO5300 silicon through it.
  *
  * The board carries a QMI8658 IMU (see qmi8658.c / orientation.c) for
- * auto-rotate + motion-wake. Touch (CST9217) and the AXP2101 PMIC are
- * out of scope for this profile pass; RST is a direct GPIO (39) and the
- * panel rail is on by the board's power-on defaults (verified — first
- * light works with no PMIC code).
+ * auto-rotate + motion-wake, and a CST9217 capacitive touch controller
+ * (see touch.c) used as a burn-in touch-wake source. The AXP2101 PMIC is
+ * out of scope for this profile pass; the panel RST is a direct GPIO (39)
+ * and the panel rail is on by the board's power-on defaults (verified —
+ * first light works with no PMIC code).
  */
 
 #include "driver.h"

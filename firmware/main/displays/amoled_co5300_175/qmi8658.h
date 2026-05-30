@@ -10,9 +10,9 @@
  * is used (motion-wake source + orientation watcher).
  *
  * Bus: I²C0 on SDA=GPIO15 / SCL=GPIO14 (the 1.75" board's shared
- * peripheral bus). Unlike the 1.43" — where touch.c installs the I²C
- * driver — this profile defers touch (CST9217), so `qmi8658_init`
- * installs the bus itself (idempotently).
+ * peripheral bus), shared with the CST9217 touch driver (touch.c).
+ * Both `qmi8658_init` and `touch_init` install it idempotently, so
+ * either may run first.
  *
  * Settings: ±2 g range, ODR Qmi8658AccOdr_LowPower_21Hz, LPF disabled.
  * Sensitivity at ±2 g is 16384 LSB / g (i.e. 1 mg = 16.384 LSB).

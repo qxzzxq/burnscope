@@ -10,8 +10,8 @@
  *   - snapshot store listener (POST /summary)     → EV_PUSH
  *   - GPIO0 (BOOT button) negative-edge ISR       → EV_BUTTON
  *   - QMI8658 motion sampler                      → EV_MOTION
- *   - LVGL touch indev callback (notify_touch)    → EV_TOUCH (unused
- *     until the CST9217 touch driver is wired; kept for API parity)
+ *   - LVGL touch indev callback (notify_touch)    → EV_TOUCH (CST9217,
+ *     polled from ui.c's touch_indev_read_cb on a fresh press)
  *
  * Outputs applied:
  *   - `amoled_co5300_175_set_brightness_pct` on every state change
@@ -32,11 +32,9 @@
 void burn_idle_adapter_start(void);
 
 /**
- * Post EV_TOUCH into the adapter's event queue. Intended for the LVGL
- * touch input-device callback on a fresh-press transition. Non-blocking;
- * drops the event if the queue is full. (No caller yet — touch is
- * deferred on this board — but kept so wiring CST9217 later is a one-line
- * change.)
+ * Post EV_TOUCH into the adapter's event queue. Called by the LVGL touch
+ * input-device callback (ui.c) on a fresh-press transition. Non-blocking;
+ * drops the event if the queue is full.
  */
 void burn_idle_adapter_notify_touch(void);
 

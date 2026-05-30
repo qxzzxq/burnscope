@@ -2,6 +2,7 @@ if(CONFIG_BURNSCOPE_DISPLAY_AMOLED_CO5300_175)
     list(APPEND srcs
         "displays/amoled_co5300_175/driver.c"
         "displays/amoled_co5300_175/ui.c"
+        "displays/amoled_co5300_175/touch.c"
         "displays/amoled_co5300_175/qmi8658.c"
         "displays/amoled_co5300_175/burn_idle_adapter.c"
         "displays/amoled_co5300_175/orientation.c"

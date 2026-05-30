@@ -47,6 +47,7 @@
 - Keep PRs small and reviewable (ideally under ~400 lines of diff).
 - When creating a PR, Codex review should be triggered automatically.
 - Address review comments with follow-up commits; do not force-push after review has started unless requested.
+- After creating a PR, request review by appending `@codex review PR` in the PR body to notify the reviewer.
 - Before addressing review feedback, ensure you understand the comment. If unclear, ask for clarification rather than guessing.
 - Always verify the review feedback is a valid concern before making changes. If you disagree with the feedback, respectfully explain your reasoning in a comment rather than ignoring it.
 - After addressing review feedback, re-request review by commenting `@codex review PR` again to ensure the reviewer knows to re-review the changes.

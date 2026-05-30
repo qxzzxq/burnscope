@@ -115,10 +115,18 @@ class CodexDaemon:
         self,
         *,
         app_server_cmd: tuple[str, ...] = APP_SERVER_CMD,
-        client_version: str = "0.2.0",
+        client_version: str | None = None,
     ) -> None:
+        from . import __version__
+
         self._app_server_cmd = app_server_cmd
-        self._client_version = client_version
+        # Single-source the version reported to the app-server's clientInfo
+        # from the package metadata (same source as `__version__`), so the
+        # daemon never identifies itself with a stale hard-coded literal.
+        # Callers may still override explicitly (e.g. tests).
+        self._client_version = (
+            client_version if client_version is not None else __version__
+        )
         self._next_id = 0
         self._pending: dict[int, _PendingRequest] = {}
         self._snapshot_queue: asyncio.Queue[AgentSnapshot] = asyncio.Queue(

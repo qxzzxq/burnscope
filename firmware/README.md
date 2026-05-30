@@ -114,12 +114,15 @@ motion-wake — but runs the accelerometer in **normal `ODR_250Hz` mode**,
 not the 1.43"'s duty-cycled `LowPower_21Hz`: on this board the low-power
 mode injected a ~0.8 g DC offset on the accel X axis that broke axis
 detection, and normal mode reads true gravity (no calibration needed).
-The IMU is on the shared I²C bus (SDA 15 / SCL 14, addr 0x6A/0x6B); since
-touch is deferred the IMU init installs the bus itself. The
+The IMU shares the I²C bus (SDA 15 / SCL 14, addr 0x6A/0x6B) with the
+CST9217 capacitive touch controller (`touch.c`, addr 0x5A); both install
+the bus idempotently, so either may run first. The
 axis→rotation table in `orientation.c` is calibrated for this board's IMU
-mounting (down=90°, left=180°, up=270°, right=0°). Touch (CST9217) and
-the PMIC are not yet driven — RST is a direct GPIO and the panel rail is
-on by power-on defaults (verified; first light works with no PMIC code).
+mounting (down=90°, left=180°, up=270°, right=0°). Touch is polled from
+an LVGL indev callback (`ui.c`) and drives the burn-in **touch-wake**
+source, mirroring the 1.43" profile. The AXP2101 PMIC is not yet driven —
+the panel RST is a direct GPIO and the panel rail is on by power-on
+defaults (verified; first light works with no PMIC code).
 Because it shares the esp32s3 target with the 1.43", select it with a
 dedicated sdkconfig (the `sdkconfig.amoled175` fragment) rather than the
 target overlay's default:

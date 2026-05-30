@@ -2,10 +2,10 @@
  * QMI8658C accelerometer driver for the Waveshare 1.75" AMOLED board.
  * Clone of the 1.43" profile's qmi8658.c with two differences:
  *   - I²C bus pins: SDA=GPIO15 / SCL=GPIO14 (vs 47/48 on the 1.43").
- *   - This profile defers the CST9217 touch driver, so there is no
- *     touch.c to own the I²C install. `qmi8658_init` installs the bus
- *     itself (idempotently — a second install returns INVALID_STATE,
- *     treated as success).
+ *   - The I²C0 bus is shared with the CST9217 touch driver (touch.c).
+ *     Both install it idempotently — whichever of `qmi8658_init` or
+ *     `touch_init` runs first wins; the other's redundant install is
+ *     tolerated (see ensure_i2c_bus) and the WHO_AM_I probe gates health.
  *
  * Register map / settings are identical to the 1.43" (±2 g, ODR
  * LowPower_21Hz, LPF off). Confirmed against the 1.75" vendor demo
@@ -55,9 +55,13 @@ static const char *TAG = "qmi8658";
 static bool    s_initialised = false;
 static uint8_t s_addr         = QMI8658_ADDR_L;
 
-/* Install the I²C0 master on the 1.75"'s shared bus. Idempotent: a
- * second driver install returns ESP_ERR_INVALID_STATE, which we accept
- * (matches the 1.43" touch.c contract for a shared bus). */
+/* Install the I²C0 master on the 1.75"'s shared bus. Idempotent: the bus
+ * is shared with touch.c (CST9217), and whichever of the two runs first
+ * installs it. A redundant install is reported as ESP_ERR_INVALID_STATE
+ * on some IDF versions but ESP_FAIL on v6.0.1 — either way the bus is up,
+ * so any install error is treated as "already installed, proceed". The
+ * WHO_AM_I probe in qmi8658_init is the real bus-health gate: a genuinely
+ * dead bus fails there and disables the IMU. */
 static esp_err_t ensure_i2c_bus(void)
 {
     const i2c_config_t cfg = {
@@ -73,10 +77,11 @@ static esp_err_t ensure_i2c_bus(void)
         return err;
     }
     err = i2c_driver_install(QMI8658_I2C_PORT, cfg.mode, 0, 0, 0);
-    if (err == ESP_ERR_INVALID_STATE) {
-        return ESP_OK;  /* already installed — fine */
+    if (err != ESP_OK) {
+        ESP_LOGD(TAG, "i2c_driver_install: %s — assuming shared bus already up",
+                 esp_err_to_name(err));
     }
-    return err;
+    return ESP_OK;  /* reads/probe are the real gate, not the install code */
 }
 
 static esp_err_t write_reg(uint8_t reg, uint8_t value)

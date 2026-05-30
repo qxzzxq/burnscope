@@ -22,6 +22,21 @@ from burnscope_client.pusher import PushResult
 from burnscope_client.schema import AgentSnapshot, SessionSnapshot
 
 
+# ============================================================ client version
+
+
+def test_codex_daemon_client_version_defaults_to_package_version():
+    """The version reported to the app-server's clientInfo is single-sourced
+    from package metadata, not a separate hard-coded literal (PR #68 / Codex
+    P2). Otherwise the daemon logs one version but identifies itself to Codex
+    with a stale one. An explicit override is still honored.
+    """
+    import burnscope_client
+
+    assert CodexDaemon()._client_version == burnscope_client.__version__
+    assert CodexDaemon(client_version="9.9.9")._client_version == "9.9.9"
+
+
 # ============================================================ pure conversion
 
 

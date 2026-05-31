@@ -641,9 +641,16 @@ class CodexDaemon:
         only thing that can clear a stale ok=False — an idle codex never
         re-pushes to refresh it.
 
-        But the clear is gated on two conditions so it can't mask a real
+        But the clear is gated on three conditions so it can't mask a real
         failure:
 
+          * a delivery baseline exists — `_last_pushed_snapshot is not None`.
+            Before the first successful push this run (e.g. just after a
+            restart) a healthy probe proves only reachability; with nothing
+            to compare the firmware against we can't show it holds current
+            data, so a persisted ok=False must survive on reachability alone
+            (Codex review P2). The next push sets the baseline and a later
+            probe clears it then;
           * not diverged — the firmware matches what we last pushed; and
           * `_push_failures[device] == 0` — no newer snapshot is currently
             failing to deliver to this device. Otherwise (Codex review P2)
@@ -660,10 +667,16 @@ class CodexDaemon:
         a spurious divergence here every cycle.
         """
         self._health_failures.pop(device.device_id, None)
-        if (
-            self._last_pushed_snapshot is not None
-            and _firmware_diverged(body, self._last_pushed_snapshot)
-        ):
+        if self._last_pushed_snapshot is None:
+            # No delivery baseline yet this run (e.g. just after a restart, or
+            # before the first poll/push). A reachable /health probe proves
+            # only reachability — with nothing to compare the firmware against
+            # we cannot show it holds current data, so we must not clear a
+            # persisted ok=False on reachability alone (Codex review P2). The
+            # next successful push sets the baseline and a later probe clears
+            # it then.
+            return
+        if _firmware_diverged(body, self._last_pushed_snapshot):
             diverged_devices.append(device)
         elif self._push_failures.get(device.device_id, 0) == 0:
             host_cache.write_push_state(

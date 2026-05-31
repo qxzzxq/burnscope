@@ -119,6 +119,47 @@ def test_mark_health_ok_does_not_mask_pending_failed_push(monkeypatch, tmp_path)
     assert state["ok"] is False
 
 
+def test_mark_health_ok_does_not_clear_failure_without_push_baseline(
+    monkeypatch, tmp_path
+):
+    """A healthy probe must NOT clear ok=false before any snapshot has been
+    delivered this run.
+
+    Scenario (Codex review P2): the daemon just restarted, so
+    `_last_pushed_snapshot` is None and `_push_failures` is empty, but a
+    prior run left `last-push.codex.<device> = ok:false` on disk because the
+    last `/summary` push had failed. The health loop runs before the first
+    poll/push establishes a baseline. A successful `/health` probe proves
+    only reachability — with no baseline we cannot compare the firmware
+    against any delivered snapshot, so it does NOT prove the device holds
+    current data. Clearing the persisted failure on reachability alone would
+    report a never-successfully-pushed display as healthy.
+
+    The clear is gated on having a known `_last_pushed_snapshot` (and the
+    firmware matching it), so the failure stays visible until a real
+    delivery confirms sync.
+    """
+    monkeypatch.setenv("BURNSCOPE_STATE_DIR", str(tmp_path))
+
+    device = PairedDevice(device_id="burnscope-z", host="192.168.1.7:80")
+    # Persisted failure from a prior run's failed /summary push.
+    host_cache.write_push_state("codex", ok=False, device_id="burnscope-z")
+
+    daemon = CodexDaemon()
+    # Fresh restart: no delivery baseline, no failures recorded yet this run.
+    assert daemon._last_pushed_snapshot is None
+    assert daemon._push_failures == {}
+
+    diverged: list[PairedDevice] = []
+    daemon._mark_health_ok(device, _in_sync_health_body(), diverged)
+
+    # Reachability alone is not sync — no re-push flag, no false recovery.
+    assert diverged == []
+    state = host_cache.read_push_state("codex", device_id="burnscope-z")
+    assert state is not None
+    assert state["ok"] is False
+
+
 async def test_health_loop_clears_stale_failure_so_derived_aggregate_recovers(
     monkeypatch, tmp_path
 ):

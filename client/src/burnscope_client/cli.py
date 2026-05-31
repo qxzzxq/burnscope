@@ -535,13 +535,14 @@ def _status() -> int:
         print(f"⚠  {hint}")
 
     for agent in ("claude", "codex"):
-        state = host_cache.read_push_state(agent)
+        agg = host_cache.compute_aggregate_ok(agent)
         cid = host_cache.read_client_id(agent)
         cid_short = f"{cid[:32]}…" if cid and len(cid) > 32 else (cid or "<not cached>")
         devices = host_cache.load_paired_devices(agent)
         print(f"--- {agent} ---")
         print(f"  client_id:   {cid_short}")
-        print(f"  aggregate:   {state or '<none>'}")
+        agg_str = "<pending>" if agg is None else ("ok" if agg else "DEGRADED")
+        print(f"  aggregate:   {agg_str}  (derived from per-device state)")
         if not devices:
             print("  paired:      <none>")
         else:

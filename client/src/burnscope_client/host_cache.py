@@ -500,6 +500,48 @@ def read_push_state(agent: str, *, device_id: str | None = None) -> dict | None:
     return parsed
 
 
+def compute_aggregate_ok(agent: str) -> bool | None:
+    """Derive the agent's overall push health from the per-device files.
+
+    The aggregate is a pure function of the per-device `last-push` state,
+    not separately stored: it is `all(device ok)` over the paired list.
+    Deriving it on read (rather than writing it from the many sites that
+    mutate per-device state) means the aggregate can never disagree with
+    the per-device files — the class of bug where one writer flips the
+    aggregate while another leaves a device red, and vice versa.
+
+    A known failure outranks a missing outcome: if any paired device's last
+    outcome was not ok, the verdict is False even when another device has no
+    state yet. Otherwise a freshly-paired device (no outcome until the next
+    push, e.g. just after `burnscope pair`) would mask an already-failing
+    peer behind "pending" and the statusline would flip ✗ → … on a pair,
+    hiding a real problem (Codex review P2).
+
+    Returns:
+        * False — at least one paired device's last outcome was not ok.
+          Failure dominates; takes precedence over any missing state.
+        * None  — undetermined ("pending"): no devices paired yet, or no
+          failures but at least one paired device has no recorded outcome.
+          Callers render this as pending, never as a failure.
+        * True  — every paired device has a recorded outcome and all are ok.
+
+    Note this reflects only *device* health. Collector-side preconditions
+    (missing client_id, unparseable input) are surfaced via exit codes and
+    logs, not by forcing this verdict false — they are not display faults.
+    """
+    devices = load_paired_devices(agent)
+    if not devices:
+        return None
+    pending = False
+    for device in devices:
+        state = read_push_state(agent, device_id=device.device_id)
+        if state is None:
+            pending = True
+        elif not state.get("ok"):
+            return False
+    return None if pending else True
+
+
 # ------------------------------------------------------------- client_id cache
 
 def read_client_id(agent: str) -> str | None:

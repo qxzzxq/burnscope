@@ -128,6 +128,60 @@ def test_read_push_state_returns_none_for_invalid_json(_state_dir):
     assert host_cache.read_push_state("claude") is None
 
 
+# ----------------------------------------------- derived aggregate health
+
+def test_compute_aggregate_ok_none_when_no_devices():
+    """No paired devices → no verdict (pending), not a failure."""
+    assert host_cache.compute_aggregate_ok("claude") is None
+
+
+def test_compute_aggregate_ok_none_when_a_device_has_no_state():
+    """A paired device that hasn't reported any push outcome yet leaves the
+    aggregate undetermined (pending) rather than asserting health."""
+    host_cache.add_paired_device("claude", PairedDevice("dev-1", "10.0.0.5:80"))
+    assert host_cache.compute_aggregate_ok("claude") is None
+
+
+def test_compute_aggregate_ok_true_when_all_devices_ok():
+    host_cache.add_paired_device("claude", PairedDevice("dev-1", "10.0.0.5:80"))
+    host_cache.add_paired_device("claude", PairedDevice("dev-2", "10.0.0.6:80"))
+    host_cache.write_push_state("claude", ok=True, device_id="dev-1")
+    host_cache.write_push_state("claude", ok=True, device_id="dev-2")
+    assert host_cache.compute_aggregate_ok("claude") is True
+
+
+def test_compute_aggregate_ok_false_when_any_device_failing():
+    host_cache.add_paired_device("claude", PairedDevice("dev-1", "10.0.0.5:80"))
+    host_cache.add_paired_device("claude", PairedDevice("dev-2", "10.0.0.6:80"))
+    host_cache.write_push_state("claude", ok=True, device_id="dev-1")
+    host_cache.write_push_state("claude", ok=False, device_id="dev-2")
+    assert host_cache.compute_aggregate_ok("claude") is False
+
+
+def test_compute_aggregate_ok_failure_outranks_missing_state():
+    """A known per-device failure must not be masked by a freshly-paired
+    device that has no recorded outcome yet (e.g. just after `burnscope
+    pair`). Failure dominates pending — otherwise the statusline would flip
+    from ✗ to … on a pair and hide a real problem. The missing-state device
+    is ordered first to prove a pending entry seen before the failure does
+    not short-circuit to None (Codex review P2).
+    """
+    host_cache.add_paired_device("claude", PairedDevice("dev-new", "10.0.0.6:80"))
+    host_cache.add_paired_device("claude", PairedDevice("dev-fail", "10.0.0.5:80"))
+    # dev-new has no per-device state yet; dev-fail already failed.
+    host_cache.write_push_state("claude", ok=False, device_id="dev-fail")
+    assert host_cache.compute_aggregate_ok("claude") is False
+
+
+def test_compute_aggregate_ok_is_per_agent():
+    host_cache.add_paired_device("claude", PairedDevice("c1", "10.0.0.5:80"))
+    host_cache.write_push_state("claude", ok=True, device_id="c1")
+    host_cache.add_paired_device("codex", PairedDevice("x1", "10.0.0.7:80"))
+    host_cache.write_push_state("codex", ok=False, device_id="x1")
+    assert host_cache.compute_aggregate_ok("claude") is True
+    assert host_cache.compute_aggregate_ok("codex") is False
+
+
 # --------------------------------------------------------- client_id cache
 
 def test_client_id_round_trip_with_email():

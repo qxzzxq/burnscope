@@ -102,14 +102,14 @@ def _foreground_mode() -> int:
     except (ValueError, OSError):
         payload = {}
 
-    prev = host_cache.read_push_state("claude")
-    indicator = _indicator_for(prev)
+    agg = host_cache.compute_aggregate_ok(AGENT_NAME)
+    indicator = _indicator_for(agg)
     rate_limits = payload.get("rate_limits") or {}
     five = rate_limits.get("five_hour") or {}
     seven = rate_limits.get("seven_day") or {}
     log.debug(
-        "foreground fire: prev=%s indicator=%s rate_limits=%s",
-        prev,
+        "foreground fire: aggregate=%s indicator=%s rate_limits=%s",
+        agg,
         indicator,
         "present" if rate_limits else "absent",
     )
@@ -143,10 +143,16 @@ def _format_pct(value: object) -> str:
     return "—"
 
 
-def _indicator_for(prev: dict | None) -> str:
-    if prev is None:
+def _indicator_for(aggregate_ok: bool | None) -> str:
+    """Map the derived aggregate health to a statusline glyph.
+
+    `aggregate_ok` comes from `host_cache.compute_aggregate_ok`: None when
+    undetermined (nothing paired, or a device with no outcome yet) → the
+    pending glyph; True/False → ok/fail.
+    """
+    if aggregate_ok is None:
         return _INDICATOR_PENDING
-    return _INDICATOR_OK if prev.get("ok") else _INDICATOR_FAIL
+    return _INDICATOR_OK if aggregate_ok else _INDICATOR_FAIL
 
 
 def _build_snapshot(five: dict, seven: dict) -> AgentSnapshot | None:
@@ -221,13 +227,16 @@ def _push_mode() -> int:
             sessions=[SessionSnapshot(**s) for s in snap_dict["sessions"]],
         )
     except (ValueError, KeyError, TypeError) as exc:
+        # Collector-side precondition failure (bad input) — not a display
+        # fault. Surface via exit code + log only; the aggregate is derived
+        # from per-device health and must not be tipped red by this.
         log.error("invalid snapshot on stdin: %s", exc)
-        host_cache.write_push_state(AGENT_NAME, ok=False)
         return 1
 
     client_id = _resolve_client_id()
     if client_id is None:
-        host_cache.write_push_state(AGENT_NAME, ok=False)
+        # Same: an identity miss is a collector precondition, not a device
+        # failure. No aggregate write — `compute_aggregate_ok` derives it.
         return 1
 
     return asyncio.run(_do_fanout(snapshot, client_id))
@@ -254,8 +263,10 @@ async def _do_fanout(snapshot: AgentSnapshot, client_id: str) -> int:
     async with httpx.AsyncClient() as client:
         devices = await _resolve_paired_devices(snapshot, client_id, client)
         if not devices:
+            # Nothing paired/claimable → the derived aggregate is "pending"
+            # (None), not a failure. Exit non-zero for the caller, but write
+            # no aggregate state.
             log.warning("no paired devices and discovery found nothing claimable")
-            host_cache.write_push_state(AGENT_NAME, ok=False)
             return 1
 
         results = await push_to_all(snapshot, devices, client_id, client)
@@ -311,7 +322,8 @@ async def _do_fanout(snapshot: AgentSnapshot, client_id: str) -> int:
         overall_ok = False
         host_cache.bump_push_failures(AGENT_NAME, device_id)
 
-    host_cache.write_push_state(AGENT_NAME, ok=overall_ok)
+    # No aggregate write — `compute_aggregate_ok` derives it from the
+    # per-device files updated above. `overall_ok` is only the exit code.
     return 0 if overall_ok else 1
 
 

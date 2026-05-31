@@ -48,7 +48,13 @@ static const char *TAG = "burn_idle_ad";
 #define BUTTON_DEBOUNCE_US      100000       /* 100 ms */
 #define DRAIN_TASK_STACK        4096
 #define DRAIN_TASK_PRIORITY     5
-#define IMU_SAMPLE_PERIOD_MS    48           /* ~21 Hz, matches Qmi8658AccOdr_LowPower_21Hz */
+/* Motion-sampler poll rate. 10 Hz — matches the orientation watcher and
+ * is ample for motion-wake (human motion is < ~10 Hz, and touch + button
+ * also wake the panel). The 1.43" profile uses ~21 Hz to match its
+ * LowPower_21Hz accel ODR, but this board runs the IMU at 250 Hz normal
+ * mode (see qmi8658.c), so there's no ODR to match and 21 Hz only
+ * over-sampled — see issue #71. */
+#define IMU_SAMPLE_PERIOD_MS    100
 #define IMU_POST_DEBOUNCE_US    200000       /* 200 ms between consecutive EV_MOTION posts */
 #define IMU_TASK_STACK          2560
 #define IMU_TASK_PRIORITY       3            /* below drain task */

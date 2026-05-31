@@ -108,13 +108,23 @@ static lv_obj_t *s_battery_label       = NULL;  /* AXP2101 % + glyph, above foot
 
 /* Battery telemetry. `s_battery_ok` is the one-shot result of axp2101_init
  * (false when no AXP2101 / no PMU board); `s_battery` is the last good
- * reading and `s_battery_valid` gates whether we have one yet. The I2C
- * sample cadence (10 s, in the tick) is decoupled from the paint
- * (apply_battery_locked, called on agent swap + after each sample) so a
- * 5 s cycle swap doesn't trigger an I2C read. */
+ * reading and `s_battery_valid` gates whether we have one yet. The tick
+ * resamples every 1 s (I2C); the paint (apply_battery_locked) is gated so
+ * it only invalidates the label on a real appearance change — see the
+ * `s_batt_shown_*` snapshot below. */
 static bool             s_battery_ok    = false;
 static bool             s_battery_valid = false;
 static axp2101_status_t s_battery       = { 0 };
+
+/* The appearance the battery label currently shows, so the per-tick paint
+ * is a no-op unless something visible changed. Covers every field that
+ * feeds the glyph / colour / text: presence (visibility), percent,
+ * charging (the bolt + colour), and vbus (plug/unplug). */
+static bool   s_batt_shown_set      = false;  /* have we painted once?   */
+static bool   s_batt_shown_visible  = false;
+static int8_t s_batt_shown_pct      = 0;
+static bool   s_batt_shown_charging = false;
+static bool   s_batt_shown_vbus     = false;
 
 typedef struct {
     lv_obj_t *arc;
@@ -477,7 +487,7 @@ static void render_footer_locked(const agent_snapshot_t *snap)
 /* Read a fresh AXP2101 snapshot into the cache. No-op — leaving the
  * previous reading intact — when the PMU is absent or the I2C read fails,
  * so a transient bus hiccup doesn't blank the indicator. Does its own
- * I2C, so callers should throttle it (see the 10 s tick block). */
+ * I2C, so callers should throttle it (the tick calls it at 1 Hz). */
 static void sample_battery(void)
 {
     if (!s_battery_ok) return;
@@ -491,31 +501,55 @@ static void sample_battery(void)
 /* Paint the battery label from the cached reading. Hidden when the PMU is
  * absent, no reading has landed yet, or no pack is connected (USB-only
  * power). Picks a charge/battery glyph by level and tints a low,
- * not-charging pack red. Caller must hold lvgl_port_lock. */
+ * not-charging pack red. Caller must hold lvgl_port_lock.
+ *
+ * Called every tick, so it gates on the shown appearance and only touches
+ * LVGL when something visible actually changed — percent, charging (the
+ * bolt + colour) or vbus (plug/unplug), plus the hidden/shown flag. That
+ * keeps the per-second paint free on the common no-change tick. */
 static void apply_battery_locked(void)
 {
     if (s_battery_label == NULL) return;
-    if (!s_battery_ok || !s_battery_valid || !s_battery.present) {
+
+    const bool visible  = s_battery_ok && s_battery_valid && s_battery.present;
+    int pct = s_battery.percent;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    const bool charging = s_battery.charging;
+    const bool vbus     = s_battery.vbus;
+
+    /* No-op unless the appearance changed. While hidden only `visible`
+     * matters; while shown, percent / charging / vbus all feed the
+     * glyph, colour, text or plug state. */
+    if (s_batt_shown_set && visible == s_batt_shown_visible &&
+        (!visible || (pct == s_batt_shown_pct &&
+                      charging == s_batt_shown_charging &&
+                      vbus == s_batt_shown_vbus))) {
+        return;
+    }
+    s_batt_shown_set      = true;
+    s_batt_shown_visible  = visible;
+    s_batt_shown_pct      = (int8_t)pct;
+    s_batt_shown_charging = charging;
+    s_batt_shown_vbus     = vbus;
+
+    if (!visible) {
         lv_obj_add_flag(s_battery_label, LV_OBJ_FLAG_HIDDEN);
         return;
     }
 
-    int pct = s_battery.percent;
-    if (pct < 0) pct = 0;
-    if (pct > 100) pct = 100;
-
     const char *glyph;
-    if (s_battery.charging) glyph = LV_SYMBOL_CHARGE;
-    else if (pct >= 88)     glyph = LV_SYMBOL_BATTERY_FULL;
-    else if (pct >= 63)     glyph = LV_SYMBOL_BATTERY_3;
-    else if (pct >= 38)     glyph = LV_SYMBOL_BATTERY_2;
-    else if (pct >= 13)     glyph = LV_SYMBOL_BATTERY_1;
-    else                    glyph = LV_SYMBOL_BATTERY_EMPTY;
+    if (charging)       glyph = LV_SYMBOL_CHARGE;
+    else if (pct >= 88) glyph = LV_SYMBOL_BATTERY_FULL;
+    else if (pct >= 63) glyph = LV_SYMBOL_BATTERY_3;
+    else if (pct >= 38) glyph = LV_SYMBOL_BATTERY_2;
+    else if (pct >= 13) glyph = LV_SYMBOL_BATTERY_1;
+    else                glyph = LV_SYMBOL_BATTERY_EMPTY;
 
     uint32_t color;
-    if (s_battery.charging) color = 0x7FB069;  /* charging — soft green   */
-    else if (pct < 15)      color = 0xE05A4F;  /* low, uncharging — red    */
-    else                    color = 0x8A8A8A;  /* normal — dim grey        */
+    if (charging)      color = 0x7FB069;  /* charging — soft green   */
+    else if (pct < 15) color = 0xE05A4F;  /* low, uncharging — red    */
+    else               color = 0x8A8A8A;  /* normal — dim grey        */
     lv_obj_set_style_text_color(s_battery_label, lv_color_hex(color), 0);
 
     char buf[16];
@@ -680,6 +714,12 @@ static void tick_lvgl_cb(lv_timer_t *t)
     if (snapshot_store_get(s_visible_agent, &cur)) {
         render_snapshot_locked(&cur);
     }
+    /* Battery: resample + repaint every tick (1 Hz) so plugging or
+     * unplugging power — and level changes — reflect within ~1 s. The
+     * reads are a few single-byte I2C transfers, same order as the
+     * per-tick touch poll, so doing this every tick is cheap. */
+    sample_battery();
+    apply_battery_locked();
     /* Periodically re-read the footer CID from NVS so a factory-reset
      * (which wipes NVS behind our back) is reflected within 10 seconds
      * instead of persisting the previous owner's email indefinitely.
@@ -692,10 +732,6 @@ static void tick_lvgl_cb(lv_timer_t *t)
             for (size_t i = 0; i < FOOTER_AGENT_COUNT; ++i) {
                 refresh_footer_cid(FOOTER_AGENTS[i]);
             }
-            /* Battery moves slowly — resample on the same 10 s cadence as
-             * the footer, then repaint the indicator from the cache. */
-            sample_battery();
-            apply_battery_locked();
         }
     }
     if (snapshot_store_count() >= 2) {

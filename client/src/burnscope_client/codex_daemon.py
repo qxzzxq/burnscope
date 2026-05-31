@@ -643,8 +643,20 @@ class CodexDaemon:
         body: dict,
         diverged_devices: list[PairedDevice],
     ) -> None:
-        """Record a successful health probe — clear the counter, then
-        check whether the firmware diverged from `_last_pushed_snapshot`.
+        """Record a successful health probe — clear the counter, persist
+        ok=True, then check whether the firmware diverged from
+        `_last_pushed_snapshot`.
+
+        Persisting ok=True here is what lets a device recover its
+        per-device push state after a transient blip. If it comes back at
+        the *same* host with the firmware still in sync, neither the
+        host-change heal nor a divergence re-push fires, so this plain
+        healthy probe is the only thing that can clear a stale ok=False
+        — an idle codex never re-pushes to refresh it. Later writes in the
+        same cycle still take precedence by running after this: a device
+        found in an unresolved duplicate-host group is overwritten back to
+        ok=False by the caller, and a diverged device is corrected by the
+        subsequent targeted re-push.
 
         Compare against `_last_pushed_snapshot` (the anchored value the
         firmware actually has), not `_last_snapshot` (the raw value from
@@ -652,6 +664,9 @@ class CodexDaemon:
         a spurious divergence here every cycle.
         """
         self._health_failures.pop(device.device_id, None)
+        host_cache.write_push_state(
+            AGENT_NAME, ok=True, device_id=device.device_id
+        )
         if (
             self._last_pushed_snapshot is not None
             and _firmware_diverged(body, self._last_pushed_snapshot)
@@ -745,9 +760,7 @@ class CodexDaemon:
                 self._record_health_failure(refreshed)
                 continue
             healed.add(refreshed.device_id)
-            host_cache.write_push_state(
-                AGENT_NAME, ok=True, device_id=refreshed.device_id
-            )
+            # ok=True is persisted by `_mark_health_ok` below.
             self._mark_health_ok(refreshed, retry, diverged_devices)
         return healed
 

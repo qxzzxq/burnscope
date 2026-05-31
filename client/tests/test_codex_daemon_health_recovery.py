@@ -78,3 +78,38 @@ def test_mark_health_ok_clears_stale_failure(monkeypatch, tmp_path):
     state = host_cache.read_push_state("codex", device_id="burnscope-x")
     assert state is not None
     assert state["ok"] is True
+
+
+def test_mark_health_ok_does_not_mask_pending_failed_push(monkeypatch, tmp_path):
+    """A healthy probe must NOT clear ok=false while a newer snapshot is
+    still failing to deliver to this device.
+
+    Scenario (Codex review P2): a newer snapshot S2 failed to push to the
+    device (transport), so `_push_failures[device] > 0` and the per-device
+    state is ok=false. The firmware still holds the older, successfully
+    pushed S1 — which equals `_last_pushed_snapshot` — so the probe body
+    is *not* diverged. An unconditional ok=true here would mask the real
+    failed delivery of S2 until the next push attempt flips it back.
+
+    The clear is gated on there being no pending failed push for the
+    device, so the failure stays visible to `burnscope status`.
+    """
+    monkeypatch.setenv("BURNSCOPE_STATE_DIR", str(tmp_path))
+
+    device = PairedDevice(device_id="burnscope-y", host="192.168.1.6:80")
+    # Pusher recorded a failed delivery of the newer snapshot.
+    host_cache.write_push_state("codex", ok=False, device_id="burnscope-y")
+
+    daemon = CodexDaemon()
+    daemon._last_pushed_snapshot = _snapshot()  # S1 — what the firmware holds
+    daemon._push_failures["burnscope-y"] = 1  # S2 delivery still failing
+
+    diverged: list[PairedDevice] = []
+    # Body matches S1 (last successfully pushed) → not diverged.
+    daemon._mark_health_ok(device, _in_sync_health_body(), diverged)
+
+    assert diverged == []
+    # The pending failed push must remain visible — not masked as healthy.
+    state = host_cache.read_push_state("codex", device_id="burnscope-y")
+    assert state is not None
+    assert state["ok"] is False

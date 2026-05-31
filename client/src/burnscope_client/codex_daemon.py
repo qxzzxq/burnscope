@@ -643,20 +643,28 @@ class CodexDaemon:
         body: dict,
         diverged_devices: list[PairedDevice],
     ) -> None:
-        """Record a successful health probe — clear the counter, persist
-        ok=True, then check whether the firmware diverged from
-        `_last_pushed_snapshot`.
+        """Record a successful health probe — clear the counter, then
+        either flag a divergence re-push or clear a stale ok=False.
 
-        Persisting ok=True here is what lets a device recover its
-        per-device push state after a transient blip. If it comes back at
-        the *same* host with the firmware still in sync, neither the
-        host-change heal nor a divergence re-push fires, so this plain
-        healthy probe is the only thing that can clear a stale ok=False
-        — an idle codex never re-pushes to refresh it. Later writes in the
-        same cycle still take precedence by running after this: a device
-        found in an unresolved duplicate-host group is overwritten back to
-        ok=False by the caller, and a diverged device is corrected by the
-        subsequent targeted re-push.
+        Clearing ok=True here is what lets a device recover its per-device
+        push state after a transient blip. If it comes back at the *same*
+        host with the firmware still in sync, neither the host-change heal
+        nor a divergence re-push fires, so this plain healthy probe is the
+        only thing that can clear a stale ok=False — an idle codex never
+        re-pushes to refresh it.
+
+        But the clear is gated on two conditions so it can't mask a real
+        failure:
+
+          * not diverged — the firmware matches what we last pushed; and
+          * `_push_failures[device] == 0` — no newer snapshot is currently
+            failing to deliver to this device. Otherwise (Codex review P2)
+            a newer snapshot S2 that transport-failed leaves the firmware
+            holding the older, successfully-pushed S1 (== last-pushed, so
+            *not* diverged); an unconditional ok=True would hide S2's
+            failed delivery until the next push attempt. A diverged device
+            is instead appended for the caller's targeted re-push, which
+            writes the true per-device outcome.
 
         Compare against `_last_pushed_snapshot` (the anchored value the
         firmware actually has), not `_last_snapshot` (the raw value from
@@ -664,14 +672,15 @@ class CodexDaemon:
         a spurious divergence here every cycle.
         """
         self._health_failures.pop(device.device_id, None)
-        host_cache.write_push_state(
-            AGENT_NAME, ok=True, device_id=device.device_id
-        )
         if (
             self._last_pushed_snapshot is not None
             and _firmware_diverged(body, self._last_pushed_snapshot)
         ):
             diverged_devices.append(device)
+        elif self._push_failures.get(device.device_id, 0) == 0:
+            host_cache.write_push_state(
+                AGENT_NAME, ok=True, device_id=device.device_id
+            )
 
     def _record_health_failure(self, device: PairedDevice) -> None:
         """Persist a health-probe failure for `device` without evicting.

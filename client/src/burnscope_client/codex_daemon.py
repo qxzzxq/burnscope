@@ -629,6 +629,8 @@ class CodexDaemon:
                         [d.device_id for d in diverged_devices],
                         [d.device_id for d in verified_rebind],
                     )
+                    # `_push_to_devices` writes its own aggregate via
+                    # `overall_ok`, so the aggregate is reconciled there.
                     await self._push_to_devices(
                         self._last_pushed_snapshot, repush_devices, client
                     )
@@ -636,6 +638,31 @@ class CodexDaemon:
                     # Aggregate ok=False when nothing was verifiably healthy
                     # in either round and there's no re-push to fix it up.
                     host_cache.write_push_state(AGENT_NAME, ok=False)
+                else:
+                    # `any_ok` is true and nothing needs a re-push. Clear any
+                    # stale aggregate ok=False left by an earlier transient
+                    # miss — otherwise the aggregate only ever gets written
+                    # false (the `not any_ok` branch never had a true
+                    # counterpart), so a recovered fleet shows per-device
+                    # green but aggregate red indefinitely (Codex review P2
+                    # round 2). Gate on the whole fleet being healthy this
+                    # cycle so a genuinely degraded peer still surfaces:
+                    #   * a device that failed its initial probe but healed in
+                    #     round 2 is in `failed_devices` yet now ok, so
+                    #     subtract `healed`;
+                    #   * any unverified-rebind device left in `rebind_devices`
+                    #     (verified ones went through the re-push branch above)
+                    #     is still down;
+                    #   * `unverified` duplicate-host devices were just written
+                    #     ok=False and must not be papered over.
+                    still_failed = {
+                        d.device_id for d in failed_devices
+                    } - healed
+                    any_unhealthy = bool(
+                        still_failed or rebind_devices or unverified
+                    )
+                    if not any_unhealthy:
+                        host_cache.write_push_state(AGENT_NAME, ok=True)
 
     def _mark_health_ok(
         self,

@@ -13,7 +13,11 @@ down indefinitely.
 
 from __future__ import annotations
 
-from burnscope_client import host_cache
+import asyncio
+
+import pytest
+
+from burnscope_client import codex_daemon, host_cache
 from burnscope_client.codex_daemon import CodexDaemon
 from burnscope_client.host_cache import PairedDevice
 from burnscope_client.schema import AgentSnapshot, SessionSnapshot
@@ -113,3 +117,61 @@ def test_mark_health_ok_does_not_mask_pending_failed_push(monkeypatch, tmp_path)
     state = host_cache.read_push_state("codex", device_id="burnscope-y")
     assert state is not None
     assert state["ok"] is False
+
+
+async def test_health_loop_clears_stale_aggregate_when_all_healthy(
+    monkeypatch, tmp_path
+):
+    """A healthy cycle must clear a stale *aggregate* ok=false too.
+
+    Codex review P2 (round 2): a transient miss writes both the per-device
+    and the aggregate `last-push.codex` as ok=false. The health loop only
+    ever wrote the aggregate false (and only via the `not any_ok` branch);
+    once a device healed, `any_ok` became true and that branch was skipped,
+    so the aggregate stayed down indefinitely even though every device was
+    healthy. `burnscope status` showed a partial recovery: per-device green,
+    aggregate red.
+
+    Drive the loop with a single device that probes healthy and in-sync,
+    starting from a stale aggregate failure; the aggregate must flip back
+    to true.
+    """
+    monkeypatch.setenv("BURNSCOPE_STATE_DIR", str(tmp_path))
+
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+    daemon._last_pushed_snapshot = _snapshot()
+    host_cache.add_paired_device("codex", PairedDevice("dev-A", "10.0.0.5:80"))
+    # Stale aggregate failure left by an earlier transient miss.
+    host_cache.write_push_state("codex", ok=False)
+
+    async def fake_fetch_health(host, client_id, client):
+        return _in_sync_health_body()
+
+    monkeypatch.setattr(codex_daemon, "fetch_health", fake_fetch_health)
+    monkeypatch.setattr(codex_daemon, "HEALTH_INTERVAL_S", 0.005)
+
+    async def fake_discover_all(timeout=4.0, agent=None, zc=None):
+        return []
+
+    monkeypatch.setattr(codex_daemon, "discover_all", fake_discover_all)
+    from burnscope_client import pusher as pusher_mod
+
+    monkeypatch.setattr(pusher_mod, "discover_all", fake_discover_all)
+
+    task = asyncio.create_task(daemon._health_loop())
+    try:
+        for _ in range(200):
+            agg = host_cache.read_push_state("codex")
+            if agg is not None and agg["ok"] is True:
+                break
+            await asyncio.sleep(0.005)
+        else:
+            raise AssertionError("aggregate never cleared to true")
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert host_cache.read_push_state("codex")["ok"] is True
+    assert host_cache.read_push_state("codex", device_id="dev-A")["ok"] is True

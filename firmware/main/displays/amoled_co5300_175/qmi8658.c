@@ -42,7 +42,7 @@ static const char *TAG = "qmi8658";
  * 1.43" profile uses. On the 1.75" board the LowPower_21Hz mode produced
  * a large (~0.8 g) DC offset on the accel X axis that broke orientation;
  * normal mode reads true gravity. ±2 g @ 250 Hz is ample for the 10 Hz
- * orientation watcher + ~21 Hz motion sampler, and matches the spirit of
+ * orientation watcher and motion sampler (both 10 Hz), and matches the spirit of
  * the vendor demo (which runs normal ODR, not LowPower). */
 #define CTRL2_2G_NORM_250HZ   0x05   /* aFS=±2g (000) | aODR=250 Hz (0x5) */
 /* Accel low-pass filter, mode 0 (≈2.66% of ODR), enabled — matches the

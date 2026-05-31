@@ -654,12 +654,26 @@ class CodexDaemon:
                     #     (verified ones went through the re-push branch above)
                     #     is still down;
                     #   * `unverified` duplicate-host devices were just written
-                    #     ok=False and must not be papered over.
+                    #     ok=False and must not be papered over;
+                    #   * a probed-healthy device with a still-pending push
+                    #     failure was deliberately left ok=False by
+                    #     `_mark_health_ok` (its newest snapshot is undelivered)
+                    #     — it must keep the aggregate red too, or aggregate=True
+                    #     would contradict every per-device ok=False (Codex
+                    #     review P2 round 3).
                     still_failed = {
                         d.device_id for d in failed_devices
                     } - healed
+                    push_pending = {
+                        d.device_id
+                        for d in ok_devices
+                        if self._push_failures.get(d.device_id, 0) > 0
+                    }
                     any_unhealthy = bool(
-                        still_failed or rebind_devices or unverified
+                        still_failed
+                        or rebind_devices
+                        or unverified
+                        or push_pending
                     )
                     if not any_unhealthy:
                         host_cache.write_push_state(AGENT_NAME, ok=True)

@@ -175,3 +175,58 @@ async def test_health_loop_clears_stale_aggregate_when_all_healthy(
 
     assert host_cache.read_push_state("codex")["ok"] is True
     assert host_cache.read_push_state("codex", device_id="dev-A")["ok"] is True
+
+
+async def test_health_loop_keeps_aggregate_red_while_push_pending(
+    monkeypatch, tmp_path
+):
+    """A healthy probe must not flip the aggregate green while a newer
+    snapshot is still undelivered to a device.
+
+    Codex review P2 (round 3): when snapshot S2 failed to push to the
+    device, `_push_failures[device] > 0` and `_mark_health_ok` leaves the
+    per-device state ok=false (round-1 gate). But the device still probes
+    healthy at the HTTP level, so it lands in `ok_devices` and `any_ok` is
+    true. The aggregate branch must mirror the per-device gate — a probed-
+    healthy device with a pending push failure keeps the aggregate red —
+    or aggregate=true would contradict every per-device ok=false.
+    """
+    monkeypatch.setenv("BURNSCOPE_STATE_DIR", str(tmp_path))
+
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+    daemon._last_pushed_snapshot = _snapshot()  # S1 — what the firmware holds
+    host_cache.add_paired_device("codex", PairedDevice("dev-A", "10.0.0.5:80"))
+    # Newer snapshot S2 failed to deliver: pending failure + ok=false on both
+    # the per-device and aggregate files.
+    daemon._push_failures["dev-A"] = 1
+    host_cache.write_push_state("codex", ok=False, device_id="dev-A")
+    host_cache.write_push_state("codex", ok=False)
+
+    async def fake_fetch_health(host, client_id, client):
+        return _in_sync_health_body()
+
+    monkeypatch.setattr(codex_daemon, "fetch_health", fake_fetch_health)
+    monkeypatch.setattr(codex_daemon, "HEALTH_INTERVAL_S", 0.005)
+
+    async def fake_discover_all(timeout=4.0, agent=None, zc=None):
+        return []
+
+    monkeypatch.setattr(codex_daemon, "discover_all", fake_discover_all)
+    from burnscope_client import pusher as pusher_mod
+
+    monkeypatch.setattr(pusher_mod, "discover_all", fake_discover_all)
+
+    task = asyncio.create_task(daemon._health_loop())
+    try:
+        # Let several cycles run; a buggy aggregate-true write would land.
+        await asyncio.sleep(0.05)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    # Newest snapshot still undelivered → aggregate must stay red...
+    assert host_cache.read_push_state("codex")["ok"] is False
+    # ...and so must the per-device entry.
+    assert host_cache.read_push_state("codex", device_id="dev-A")["ok"] is False

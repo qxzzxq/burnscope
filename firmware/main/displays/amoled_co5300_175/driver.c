@@ -19,10 +19,11 @@
  *
  * The board carries a QMI8658 IMU (see qmi8658.c / orientation.c) for
  * auto-rotate + motion-wake, and a CST9217 capacitive touch controller
- * (see touch.c) used as a burn-in touch-wake source. The AXP2101 PMIC is
- * out of scope for this profile pass; the panel RST is a direct GPIO (39)
- * and the panel rail is on by the board's power-on defaults (verified —
- * first light works with no PMIC code).
+ * (see touch.c) used as a burn-in touch-wake source. The AXP2101 PMIC's
+ * power rails are left untouched — the panel RST is a direct GPIO (39) and
+ * the panel rail is on by the board's power-on defaults (verified — first
+ * light works with no rail code). Its battery/charger telemetry is read
+ * (read-only) for the UI's battery indicator (see axp2101.c).
  */
 
 #include "driver.h"

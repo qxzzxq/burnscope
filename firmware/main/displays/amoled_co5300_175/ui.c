@@ -37,6 +37,7 @@
 #include "lvgl.h"
 #include "nvs.h"
 
+#include "axp2101.h"
 #include "burn_idle_adapter.h"
 #include "driver.h"
 #include "nvs_store.h"
@@ -79,6 +80,9 @@ static const char *TAG = "render";
 #define AMOLED_CORE_CHIP_PAD_V         3
 #define AMOLED_CORE_COUNTDOWN_GAP      10    /* gap between % and countdown */
 
+/* Battery indicator centre — in the clear band between the secondary %
+ * (AMOLED_CORE_SECONDARY_Y) and the footer (AMOLED_FOOTER_UPDATED_Y). */
+#define AMOLED_BATTERY_Y               367
 #define AMOLED_FOOTER_UPDATED_Y        410   /* top footer line centre */
 #define AMOLED_FOOTER_EMAIL_Y          430   /* bottom footer line centre */
 #define AMOLED_FOOTER_WIDTH            420   /* ellipsis clamp width */
@@ -100,6 +104,17 @@ static lv_obj_t *s_core_secondary      = NULL;  /* M36 percentage    */
 static lv_obj_t *s_core_secondary_cd   = NULL;
 static lv_obj_t *s_footer_updated      = NULL;  /* "updated N ago"   */
 static lv_obj_t *s_footer_email        = NULL;  /* client_id         */
+static lv_obj_t *s_battery_label       = NULL;  /* AXP2101 % + glyph, above footer */
+
+/* Battery telemetry. `s_battery_ok` is the one-shot result of axp2101_init
+ * (false when no AXP2101 / no PMU board); `s_battery` is the last good
+ * reading and `s_battery_valid` gates whether we have one yet. The I2C
+ * sample cadence (10 s, in the tick) is decoupled from the paint
+ * (apply_battery_locked, called on agent swap + after each sample) so a
+ * 5 s cycle swap doesn't trigger an I2C read. */
+static bool             s_battery_ok    = false;
+static bool             s_battery_valid = false;
+static axp2101_status_t s_battery       = { 0 };
 
 typedef struct {
     lv_obj_t *arc;
@@ -419,6 +434,17 @@ static void build_agent_screen(void)
     lv_obj_align(s_footer_email, LV_ALIGN_TOP_MID, 0,
                  AMOLED_FOOTER_EMAIL_Y - 8);
 
+    /* Battery indicator — a battery/charge glyph + percentage centred in
+     * the clear band between the secondary % and the footer. Hidden until
+     * a reading lands (and stays hidden on boards with no battery, see
+     * apply_battery_locked). M16 to match the chips/footer. */
+    s_battery_label = lv_label_create(scr);
+    lv_label_set_text(s_battery_label, "");
+    lv_obj_set_style_text_font(s_battery_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(s_battery_label, lv_color_hex(0x8A8A8A), 0);
+    lv_obj_add_flag(s_battery_label, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_align(s_battery_label, LV_ALIGN_TOP_MID, 0, AMOLED_BATTERY_Y - 8);
+
     s_agent_screen = scr;
 }
 
@@ -446,6 +472,57 @@ static void render_footer_locked(const agent_snapshot_t *snap)
     /* format_updated_relative writes "" when the wall clock is unsynced —
      * that already gives us the "top empty" state. */
     lv_label_set_text(s_footer_updated, buf);
+}
+
+/* Read a fresh AXP2101 snapshot into the cache. No-op — leaving the
+ * previous reading intact — when the PMU is absent or the I2C read fails,
+ * so a transient bus hiccup doesn't blank the indicator. Does its own
+ * I2C, so callers should throttle it (see the 10 s tick block). */
+static void sample_battery(void)
+{
+    if (!s_battery_ok) return;
+    axp2101_status_t st;
+    if (axp2101_read(&st)) {
+        s_battery = st;
+        s_battery_valid = true;
+    }
+}
+
+/* Paint the battery label from the cached reading. Hidden when the PMU is
+ * absent, no reading has landed yet, or no pack is connected (USB-only
+ * power). Picks a charge/battery glyph by level and tints a low,
+ * not-charging pack red. Caller must hold lvgl_port_lock. */
+static void apply_battery_locked(void)
+{
+    if (s_battery_label == NULL) return;
+    if (!s_battery_ok || !s_battery_valid || !s_battery.present) {
+        lv_obj_add_flag(s_battery_label, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+
+    int pct = s_battery.percent;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+
+    const char *glyph;
+    if (s_battery.charging) glyph = LV_SYMBOL_CHARGE;
+    else if (pct >= 88)     glyph = LV_SYMBOL_BATTERY_FULL;
+    else if (pct >= 63)     glyph = LV_SYMBOL_BATTERY_3;
+    else if (pct >= 38)     glyph = LV_SYMBOL_BATTERY_2;
+    else if (pct >= 13)     glyph = LV_SYMBOL_BATTERY_1;
+    else                    glyph = LV_SYMBOL_BATTERY_EMPTY;
+
+    uint32_t color;
+    if (s_battery.charging) color = 0x7FB069;  /* charging — soft green   */
+    else if (pct < 15)      color = 0xE05A4F;  /* low, uncharging — red    */
+    else                    color = 0x8A8A8A;  /* normal — dim grey        */
+    lv_obj_set_style_text_color(s_battery_label, lv_color_hex(color), 0);
+
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%s %d%%", glyph, pct);
+    lv_label_set_text(s_battery_label, buf);
+    lv_obj_clear_flag(s_battery_label, LV_OBJ_FLAG_HIDDEN);
+    recenter_at(s_battery_label, AMOLED_BATTERY_Y);
 }
 
 /* Render one (chip, %-label, countdown-label) stack from a
@@ -561,6 +638,7 @@ static void show_agent_locked(const agent_snapshot_t *snap)
 {
     refresh_footer_cid(snap->agent);
     render_snapshot_locked(snap);
+    apply_battery_locked();
     strncpy(s_visible_agent, snap->agent, sizeof(s_visible_agent) - 1);
     s_visible_agent[sizeof(s_visible_agent) - 1] = '\0';
     lv_screen_load(s_agent_screen);
@@ -614,6 +692,10 @@ static void tick_lvgl_cb(lv_timer_t *t)
             for (size_t i = 0; i < FOOTER_AGENT_COUNT; ++i) {
                 refresh_footer_cid(FOOTER_AGENTS[i]);
             }
+            /* Battery moves slowly — resample on the same 10 s cadence as
+             * the footer, then repaint the indicator from the cache. */
+            sample_battery();
+            apply_battery_locked();
         }
     }
     if (snapshot_store_count() >= 2) {
@@ -666,6 +748,12 @@ void display_profile_init(void)
 
     lv_display_t *disp = amoled_co5300_175_driver_init();
     touch_init();
+    /* AXP2101 battery telemetry shares the touch/IMU I2C0 bus. Probe it
+     * here and take one reading so the indicator is warm before the agent
+     * screen first shows; false (no PMU / no board support) leaves the
+     * indicator permanently hidden. */
+    s_battery_ok = axp2101_init();
+    sample_battery();
 
     if (!lvgl_port_lock(0)) {
         ESP_LOGE(TAG, "lvgl_port_lock failed during init");

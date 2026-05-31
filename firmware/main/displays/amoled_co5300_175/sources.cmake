@@ -4,6 +4,7 @@ if(CONFIG_BURNSCOPE_DISPLAY_AMOLED_CO5300_175)
         "displays/amoled_co5300_175/ui.c"
         "displays/amoled_co5300_175/touch.c"
         "displays/amoled_co5300_175/qmi8658.c"
+        "displays/amoled_co5300_175/axp2101.c"
         "displays/amoled_co5300_175/burn_idle_adapter.c"
         "displays/amoled_co5300_175/orientation.c"
         # 70×70 brand icons are AMOLED-only — same assets the 1.43"

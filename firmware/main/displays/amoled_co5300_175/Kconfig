@@ -4,9 +4,10 @@ config BURNSCOPE_DISPLAY_AMOLED_CO5300_175
     help
         The Waveshare ESP32-S3-Touch-AMOLED-1.75" board: a 466x466 round
         AMOLED on a CO5300 controller over QSPI. Same pixel grid and UI
-        as the 1.43" profile, but CO5300-only (no SH8601 fallback),
-        different GPIO pins, and no IMU. Touch (CST9217) and the AXP2101
-        PMIC are not driven by this profile pass. Links against the same
+        as the 1.43" profile, but CO5300-only (no SH8601 fallback) and
+        different GPIO pins. The AXP2101 PMIC's power rails are left at the
+        board's defaults; its battery telemetry is read (read-only) for
+        the UI battery indicator (axp2101.c). Links against the same
         `esp_lcd_sh8601` managed component (it frames QSPI for the whole
         SH8601/CO5300 family).
 
@@ -34,7 +35,7 @@ menu "AMOLED burn-in mitigation"
 
     config BURNSCOPE_AMOLED_IDLE_DIM_MINUTES
         int "Minutes of idle before dimming the panel"
-        default 5
+        default 3
         range 1 60
         help
             After this many minutes with no activity event (button or
@@ -44,7 +45,7 @@ menu "AMOLED burn-in mitigation"
 
     config BURNSCOPE_AMOLED_IDLE_OFF_MINUTES
         int "Minutes of idle before turning the panel off"
-        default 30
+        default 15
         range 1 240
         help
             After this many minutes idle the burn-in adapter issues

@@ -158,6 +158,21 @@ def test_compute_aggregate_ok_false_when_any_device_failing():
     assert host_cache.compute_aggregate_ok("claude") is False
 
 
+def test_compute_aggregate_ok_failure_outranks_missing_state():
+    """A known per-device failure must not be masked by a freshly-paired
+    device that has no recorded outcome yet (e.g. just after `burnscope
+    pair`). Failure dominates pending — otherwise the statusline would flip
+    from ✗ to … on a pair and hide a real problem. The missing-state device
+    is ordered first to prove a pending entry seen before the failure does
+    not short-circuit to None (Codex review P2).
+    """
+    host_cache.add_paired_device("claude", PairedDevice("dev-new", "10.0.0.6:80"))
+    host_cache.add_paired_device("claude", PairedDevice("dev-fail", "10.0.0.5:80"))
+    # dev-new has no per-device state yet; dev-fail already failed.
+    host_cache.write_push_state("claude", ok=False, device_id="dev-fail")
+    assert host_cache.compute_aggregate_ok("claude") is False
+
+
 def test_compute_aggregate_ok_is_per_agent():
     host_cache.add_paired_device("claude", PairedDevice("c1", "10.0.0.5:80"))
     host_cache.write_push_state("claude", ok=True, device_id="c1")

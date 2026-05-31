@@ -61,7 +61,8 @@ def test_foreground_renders_with_pending_indicator(monkeypatch, capsys):
 
 
 def test_foreground_uses_check_indicator_after_successful_push(monkeypatch, capsys):
-    host_cache.write_push_state("claude", ok=True)
+    host_cache.add_paired_device("claude", PairedDevice("dev-a", "10.0.0.5:80"))
+    host_cache.write_push_state("claude", ok=True, device_id="dev-a")
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(_payload())))
     monkeypatch.setattr(claude_statusline.subprocess, "Popen", MagicMock())
 
@@ -70,7 +71,8 @@ def test_foreground_uses_check_indicator_after_successful_push(monkeypatch, caps
 
 
 def test_foreground_uses_cross_indicator_after_failed_push(monkeypatch, capsys):
-    host_cache.write_push_state("claude", ok=False)
+    host_cache.add_paired_device("claude", PairedDevice("dev-a", "10.0.0.5:80"))
+    host_cache.write_push_state("claude", ok=False, device_id="dev-a")
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(_payload())))
     monkeypatch.setattr(claude_statusline.subprocess, "Popen", MagicMock())
 
@@ -165,7 +167,7 @@ def test_push_uses_cached_paired_list_without_discovery(monkeypatch):
     rc = claude_statusline.main(["--push"])
     assert rc == 0
     assert {d.device_id for d in seen_devices} == {"dev-a", "dev-b"}
-    assert host_cache.read_push_state("claude")["ok"] is True
+    assert host_cache.compute_aggregate_ok("claude") is True
     assert host_cache.read_push_state("claude", device_id="dev-a")["ok"] is True
 
 
@@ -257,7 +259,7 @@ def test_push_silently_drops_device_on_401(monkeypatch):
     assert host_cache.read_push_state("claude", device_id="dev-drop") is None
     assert host_cache.read_push_state("claude", device_id="dev-keep")["ok"] is True
     # Aggregate must reflect only still-paired devices (#23).
-    assert host_cache.read_push_state("claude")["ok"] is True
+    assert host_cache.compute_aggregate_ok("claude") is True
 
 
 def test_push_keeps_device_on_transport_error(monkeypatch):
@@ -277,7 +279,7 @@ def test_push_keeps_device_on_transport_error(monkeypatch):
     paired = {d.device_id for d in host_cache.load_paired_devices("claude")}
     assert paired == {"dev-flaky"}
     assert host_cache.read_push_state("claude", device_id="dev-flaky")["ok"] is False
-    assert host_cache.read_push_state("claude")["ok"] is False
+    assert host_cache.compute_aggregate_ok("claude") is False
 
 
 def test_push_writes_aggregate_ok_only_when_every_device_succeeds(monkeypatch):
@@ -296,7 +298,7 @@ def test_push_writes_aggregate_ok_only_when_every_device_succeeds(monkeypatch):
     )
 
     claude_statusline.main(["--push"])
-    assert host_cache.read_push_state("claude")["ok"] is False
+    assert host_cache.compute_aggregate_ok("claude") is False
 
 
 @respx.mock
@@ -326,7 +328,7 @@ def test_push_recovers_when_device_ip_changed(monkeypatch):
     assert host_cache.load_paired_devices("claude") == [
         PairedDevice("dev-moved", "10.0.0.9:80")
     ]
-    assert host_cache.read_push_state("claude")["ok"] is True
+    assert host_cache.compute_aggregate_ok("claude") is True
     assert host_cache.read_push_state("claude", device_id="dev-moved")["ok"] is True
 
 
@@ -359,7 +361,7 @@ def test_push_returns_failure_when_no_devices_and_discovery_empty(monkeypatch):
 
     rc = claude_statusline.main(["--push"])
     assert rc == 1
-    assert host_cache.read_push_state("claude")["ok"] is False
+    assert host_cache.compute_aggregate_ok("claude") is None
 
 
 def test_push_writes_fail_when_identity_unavailable(monkeypatch):
@@ -371,7 +373,7 @@ def test_push_writes_fail_when_identity_unavailable(monkeypatch):
 
     rc = claude_statusline.main(["--push"])
     assert rc == 1
-    assert host_cache.read_push_state("claude")["ok"] is False
+    assert host_cache.compute_aggregate_ok("claude") is None
 
 
 def test_push_migrates_legacy_host_file(monkeypatch, _isolate_state):
@@ -423,7 +425,7 @@ def test_push_marks_duplicate_host_devices_unverified_even_on_http_success(
     assert paired == {"dev-a", "dev-b"}
     # Aggregate dishonest if we marked them healthy.
     assert rc == 1
-    assert host_cache.read_push_state("claude")["ok"] is False
+    assert host_cache.compute_aggregate_ok("claude") is False
     assert host_cache.read_push_state("claude", device_id="dev-a")["ok"] is False
     assert host_cache.read_push_state("claude", device_id="dev-b")["ok"] is False
 

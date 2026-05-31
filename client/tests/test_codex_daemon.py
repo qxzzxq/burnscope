@@ -607,11 +607,12 @@ async def test_pusher_loop_fans_out_and_writes_per_device_state(monkeypatch):
     )
     await _drain_one_push(
         daemon,
-        predicate=lambda: host_cache.read_push_state("codex") is not None,
+        predicate=lambda: host_cache.compute_aggregate_ok("codex") is not None,
     )
 
     assert seen and set(seen[0]) == {"dev-a", "dev-b"}
-    assert host_cache.read_push_state("codex")["ok"] is True
+    # Aggregate is derived from the per-device files, not stored.
+    assert host_cache.compute_aggregate_ok("codex") is True
     assert host_cache.read_push_state("codex", device_id="dev-a")["ok"] is True
     assert host_cache.read_push_state("codex", device_id="dev-b")["ok"] is True
 
@@ -649,10 +650,11 @@ async def test_pusher_loop_silently_drops_device_on_401(monkeypatch):
     assert remaining == {"dev-keep"}
 
 
-async def test_pusher_loop_aggregate_false_when_all_devices_dropped(monkeypatch):
-    # If every paired device returns 401 (or otherwise gets dropped), the
-    # post-push state mirrors "no paired devices" — and `_push_one` writes
-    # ok=False for that case at line ~340. The fan-out branch must agree.
+async def test_pusher_loop_aggregate_pending_when_all_devices_dropped(monkeypatch):
+    # If every paired device returns 401, all are evicted. With the
+    # aggregate derived from the per-device files, an empty paired list
+    # yields "pending" (None), not a failure — there is nothing left to
+    # be unhealthy. (Before deriving, this wrote a stored ok=False.)
     daemon = CodexDaemon()
     daemon._client_id = "u@example.com"
     host_cache.add_paired_device("codex", PairedDevice("dev-a", "10.0.0.5:80"))
@@ -672,13 +674,11 @@ async def test_pusher_loop_aggregate_false_when_all_devices_dropped(monkeypatch)
     )
     await _drain_one_push(
         daemon,
-        predicate=lambda: host_cache.read_push_state("codex") is not None
-        and not host_cache.load_paired_devices("codex"),
+        predicate=lambda: not host_cache.load_paired_devices("codex"),
     )
 
     assert host_cache.load_paired_devices("codex") == []
-    aggregate = host_cache.read_push_state("codex")
-    assert aggregate is not None and aggregate["ok"] is False
+    assert host_cache.compute_aggregate_ok("codex") is None
 
 
 async def test_pusher_loop_keeps_device_and_records_failure_on_transport(monkeypatch):
@@ -706,7 +706,7 @@ async def test_pusher_loop_keeps_device_and_records_failure_on_transport(monkeyp
     )
     await _drain_one_push(
         daemon,
-        predicate=lambda: host_cache.read_push_state("codex") is not None,
+        predicate=lambda: host_cache.compute_aggregate_ok("codex") is not None,
     )
 
     # Device stays in the paired list — transport failure isn't ownership.
@@ -714,7 +714,7 @@ async def test_pusher_loop_keeps_device_and_records_failure_on_transport(monkeyp
         "dev-flaky"
     }
     assert host_cache.read_push_state("codex", device_id="dev-flaky")["ok"] is False
-    assert host_cache.read_push_state("codex")["ok"] is False
+    assert host_cache.compute_aggregate_ok("codex") is False
 
 
 async def test_pusher_loop_recovers_when_device_ip_changed(monkeypatch):
@@ -761,8 +761,7 @@ async def test_pusher_loop_recovers_when_device_ip_changed(monkeypatch):
     )
     await _drain_one_push(
         daemon,
-        predicate=lambda: host_cache.read_push_state("codex") is not None
-        and host_cache.read_push_state("codex")["ok"] is True,
+        predicate=lambda: host_cache.compute_aggregate_ok("codex") is True,
     )
 
     assert "10.0.0.5:80" in seen_hosts  # initial fan-out hit the stale host
@@ -770,7 +769,7 @@ async def test_pusher_loop_recovers_when_device_ip_changed(monkeypatch):
     assert host_cache.load_paired_devices("codex") == [
         PairedDevice("dev-moved", "10.0.0.9:80")
     ]
-    assert host_cache.read_push_state("codex")["ok"] is True
+    assert host_cache.compute_aggregate_ok("codex") is True
     # Push-failure counter must NOT advance — the failure was healed.
     assert daemon._push_failures.get("dev-moved", 0) == 0
 
@@ -1153,8 +1152,8 @@ async def test_push_one_advances_last_pushed_snapshot_on_partial_success(monkeyp
     # Baseline advanced — dev-ok got the snapshot, so a follow-up poll
     # with the same data must dedupe out instead of pummeling dev-ok.
     assert daemon._last_pushed_snapshot is snap
-    # Aggregate `ok` still reports the truth that one device is unhealthy.
-    assert host_cache.read_push_state("codex")["ok"] is False
+    # Derived aggregate still reports the truth that one device is unhealthy.
+    assert host_cache.compute_aggregate_ok("codex") is False
     # Flaky peer is still paired (transport failure, not auth) and its
     # diagnostic push-failure counter has advanced by one. Per the mDNS
     # resilience plan the counter never drives eviction — it's just for
@@ -1448,7 +1447,7 @@ async def test_pusher_loop_marks_duplicate_host_devices_unverified(monkeypatch):
     )
     await _drain_one_push(
         daemon,
-        predicate=lambda: host_cache.read_push_state("codex") is not None,
+        predicate=lambda: host_cache.compute_aggregate_ok("codex") is not None,
     )
 
     # Both still paired (no eviction on conflict).
@@ -1457,7 +1456,7 @@ async def test_pusher_loop_marks_duplicate_host_devices_unverified(monkeypatch):
     # Neither claimed healthy from the shared HTTP response.
     assert host_cache.read_push_state("codex", device_id="dev-a")["ok"] is False
     assert host_cache.read_push_state("codex", device_id="dev-b")["ok"] is False
-    assert host_cache.read_push_state("codex")["ok"] is False
+    assert host_cache.compute_aggregate_ok("codex") is False
 
 
 async def test_health_loop_treats_device_id_mismatch_as_identity_conflict(

@@ -119,22 +119,18 @@ def test_mark_health_ok_does_not_mask_pending_failed_push(monkeypatch, tmp_path)
     assert state["ok"] is False
 
 
-async def test_health_loop_clears_stale_aggregate_when_all_healthy(
+async def test_health_loop_clears_stale_failure_so_derived_aggregate_recovers(
     monkeypatch, tmp_path
 ):
-    """A healthy cycle must clear a stale *aggregate* ok=false too.
+    """End-to-end: a device with a stale per-device ok=false that probes
+    healthy and in-sync recovers, and the *derived* aggregate follows.
 
-    Codex review P2 (round 2): a transient miss writes both the per-device
-    and the aggregate `last-push.codex` as ok=false. The health loop only
-    ever wrote the aggregate false (and only via the `not any_ok` branch);
-    once a device healed, `any_ok` became true and that branch was skipped,
-    so the aggregate stayed down indefinitely even though every device was
-    healthy. `burnscope status` showed a partial recovery: per-device green,
-    aggregate red.
-
-    Drive the loop with a single device that probes healthy and in-sync,
-    starting from a stale aggregate failure; the aggregate must flip back
-    to true.
+    History: rounds 2 and 3 of review were about a separately-*stored*
+    aggregate going stale relative to the per-device files. That whole bug
+    class is gone now — the aggregate is derived from the per-device files
+    by `compute_aggregate_ok`, so it cannot disagree with them. This test
+    keeps the integration angle: the health loop heals the per-device
+    entry, and the derived aggregate reads True as a consequence.
     """
     monkeypatch.setenv("BURNSCOPE_STATE_DIR", str(tmp_path))
 
@@ -142,8 +138,10 @@ async def test_health_loop_clears_stale_aggregate_when_all_healthy(
     daemon._client_id = "u@example.com"
     daemon._last_pushed_snapshot = _snapshot()
     host_cache.add_paired_device("codex", PairedDevice("dev-A", "10.0.0.5:80"))
-    # Stale aggregate failure left by an earlier transient miss.
-    host_cache.write_push_state("codex", ok=False)
+    # Stale per-device failure from an earlier transient miss; aggregate
+    # currently derives False because of it.
+    host_cache.write_push_state("codex", ok=False, device_id="dev-A")
+    assert host_cache.compute_aggregate_ok("codex") is False
 
     async def fake_fetch_health(host, client_id, client):
         return _in_sync_health_body()
@@ -162,34 +160,33 @@ async def test_health_loop_clears_stale_aggregate_when_all_healthy(
     task = asyncio.create_task(daemon._health_loop())
     try:
         for _ in range(200):
-            agg = host_cache.read_push_state("codex")
-            if agg is not None and agg["ok"] is True:
+            if host_cache.compute_aggregate_ok("codex") is True:
                 break
             await asyncio.sleep(0.005)
         else:
-            raise AssertionError("aggregate never cleared to true")
+            raise AssertionError("derived aggregate never recovered to true")
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
 
-    assert host_cache.read_push_state("codex")["ok"] is True
+    assert host_cache.compute_aggregate_ok("codex") is True
     assert host_cache.read_push_state("codex", device_id="dev-A")["ok"] is True
 
 
 async def test_health_loop_keeps_aggregate_red_while_push_pending(
     monkeypatch, tmp_path
 ):
-    """A healthy probe must not flip the aggregate green while a newer
-    snapshot is still undelivered to a device.
+    """A healthy probe must not flip the device green while a newer
+    snapshot is still undelivered — so the derived aggregate stays red.
 
     Codex review P2 (round 3): when snapshot S2 failed to push to the
-    device, `_push_failures[device] > 0` and `_mark_health_ok` leaves the
-    per-device state ok=false (round-1 gate). But the device still probes
-    healthy at the HTTP level, so it lands in `ok_devices` and `any_ok` is
-    true. The aggregate branch must mirror the per-device gate — a probed-
-    healthy device with a pending push failure keeps the aggregate red —
-    or aggregate=true would contradict every per-device ok=false.
+    device, `_push_failures[device] > 0` and `_mark_health_ok` must leave
+    the per-device state ok=false even though the device probes healthy at
+    the HTTP level (its newest snapshot is undelivered). The aggregate is
+    now derived from the per-device files, so as long as `_mark_health_ok`
+    holds that gate, the aggregate cannot read green while a push is
+    pending — the round-3 invariant is preserved structurally.
     """
     monkeypatch.setenv("BURNSCOPE_STATE_DIR", str(tmp_path))
 
@@ -197,11 +194,10 @@ async def test_health_loop_keeps_aggregate_red_while_push_pending(
     daemon._client_id = "u@example.com"
     daemon._last_pushed_snapshot = _snapshot()  # S1 — what the firmware holds
     host_cache.add_paired_device("codex", PairedDevice("dev-A", "10.0.0.5:80"))
-    # Newer snapshot S2 failed to deliver: pending failure + ok=false on both
-    # the per-device and aggregate files.
+    # Newer snapshot S2 failed to deliver: pending failure + per-device
+    # ok=false (the aggregate is derived from this, not stored).
     daemon._push_failures["dev-A"] = 1
     host_cache.write_push_state("codex", ok=False, device_id="dev-A")
-    host_cache.write_push_state("codex", ok=False)
 
     async def fake_fetch_health(host, client_id, client):
         return _in_sync_health_body()
@@ -226,7 +222,7 @@ async def test_health_loop_keeps_aggregate_red_while_push_pending(
         with pytest.raises(asyncio.CancelledError):
             await task
 
-    # Newest snapshot still undelivered → aggregate must stay red...
-    assert host_cache.read_push_state("codex")["ok"] is False
-    # ...and so must the per-device entry.
+    # Newest snapshot still undelivered → per-device entry stays red...
     assert host_cache.read_push_state("codex", device_id="dev-A")["ok"] is False
+    # ...so the derived aggregate is red too.
+    assert host_cache.compute_aggregate_ok("codex") is False

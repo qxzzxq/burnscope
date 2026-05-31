@@ -500,6 +500,40 @@ def read_push_state(agent: str, *, device_id: str | None = None) -> dict | None:
     return parsed
 
 
+def compute_aggregate_ok(agent: str) -> bool | None:
+    """Derive the agent's overall push health from the per-device files.
+
+    The aggregate is a pure function of the per-device `last-push` state,
+    not separately stored: it is `all(device ok)` over the paired list.
+    Deriving it on read (rather than writing it from the many sites that
+    mutate per-device state) means the aggregate can never disagree with
+    the per-device files — the class of bug where one writer flips the
+    aggregate while another leaves a device red, and vice versa.
+
+    Returns:
+        * None  — undetermined (no devices paired yet, or at least one
+          paired device has no recorded push outcome). Callers render this
+          as "pending", never as a failure.
+        * True  — every paired device's last outcome was ok.
+        * False — at least one paired device's last outcome was not ok.
+
+    Note this reflects only *device* health. Collector-side preconditions
+    (missing client_id, unparseable input) are surfaced via exit codes and
+    logs, not by forcing this verdict false — they are not display faults.
+    """
+    devices = load_paired_devices(agent)
+    if not devices:
+        return None
+    ok = True
+    for device in devices:
+        state = read_push_state(agent, device_id=device.device_id)
+        if state is None:
+            return None
+        if not state.get("ok"):
+            ok = False
+    return ok
+
+
 # ------------------------------------------------------------- client_id cache
 
 def read_client_id(agent: str) -> str | None:

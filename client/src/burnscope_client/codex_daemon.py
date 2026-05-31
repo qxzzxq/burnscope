@@ -361,14 +361,15 @@ class CodexDaemon:
         self, snapshot: AgentSnapshot, client: httpx.AsyncClient
     ) -> None:
         if self._client_id is None:
+            # Collector precondition, not a device fault — surface via log
+            # only. The aggregate is derived from per-device state by
+            # `host_cache.compute_aggregate_ok`, never stored here.
             log.warning("no client_id; skipping push")
-            host_cache.write_push_state(AGENT_NAME, ok=False)
             return
 
         devices = await self._resolve_paired_devices(snapshot, client)
         if not devices:
             log.warning("no paired codex devices; skipping push")
-            host_cache.write_push_state(AGENT_NAME, ok=False)
             return
 
         await self._push_to_devices(snapshot, devices, client)
@@ -386,9 +387,10 @@ class CodexDaemon:
         through the queue + fan-out-to-all path.
 
         Updates per-device push state, evicts only on 401 (transport
-        failures are diagnostics-only per the mDNS resilience plan),
-        advances `_last_pushed_snapshot` on any device's success, and
-        writes the aggregate status.
+        failures are diagnostics-only per the mDNS resilience plan), and
+        advances `_last_pushed_snapshot` on any device's success. The
+        aggregate is NOT written here — `host_cache.compute_aggregate_ok`
+        derives it from the per-device files this method maintains.
 
         Caller must have already verified `self._client_id is not None`.
         """
@@ -406,9 +408,7 @@ class CodexDaemon:
         unverified = await reconcile_duplicate_hosts(
             AGENT_NAME, current_devices, discovery_timeout=DISCOVERY_TIMEOUT_S,
         )
-        overall_ok = True
         any_ok = False
-        kept = 0
         for device_id, result in results.items():
             effective_ok = result.ok and device_id not in unverified
             host_cache.write_push_state(
@@ -427,8 +427,6 @@ class CodexDaemon:
                 self._push_failures[device_id] = (
                     self._push_failures.get(device_id, 0) + 1
                 )
-                overall_ok = False
-                kept += 1
                 continue
             if result.kind == "auth":
                 log.info("dropping %s from codex paired list (401)", device_id)
@@ -451,15 +449,6 @@ class CodexDaemon:
                 # Push succeeded — clear only the push counter. Health
                 # has its own counter and resets independently.
                 self._push_failures.pop(device_id, None)
-            kept += 1
-            if not result.ok:
-                overall_ok = False
-        # If every device was dropped during this push, mirror the "no
-        # paired devices" branch above and surface ok=False so `burnscope
-        # status` doesn't report a misleading healthy aggregate.
-        if kept == 0:
-            overall_ok = False
-        host_cache.write_push_state(AGENT_NAME, ok=overall_ok)
         # Advance the dedupe baseline as soon as *any* device accepted
         # the push — that device now has the snapshot, so re-pushing the
         # same content next minute would pummel a working peer because
@@ -467,7 +456,6 @@ class CodexDaemon:
         # poll cycle until the next semantic change; transport-failed
         # peers get healed by the throttled mDNS reconciliation in
         # `refresh_and_retry_transport_failures` rather than evicted.
-        # `overall_ok` is reserved for status reporting.
         if any_ok:
             self._last_pushed_snapshot = snapshot
 
@@ -575,9 +563,11 @@ class CodexDaemon:
                         continue
                     ok_devices.append(device)
                     self._mark_health_ok(device, body, diverged_devices)
-                healed: set[str] = set()
                 if failed_devices:
-                    healed = await self._reconcile_health_failures(
+                    # Side effects only — reconciliation writes per-device
+                    # state and re-pushes; its returned heal set is no longer
+                    # needed now the aggregate is derived from those files.
+                    await self._reconcile_health_failures(
                         failed_devices, client, diverged_devices,
                     )
                 # Confirm each 401 device's host via mDNS before re-binding,
@@ -591,26 +581,21 @@ class CodexDaemon:
                 # Identity check after round 2: if two paired records
                 # still share a cached host, success at that host can't
                 # prove which physical device replied. Mark each as
-                # ok=False so the aggregate is honest until reconciliation
-                # can split them (plan §8b).
+                # ok=False (per-device) so the derived aggregate is honest
+                # until reconciliation can split them (plan §8b).
                 current_devices = host_cache.load_paired_devices(AGENT_NAME)
                 unverified = await reconcile_duplicate_hosts(
                     AGENT_NAME, current_devices,
                     discovery_timeout=DISCOVERY_TIMEOUT_S,
                 )
-                if unverified:
-                    for device_id in unverified:
-                        log.warning(
-                            "health: device %s in unresolved duplicate-host group; marking unverified",
-                            device_id,
-                        )
-                        host_cache.write_push_state(
-                            AGENT_NAME, ok=False, device_id=device_id
-                        )
-                any_ok = (
-                    any(d.device_id not in unverified for d in ok_devices)
-                    or bool(healed - unverified)
-                )
+                for device_id in unverified:
+                    log.warning(
+                        "health: device %s in unresolved duplicate-host group; marking unverified",
+                        device_id,
+                    )
+                    host_cache.write_push_state(
+                        AGENT_NAME, ok=False, device_id=device_id
+                    )
                 # Re-push `_last_pushed_snapshot` to the device(s) that need
                 # it — those that diverged (firmware lost state) and those
                 # that 401'd at an mDNS-confirmed host (slot wiped, needs a
@@ -621,6 +606,13 @@ class CodexDaemon:
                 # `_verify_rebind_hosts` already confirmed the host belongs to
                 # this device_id; /summary then TOFU-binds an empty slot and
                 # 401s (→ drop) on one owned by a different id.
+                #
+                # No aggregate bookkeeping here: the per-device files written
+                # above (and by `_mark_health_ok`, the rebind 401 branch, and
+                # `_push_to_devices` for the re-push) are the single source of
+                # truth. `host_cache.compute_aggregate_ok` derives the overall
+                # verdict from them on read, so it can never disagree with the
+                # per-device state — the bug class that drove rounds 2 and 3.
                 repush_devices = diverged_devices + verified_rebind
                 if repush_devices and self._last_pushed_snapshot is not None:
                     log.info(
@@ -629,54 +621,9 @@ class CodexDaemon:
                         [d.device_id for d in diverged_devices],
                         [d.device_id for d in verified_rebind],
                     )
-                    # `_push_to_devices` writes its own aggregate via
-                    # `overall_ok`, so the aggregate is reconciled there.
                     await self._push_to_devices(
                         self._last_pushed_snapshot, repush_devices, client
                     )
-                elif not any_ok:
-                    # Aggregate ok=False when nothing was verifiably healthy
-                    # in either round and there's no re-push to fix it up.
-                    host_cache.write_push_state(AGENT_NAME, ok=False)
-                else:
-                    # `any_ok` is true and nothing needs a re-push. Clear any
-                    # stale aggregate ok=False left by an earlier transient
-                    # miss — otherwise the aggregate only ever gets written
-                    # false (the `not any_ok` branch never had a true
-                    # counterpart), so a recovered fleet shows per-device
-                    # green but aggregate red indefinitely (Codex review P2
-                    # round 2). Gate on the whole fleet being healthy this
-                    # cycle so a genuinely degraded peer still surfaces:
-                    #   * a device that failed its initial probe but healed in
-                    #     round 2 is in `failed_devices` yet now ok, so
-                    #     subtract `healed`;
-                    #   * any unverified-rebind device left in `rebind_devices`
-                    #     (verified ones went through the re-push branch above)
-                    #     is still down;
-                    #   * `unverified` duplicate-host devices were just written
-                    #     ok=False and must not be papered over;
-                    #   * a probed-healthy device with a still-pending push
-                    #     failure was deliberately left ok=False by
-                    #     `_mark_health_ok` (its newest snapshot is undelivered)
-                    #     — it must keep the aggregate red too, or aggregate=True
-                    #     would contradict every per-device ok=False (Codex
-                    #     review P2 round 3).
-                    still_failed = {
-                        d.device_id for d in failed_devices
-                    } - healed
-                    push_pending = {
-                        d.device_id
-                        for d in ok_devices
-                        if self._push_failures.get(d.device_id, 0) > 0
-                    }
-                    any_unhealthy = bool(
-                        still_failed
-                        or rebind_devices
-                        or unverified
-                        or push_pending
-                    )
-                    if not any_unhealthy:
-                        host_cache.write_push_state(AGENT_NAME, ok=True)
 
     def _mark_health_ok(
         self,

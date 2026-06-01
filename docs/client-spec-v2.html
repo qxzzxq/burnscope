@@ -453,8 +453,8 @@ flowchart LR
     <td>Same recovery shape as the push side: codex's health loop batches the failed devices into one throttled mDNS browse and retries <code>/health</code> at any refreshed host. On continued failure it <strong>debounces</strong> before marking the device unhealthy — <code>ok=false</code> is persisted only after <code>HEALTH_FAILURE_THRESHOLD</code> (5) <em>consecutive</em> misses (~2.5 min of silence at the 30 s interval). A single miss is treated as noise: an idle ESP32 in WiFi modem-sleep sometimes answers slower than the 5 s timeout while still accepting <code>/summary</code> fine. The streak resets on any healthy probe <em>or</em> any successful <code>/summary</code> push (proof of contact). Never evicts — only <code>/summary</code> 401 removes a pairing.</td>
   </tr>
   <tr>
-    <td><code>GET /health</code> returns <code>401</code> (reachable, slot unbound)</td>
-    <td>The device rebooted / reflashed / wiped NVS, so our <code>codex</code> slot is no longer bound. <code>fetch_health</code> returns the <code>HEALTH_AUTH_REJECTED</code> sentinel — distinct from <code>None</code> — and the daemon treats it as a <strong>re-bind trigger</strong>, not a reachability miss. Because a 401 at a <em>stale</em> cached host can also be a different display answering after a DHCP reassignment, <code>_verify_rebind_hosts</code> first confirms via mDNS that the host still maps to this <code>device_id</code>; only then does a targeted <code>/summary</code> re-push TOFU-rebind the empty slot (and 401-drop if the slot is now owned by a different id). Marks <code>ok=false</code> immediately — definitive, so it bypasses the consecutive-miss debounce. The probe itself never evicts (issues #66 / #67).</td>
+    <td><code>GET /health</code> returns <code>401</code> (our client_id matches no populated slot)</td>
+    <td>The firmware's <code>authorize_health</code> accepts when our id equals <em>any</em> populated slot; a 401 means at least one slot is bound but none to us. Causes: only <em>another agent's</em> slot is populated and ours is empty; a slot is now bound to a <em>different id</em> (another laptop won the race, or it's someone else's display); or a stale cached host where a <em>different display</em> answers after a DHCP reassignment. (A <em>full</em> NVS wipe leaves no slot bound, so <code>/health</code> instead <strong>accepts</strong> the probe and the empty-slot drift is healed via the body, not a 401.) <code>fetch_health</code> returns the <code>HEALTH_AUTH_REJECTED</code> sentinel — distinct from <code>None</code> — and the daemon treats it as a <strong>re-bind candidate</strong>, not a reachability miss. <code>_verify_rebind_hosts</code> first confirms via mDNS that the host still maps to this <code>device_id</code>; only then does a targeted <code>/summary</code> re-push run — which TOFU-binds an empty slot (<code>204</code>) but <strong>401-drops</strong> a slot owned by a different id. Marks <code>ok=false</code> immediately — definitive, so it bypasses the consecutive-miss debounce. The probe itself never evicts (issues #66 / #67).</td>
   </tr>
   <tr>
     <td><code>/health.device_id</code> doesn't match the requested paired record (firmware ≥ 0.5.x)</td>
@@ -636,7 +636,7 @@ flowchart LR
   <tr><th>File</th><th>Owner</th><th>Reader(s)</th><th>Purpose</th></tr>
   <tr><td class="mono">paired-devices.claude.json</td><td>Claude collector (statusline <code>--push</code> child)</td><td>Claude collector, <code>cli.py</code> (status, pair, pair-reset)</td><td>List of <code>{device_id, host}</code> entries representing displays whose <code>claude</code> NVS slot is bound to this laptop's identifier.</td></tr>
   <tr><td class="mono">paired-devices.codex.json</td><td>Codex daemon pusher coroutine</td><td>Codex daemon, <code>cli.py</code></td><td>Same shape as Claude's list, for the <code>codex</code> slot.</td></tr>
-  <tr><td class="mono">last-push.{agent}.{device_id}</td><td>collectors (per device, every fan-out / health probe)</td><td><code>cli.py status</code>, <code>compute_aggregate_ok</code></td><td><strong>Single source of truth</strong> for display health: <code>{"ok": bool, "at": unix_seconds, "consecutive_failures": int}</code>. The <code>consecutive_failures</code> counter survives short-lived statusline children so <code>burnscope status</code> can surface a degraded device; on the push side it is diagnostic only (never drives eviction). The ✓/✗/… indicator is <em>derived</em> from these files, not stored separately — see <code>compute_aggregate_ok</code> below.</td></tr>
+  <tr><td class="mono">last-push.{agent}.{device_id}</td><td>collectors (per device, every fan-out / health probe)</td><td><code>cli.py status</code>, <code>compute_aggregate_ok</code></td><td><strong>Single source of truth</strong> for display health: <code>{"ok": bool, "at": unix_seconds}</code>, plus an <strong>optional</strong> <code>"consecutive_failures": int</code>. Plain outcome writers (<code>write_push_state</code> — codex health verdicts, auto-pair success) emit only <code>ok</code> + <code>at</code>; only <code>bump_push_failures</code> / <code>reset_push_failures</code> include the counter, so a reader must treat it as absent-or-int. It survives short-lived statusline children so <code>burnscope status</code> can surface a degraded device; on the push side it is diagnostic only (never drives eviction). The ✓/✗/… indicator is <em>derived</em> from these files, not stored separately — see <code>compute_aggregate_ok</code> below.</td></tr>
   <tr><td class="mono">last-push.{agent} (aggregate)</td><td>(no longer written)</td><td>—</td><td><strong>Vestigial.</strong> Since #73 the aggregate is not stored: <code>compute_aggregate_ok(agent)</code> derives the ✓/✗/… verdict on read from the per-device files above, so it can never disagree with them. A stale aggregate file left by an older client is ignored and removed by <code>pair-reset</code>.</td></tr>
   <tr><td class="mono">client-id.{agent}</td><td>collectors (first identity resolve)</td><td>collectors, <code>cli.py</code> (status, pair, pair-reset)</td><td>Plaintext per-agent identifier (Claude email / userID, Codex account email) cached so the statusline doesn't re-read <code>~/.claude.json</code> every fire and the daemon doesn't re-derive on restart. Validated on read (printable ASCII, ≤ 254 bytes). <code>burnscope pair</code> needs it; <code>pair-reset</code> wipes it.</td></tr>
   <tr><td class="mono">mdns-reconcile.{agent}.json</td><td>collectors (via <code>claim_reconcile_slots</code>)</td><td>collectors</td><td>Map of <code>{device_id: last_reconcile_unix_ts}</code>. Gates how often a failing or duplicated device can drive a fresh full-LAN mDNS browse. Default cooldown 60 s, overridable via <code>BURNSCOPE_MDNS_RECONCILE_COOLDOWN_S</code>. Shared across the transport-failure and duplicate-host paths so they can't double-trigger a browse within the cooldown.</td></tr>
@@ -895,11 +895,12 @@ flowchart LR
       the requested paired record (mismatch = stale-host / identity
       conflict → marked <code>ok=false</code> immediately and rerouted
       into the round-2 reconcile path). A <code>401</code>
-      (<code>HEALTH_AUTH_REJECTED</code>) means the slot was wiped by a
-      reboot/reflash → the device is scheduled for re-bind:
-      <code>_verify_rebind_hosts</code> confirms the host via mDNS, then
-      a targeted <code>/summary</code> re-push TOFU-rebinds the empty
-      slot. Devices whose round-1 probe timed out are batched into one
+      (<code>HEALTH_AUTH_REJECTED</code>) means our client_id matches no
+      populated slot (another agent's slot is the only one bound, the
+      slot is owned by a different id, or a stale host) → the device is a
+      re-bind candidate: <code>_verify_rebind_hosts</code> confirms the
+      host via mDNS, then a targeted <code>/summary</code> re-push
+      TOFU-binds an empty slot or 401-drops one owned by a different id. Devices whose round-1 probe timed out are batched into one
       shared throttled mDNS browse (via <code>claim_reconcile_slots</code>)
       with a single <code>/health</code> retry at any refreshed host.
       Then runs <code>reconcile_duplicate_hosts</code> on the
@@ -1229,11 +1230,15 @@ flowchart LR
       one of three things, each routed differently:
       <ul>
         <li><code>HEALTH_AUTH_REJECTED</code> (<code>401</code>) →
-            reachable but our slot is unbound (the device rebooted /
-            reflashed / wiped NVS). Append to <code>rebind_devices</code>
-            and write <code>ok=false</code> now so state is honest if
-            there's nothing to re-push. <strong>Not</strong> a
-            reachability miss.</li>
+            reachable, but our client_id matches no populated slot
+            (only another agent's slot is bound, the slot is owned by a
+            different id, or a different display answers at a stale host —
+            a full NVS wipe would instead accept). Append to
+            <code>rebind_devices</code> and write <code>ok=false</code> now
+            so state is honest if there's nothing to re-push.
+            <strong>Not</strong> a reachability miss — and not necessarily
+            a re-bind: the targeted re-push 401-drops a slot owned by a
+            different id.</li>
         <li><code>None</code> (transport / non-2xx / invalid JSON) →
             append to <code>failed_devices</code> for round-2 recovery.
             A transient timeout, to be <em>debounced</em>, not believed

@@ -10,6 +10,7 @@
 #include "driver.h"
 
 #include "driver/gpio.h"
+#include "driver/ledc.h"
 #include "driver/spi_master.h"
 #include "esp_err.h"
 #include "esp_lcd_panel_io.h"
@@ -26,7 +27,6 @@
 #define PIN_NUM_LCD_RST     -1   /* Tied to system EN on CYD. */
 #define PIN_NUM_LCD_CS      15
 #define PIN_NUM_BK_LIGHT    21
-#define LCD_BK_LIGHT_ON     1
 
 /* ST7789 native orientation is 240x320 portrait; we rotate to 320x240. */
 #define LCD_H_RES_NATIVE    240
@@ -37,14 +37,35 @@
 
 static lv_display_t *s_display = NULL;
 
+/* Backlight is PWM-dimmed via LEDC. GPIO21 drives an active-high transistor,
+ * so duty maps directly to brightness. Hardcoded to 50% for now. */
+#define BK_LIGHT_LEDC_MODE      LEDC_LOW_SPEED_MODE
+#define BK_LIGHT_LEDC_TIMER     LEDC_TIMER_0
+#define BK_LIGHT_LEDC_CHANNEL   LEDC_CHANNEL_0
+#define BK_LIGHT_LEDC_DUTY_RES  LEDC_TIMER_8_BIT   /* duty range 0–255 */
+#define BK_LIGHT_LEDC_FREQ_HZ   5000               /* >1 kHz: no visible flicker */
+#define BK_LIGHT_DUTY_PCT       50
+
 static void enable_backlight(void)
 {
-    const gpio_config_t cfg = {
-        .mode = GPIO_MODE_OUTPUT,
-        .pin_bit_mask = 1ULL << PIN_NUM_BK_LIGHT,
+    const ledc_timer_config_t timer = {
+        .speed_mode      = BK_LIGHT_LEDC_MODE,
+        .timer_num       = BK_LIGHT_LEDC_TIMER,
+        .duty_resolution = BK_LIGHT_LEDC_DUTY_RES,
+        .freq_hz         = BK_LIGHT_LEDC_FREQ_HZ,
+        .clk_cfg         = LEDC_AUTO_CLK,
     };
-    ESP_ERROR_CHECK(gpio_config(&cfg));
-    ESP_ERROR_CHECK(gpio_set_level(PIN_NUM_BK_LIGHT, LCD_BK_LIGHT_ON));
+    ESP_ERROR_CHECK(ledc_timer_config(&timer));
+
+    const ledc_channel_config_t channel = {
+        .gpio_num   = PIN_NUM_BK_LIGHT,
+        .speed_mode = BK_LIGHT_LEDC_MODE,
+        .channel    = BK_LIGHT_LEDC_CHANNEL,
+        .timer_sel  = BK_LIGHT_LEDC_TIMER,
+        .duty       = (BK_LIGHT_DUTY_PCT * 255) / 100,  /* 255 = full at 8-bit res */
+        .hpoint     = 0,
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&channel));
 }
 
 static esp_lcd_panel_handle_t init_st7789(esp_lcd_panel_io_handle_t *io_out)

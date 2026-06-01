@@ -45,8 +45,9 @@ idf_component_register(
         esp_http_server lwip
         # Display stack — LVGL + managed mDNS component.
         esp_lvgl_port lvgl__lvgl espressif__mdns
-        # FreeRTOS primitives + GPIO + watchdog APIs.
-        driver esp_system freertos
+        # FreeRTOS primitives + GPIO + watchdog APIs; esp_driver_ledc
+        # drives the backlight PWM (split out of `driver` in IDF 6).
+        driver esp_driver_ledc esp_system freertos
         # OTA + filesystem. `app_update` provides esp_ota_*; the
         # joltwallet/littlefs managed component mounts the `storage`
         # partition declared in partitions-16mb.csv.

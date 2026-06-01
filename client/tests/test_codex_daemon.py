@@ -1276,6 +1276,62 @@ async def test_health_loop_keeps_device_after_many_health_failures(monkeypatch):
     assert paired == {"dev-quiet"}
 
 
+# ============================== health-failure debounce (consecutive misses)
+
+
+def test_record_health_failure_debounces_until_threshold():
+    """A transient health miss must NOT immediately mark a device unhealthy.
+
+    On a stable LAN the ESP32 occasionally takes >5 s to answer GET /health
+    while its WiFi radio is in modem-sleep (it naps between DTIM beacons),
+    even though it accepts /summary fine moments later. Flipping the device —
+    and thus the agent's derived aggregate — red on a single slow reply
+    produced a stream of false-alarm WARNINGs. A device is only declared
+    unhealthy after HEALTH_FAILURE_THRESHOLD *consecutive* misses.
+    """
+    daemon = CodexDaemon()
+    device = PairedDevice("dev-flap", "10.0.0.5:80")
+    # Device was healthy before the blip (last push / probe succeeded).
+    host_cache.write_push_state("codex", ok=True, device_id="dev-flap")
+
+    # The first THRESHOLD-1 consecutive misses must leave it healthy.
+    for i in range(codex_daemon.HEALTH_FAILURE_THRESHOLD - 1):
+        daemon._record_health_failure(device)
+        state = host_cache.read_push_state("codex", device_id="dev-flap")
+        assert state["ok"] is True, f"miss {i + 1} flipped device unhealthy too early"
+
+    # The THRESHOLD-th consecutive miss is what marks it unhealthy.
+    daemon._record_health_failure(device)
+    state = host_cache.read_push_state("codex", device_id="dev-flap")
+    assert state["ok"] is False
+    assert (
+        daemon._health_failures["dev-flap"]
+        == codex_daemon.HEALTH_FAILURE_THRESHOLD
+    )
+
+
+def test_health_success_resets_miss_debounce():
+    """The debounce counts *consecutive* misses: one healthy probe resets the
+    streak, so an intermittently-flaky device that never strings THRESHOLD
+    misses together in a row is never marked unhealthy."""
+    daemon = CodexDaemon()
+    device = PairedDevice("dev-flap", "10.0.0.5:80")
+    host_cache.write_push_state("codex", ok=True, device_id="dev-flap")
+
+    # Accumulate one short of the threshold, then a healthy probe lands.
+    for _ in range(codex_daemon.HEALTH_FAILURE_THRESHOLD - 1):
+        daemon._record_health_failure(device)
+    # _mark_health_ok pops the counter before the baseline gate; with no
+    # _last_pushed_snapshot it won't rewrite ok, leaving the prior ok=True.
+    daemon._mark_health_ok(device, {}, [])
+    assert daemon._health_failures.get("dev-flap", 0) == 0
+
+    # The streak restarted, so another THRESHOLD-1 misses keep it healthy.
+    for _ in range(codex_daemon.HEALTH_FAILURE_THRESHOLD - 1):
+        daemon._record_health_failure(device)
+        assert host_cache.read_push_state("codex", device_id="dev-flap")["ok"] is True
+
+
 async def test_health_loop_recovers_via_mdns_when_ip_changes(monkeypatch):
     """Stale cached IP → /health fails → one throttled mDNS browse
     rediscovers the device at its new host → retry /health at the new

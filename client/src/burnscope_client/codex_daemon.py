@@ -79,6 +79,15 @@ AGENT_NAME = "codex"
 APP_SERVER_CMD = ("codex", "app-server")
 CLIENT_NAME = "burnscope"
 HEALTH_INTERVAL_S = 30.0
+# Consecutive failed /health probes required before a device is marked
+# unhealthy. A single probe can time out (5 s) on a stable LAN when the
+# ESP32's WiFi radio is in modem-sleep — it naps between DTIM beacons and
+# occasionally answers slowly, even though it accepts /summary fine moments
+# later. Debouncing on the *consecutive*-miss counter (reset by any healthy
+# probe) keeps those transient blips from flipping the device — and the
+# derived aggregate — red. At HEALTH_INTERVAL_S this is ~2.5 min of solid
+# silence before we believe a device is actually down.
+HEALTH_FAILURE_THRESHOLD = 5
 # Active poll of `account/rateLimits/read`. Required because the
 # app-server only emits `rateLimits/updated` when its own in-process
 # cache changes — and our long-lived app-server is a passive observer,
@@ -684,18 +693,32 @@ class CodexDaemon:
             )
 
     def _record_health_failure(self, device: PairedDevice) -> None:
-        """Persist a health-probe failure for `device` without evicting.
+        """Count a failed health probe, marking the device unhealthy only
+        after HEALTH_FAILURE_THRESHOLD *consecutive* misses.
 
-        Per the mDNS resilience plan (§8) the pairing is preserved
-        regardless of how many health probes miss — only `/summary` 401
-        is an ownership signal. The counter still advances so logs (and
-        a future `burnscope status` view) can surface the degraded peer.
+        A single missed probe is not enough: an idle ESP32 in WiFi
+        modem-sleep occasionally answers GET /health slower than the 5 s
+        timeout while still accepting /summary fine, so one miss is noise,
+        not a fault. We bump the consecutive-miss counter (reset by any
+        healthy probe in `_mark_health_ok`) and only persist ok=False once
+        it reaches the threshold — below it the device keeps its prior
+        state, so a transient blip never flips the derived aggregate red.
+
+        The pairing is preserved regardless of how many probes miss — per
+        the mDNS resilience plan (§8), only a `/summary` 401 is an
+        ownership signal. The counter also surfaces a degraded peer in
+        logs (and a future `burnscope status` view).
         """
+        misses = self._health_failures.get(device.device_id, 0) + 1
+        self._health_failures[device.device_id] = misses
+        if misses < HEALTH_FAILURE_THRESHOLD:
+            log.debug(
+                "health miss %d/%d for %s; not marking unhealthy yet",
+                misses, HEALTH_FAILURE_THRESHOLD, device.device_id,
+            )
+            return
         host_cache.write_push_state(
             AGENT_NAME, ok=False, device_id=device.device_id
-        )
-        self._health_failures[device.device_id] = (
-            self._health_failures.get(device.device_id, 0) + 1
         )
 
     async def _reconcile_health_failures(

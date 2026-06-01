@@ -1196,18 +1196,30 @@ def test_enqueue_bounded_caps_queue_and_keeps_newest():
     assert seen == list(range(total - cap, total))
 
 
-# ============================================== H-2: split push/health counters
+# ===================================== push success resets the health debounce
 
 
-async def test_push_counter_does_not_reset_health_counter(monkeypatch):
-    """A push success must not clear the health failure counter, and
-    vice versa. Without separated counters, either path's success
-    masked the other's accumulated failures (deep-review H-2).
+async def test_push_success_resets_health_debounce_counter(monkeypatch):
+    """A successful /summary push must reset the health-miss debounce counter.
+
+    The counter now gates the ok=False write (PR #74), so it means
+    "consecutive intervals with no successful contact" — and a push *is*
+    contact. In the flaky-LAN case a /summary push often succeeds between
+    /health timeouts (the exact symptom this PR targets); if the counter
+    survived the push, four earlier health timeouts plus one later one would
+    still trip the 5-miss threshold even though the device was never silent
+    for five consecutive intervals. (Codex review P2 on PR #74; this
+    deliberately revises the earlier diagnostic-only H-2 split, under which a
+    push success left the health counter untouched.)
+
+    The reverse direction is unchanged and covered elsewhere: a healthy
+    /health probe must NOT clear `_push_failures` while a newer snapshot is
+    still failing to deliver (test_codex_daemon_health_recovery.py).
     """
     daemon = CodexDaemon()
     daemon._client_id = "u@example.com"
     host_cache.add_paired_device("codex", PairedDevice("dev-x", "10.0.0.5:80"))
-    # Pretend the health loop already saw 3 health failures.
+    # The health loop already saw 3 misses — short of the threshold.
     daemon._health_failures["dev-x"] = 3
 
     async def fake_push_to_all(snapshot, devices, client_id, client):
@@ -1227,10 +1239,10 @@ async def test_push_counter_does_not_reset_health_counter(monkeypatch):
         predicate=lambda: daemon._last_pushed_snapshot is not None,
     )
 
-    # Push success cleared its own counter but the health counter
-    # must remain at 3 — health still hasn't seen recovery.
+    # Confirmed contact via /summary resets both counters — the device was
+    # demonstrably reachable, so the consecutive-miss streak restarts.
     assert daemon._push_failures.get("dev-x", 0) == 0
-    assert daemon._health_failures.get("dev-x") == 3
+    assert daemon._health_failures.get("dev-x", 0) == 0
 
 
 async def test_health_loop_keeps_device_after_many_health_failures(monkeypatch):
@@ -1274,6 +1286,62 @@ async def test_health_loop_keeps_device_after_many_health_failures(monkeypatch):
     assert daemon._health_failures["dev-quiet"] >= 10
     paired = {d.device_id for d in host_cache.load_paired_devices("codex")}
     assert paired == {"dev-quiet"}
+
+
+# ============================== health-failure debounce (consecutive misses)
+
+
+def test_record_health_failure_debounces_until_threshold():
+    """A transient health miss must NOT immediately mark a device unhealthy.
+
+    On a stable LAN the ESP32 occasionally takes >5 s to answer GET /health
+    while its WiFi radio is in modem-sleep (it naps between DTIM beacons),
+    even though it accepts /summary fine moments later. Flipping the device —
+    and thus the agent's derived aggregate — red on a single slow reply
+    produced a stream of false-alarm WARNINGs. A device is only declared
+    unhealthy after HEALTH_FAILURE_THRESHOLD *consecutive* misses.
+    """
+    daemon = CodexDaemon()
+    device = PairedDevice("dev-flap", "10.0.0.5:80")
+    # Device was healthy before the blip (last push / probe succeeded).
+    host_cache.write_push_state("codex", ok=True, device_id="dev-flap")
+
+    # The first THRESHOLD-1 consecutive misses must leave it healthy.
+    for i in range(codex_daemon.HEALTH_FAILURE_THRESHOLD - 1):
+        daemon._record_health_failure(device)
+        state = host_cache.read_push_state("codex", device_id="dev-flap")
+        assert state["ok"] is True, f"miss {i + 1} flipped device unhealthy too early"
+
+    # The THRESHOLD-th consecutive miss is what marks it unhealthy.
+    daemon._record_health_failure(device)
+    state = host_cache.read_push_state("codex", device_id="dev-flap")
+    assert state["ok"] is False
+    assert (
+        daemon._health_failures["dev-flap"]
+        == codex_daemon.HEALTH_FAILURE_THRESHOLD
+    )
+
+
+def test_health_success_resets_miss_debounce():
+    """The debounce counts *consecutive* misses: one healthy probe resets the
+    streak, so an intermittently-flaky device that never strings THRESHOLD
+    misses together in a row is never marked unhealthy."""
+    daemon = CodexDaemon()
+    device = PairedDevice("dev-flap", "10.0.0.5:80")
+    host_cache.write_push_state("codex", ok=True, device_id="dev-flap")
+
+    # Accumulate one short of the threshold, then a healthy probe lands.
+    for _ in range(codex_daemon.HEALTH_FAILURE_THRESHOLD - 1):
+        daemon._record_health_failure(device)
+    # _mark_health_ok pops the counter before the baseline gate; with no
+    # _last_pushed_snapshot it won't rewrite ok, leaving the prior ok=True.
+    daemon._mark_health_ok(device, {}, [])
+    assert daemon._health_failures.get("dev-flap", 0) == 0
+
+    # The streak restarted, so another THRESHOLD-1 misses keep it healthy.
+    for _ in range(codex_daemon.HEALTH_FAILURE_THRESHOLD - 1):
+        daemon._record_health_failure(device)
+        assert host_cache.read_push_state("codex", device_id="dev-flap")["ok"] is True
 
 
 async def test_health_loop_recovers_via_mdns_when_ip_changes(monkeypatch):
@@ -1507,6 +1575,135 @@ async def test_health_loop_treats_device_id_mismatch_as_identity_conflict(
     assert host_cache.load_paired_devices("codex") == [
         PairedDevice("burnscope-aaaa", "10.0.0.9:80")
     ]
+
+
+async def test_health_loop_identity_mismatch_marks_unhealthy_immediately(monkeypatch):
+    """A /health device_id mismatch must mark the device unhealthy on the
+    FIRST conflict, bypassing the consecutive-miss debounce.
+
+    Unlike a timeout, a mismatch is definitive: the HTTP peer identified
+    itself as a *different* display, so the cached host is stale. Debouncing
+    it (Codex review P2 on PR #74) would leave the device — and the derived
+    aggregate — green for up to HEALTH_FAILURE_THRESHOLD-1 cycles while a
+    push could still target the wrong device.
+
+    The browse hangs so `_reconcile_health_failures` (and the only call to
+    `_record_health_failure`) never completes — proving the ok=False came
+    from the immediate identity-conflict write, not the debounced counter,
+    which therefore stays at 0.
+    """
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+    host_cache.add_paired_device("codex", PairedDevice("burnscope-aaaa", "10.0.0.5:80"))
+    # Device was healthy before the conflict.
+    host_cache.write_push_state("codex", ok=True, device_id="burnscope-aaaa")
+
+    async def fake_fetch_health(host, client_id, client):
+        # A different display answers at the cached host.
+        return {"device_id": "burnscope-bbbb", "agents": {}}
+    monkeypatch.setattr(codex_daemon, "fetch_health", fake_fetch_health)
+    monkeypatch.setattr(codex_daemon, "HEALTH_INTERVAL_S", 0.005)
+
+    # mDNS reconciliation can never heal: block the browse so the counter
+    # bump in `_record_health_failure` is unreachable.
+    async def hanging_discover(timeout=4.0, agent=None, zc=None):
+        await asyncio.sleep(3600)
+    monkeypatch.setattr(codex_daemon, "discover_all", hanging_discover)
+    from burnscope_client import pusher as pusher_mod
+    monkeypatch.setattr(pusher_mod, "discover_all", hanging_discover)
+
+    task = asyncio.create_task(daemon._health_loop())
+    try:
+        for _ in range(200):
+            state = host_cache.read_push_state("codex", device_id="burnscope-aaaa")
+            if state is not None and state.get("ok") is False:
+                break
+            await asyncio.sleep(0.005)
+        else:
+            raise AssertionError("identity mismatch never marked unhealthy")
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    # Marked unhealthy immediately, not via the debounced counter.
+    assert host_cache.read_push_state("codex", device_id="burnscope-aaaa")["ok"] is False
+    assert daemon._health_failures.get("burnscope-aaaa", 0) == 0
+    # Pairing preserved — an identity conflict is not an eviction signal.
+    assert {d.device_id for d in host_cache.load_paired_devices("codex")} == {
+        "burnscope-aaaa"
+    }
+
+
+async def test_health_reconcile_retry_401_marks_unhealthy_immediately(monkeypatch):
+    """A /health 401 found on the post-mDNS-move retry must mark the device
+    unhealthy immediately, bypassing the consecutive-miss debounce.
+
+    Scenario: a device is unreachable at its stale cached host (transport
+    miss), mDNS relocates it to a new host, and the retry there returns
+    HEALTH_AUTH_REJECTED — reachable but our slot is unbound (rebooted /
+    NVS-wiped). That's definitive, not a transient timeout: the device
+    won't accept/display summaries until re-bound, exactly like the
+    top-level /health 401 branch, which marks ok=False at once. Routing the
+    retry-path 401 through the debounced _record_health_failure left a
+    previously-healthy device green for the debounce window (Codex review
+    P2 on PR #74).
+
+    The second initial probe at the moved host hangs, so the device cannot
+    be re-marked via the next cycle's top-level 401 branch — proving the
+    ok=False came from the retry path on the move cycle, with the debounce
+    counter untouched (stays 0, mirroring the top-level 401 branch).
+    """
+    from burnscope_client.discovery import DiscoveredDevice
+
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+    host_cache.add_paired_device("codex", PairedDevice("dev-moved", "10.0.0.5:80"))
+    # Device was healthy before it moved + lost its binding.
+    host_cache.write_push_state("codex", ok=True, device_id="dev-moved")
+
+    new_host_calls = 0
+
+    async def fake_fetch_health(host, client_id, client):
+        nonlocal new_host_calls
+        if host == "10.0.0.5:80":
+            return None  # stale host: unreachable → triggers reconcile
+        # Moved host: first call is the post-move retry (401); freeze any
+        # later cycle's initial probe so it can't re-mark via the top path.
+        new_host_calls += 1
+        if new_host_calls == 1:
+            return codex_daemon.HEALTH_AUTH_REJECTED
+        await asyncio.sleep(3600)
+    monkeypatch.setattr(codex_daemon, "fetch_health", fake_fetch_health)
+    monkeypatch.setattr(codex_daemon, "HEALTH_INTERVAL_S", 0.005)
+
+    async def fake_discover_all(timeout=4.0, agent=None, zc=None):
+        return [DiscoveredDevice("dev-moved", "10.0.0.9:80", True, False)]
+    monkeypatch.setattr(codex_daemon, "discover_all", fake_discover_all)
+    from burnscope_client import pusher as pusher_mod
+    monkeypatch.setattr(pusher_mod, "discover_all", fake_discover_all)
+
+    task = asyncio.create_task(daemon._health_loop())
+    try:
+        for _ in range(200):
+            state = host_cache.read_push_state("codex", device_id="dev-moved")
+            if state is not None and state.get("ok") is False:
+                break
+            await asyncio.sleep(0.005)
+        else:
+            raise AssertionError("retry-path 401 never marked device unhealthy")
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    # Host was refreshed by the reconcile, ok flipped false on the move
+    # cycle's retry, and the debounce counter was never touched.
+    assert host_cache.load_paired_devices("codex") == [
+        PairedDevice("dev-moved", "10.0.0.9:80")
+    ]
+    assert host_cache.read_push_state("codex", device_id="dev-moved")["ok"] is False
+    assert daemon._health_failures.get("dev-moved", 0) == 0
 
 
 async def test_health_loop_accepts_response_without_device_id(monkeypatch):

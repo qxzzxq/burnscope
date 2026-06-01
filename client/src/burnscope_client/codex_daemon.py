@@ -79,6 +79,15 @@ AGENT_NAME = "codex"
 APP_SERVER_CMD = ("codex", "app-server")
 CLIENT_NAME = "burnscope"
 HEALTH_INTERVAL_S = 30.0
+# Consecutive failed /health probes required before a device is marked
+# unhealthy. A single probe can time out (5 s) on a stable LAN when the
+# ESP32's WiFi radio is in modem-sleep — it naps between DTIM beacons and
+# occasionally answers slowly, even though it accepts /summary fine moments
+# later. Debouncing on the *consecutive*-miss counter (reset by any healthy
+# probe) keeps those transient blips from flipping the device — and the
+# derived aggregate — red. At HEALTH_INTERVAL_S this is ~2.5 min of solid
+# silence before we believe a device is actually down.
+HEALTH_FAILURE_THRESHOLD = 5
 # Active poll of `account/rateLimits/read`. Required because the
 # app-server only emits `rateLimits/updated` when its own in-process
 # cache changes — and our long-lived app-server is a passive observer,
@@ -141,13 +150,19 @@ class CodexDaemon:
         # change — see `_poll_loop`.
         self._last_pushed_snapshot: AgentSnapshot | None = None
         self._proc: asyncio.subprocess.Process | None = None
-        # Two diagnostic transport-failure counters, one per probe path.
-        # Per the mDNS resilience plan, neither path evicts on transport
-        # failure — only `/summary` 401 removes a pairing. The counters
-        # stay split so a push success cannot zero out accumulated
-        # health failures, and vice versa, keeping the per-path "have we
-        # heard from this device recently" signal honest for logs and a
-        # future `burnscope status` view.
+        # Two per-path transport-failure counters. Per the mDNS resilience
+        # plan, neither path evicts on transport failure — only `/summary`
+        # 401 removes a pairing.
+        #
+        # `_health_failures` is no longer diagnostic-only: it gates the
+        # ok=False write after HEALTH_FAILURE_THRESHOLD consecutive misses,
+        # so it means "consecutive intervals with no confirmed contact." A
+        # successful `/summary` push IS contact, so `_push_to_devices` resets
+        # it on success (PR #74) — that's the one direction where the two
+        # counters are intentionally coupled. The reverse stays split: a
+        # healthy `/health` probe must NOT clear `_push_failures` while a
+        # newer snapshot is still failing to deliver, so `_mark_health_ok`
+        # leaves it intact (deep-review H-2 / Codex P2).
         self._push_failures: dict[str, int] = {}
         self._health_failures: dict[str, int] = {}
 
@@ -446,9 +461,17 @@ class CodexDaemon:
                     self._push_failures.get(device_id, 0) + 1
                 )
             else:
-                # Push succeeded — clear only the push counter. Health
-                # has its own counter and resets independently.
+                # Push succeeded (effective_ok — unverified/duplicate-host
+                # devices took the `continue` above, so this is confirmed
+                # contact with *this* device_id). Clear both counters: the
+                # push obviously delivered, and since `_health_failures` now
+                # gates the ok=False write, a confirmed contact must reset the
+                # consecutive-miss streak too — otherwise a /summary push that
+                # succeeds between /health timeouts wouldn't stop the threshold
+                # from tripping, the exact flaky-LAN false positive this debounce
+                # exists to prevent (Codex review P2 on PR #74).
                 self._push_failures.pop(device_id, None)
+                self._health_failures.pop(device_id, None)
         # Advance the dedupe baseline as soon as *any* device accepted
         # the push — that device now has the snapshot, so re-pushing the
         # same content next minute would pummel a working peer because
@@ -558,6 +581,19 @@ class CodexDaemon:
                             "health: %s replied with device_id=%s (expected %s); "
                             "treating as identity conflict",
                             device.host, actual_id, device.device_id,
+                        )
+                        # Definitive, not a transient timeout: the HTTP peer
+                        # identified itself as a *different* display, so the
+                        # cached host is stale. Mark unhealthy immediately —
+                        # like the 401 branch above — bypassing the
+                        # consecutive-miss debounce in `_record_health_failure`
+                        # (which only ever withholds an ok=False write, never
+                        # writes ok=True, so this can't be undone below
+                        # threshold). Reconciliation still runs to relocate the
+                        # device via mDNS; a successful retry there clears this
+                        # via `_mark_health_ok` (Codex review P2 on PR #74).
+                        host_cache.write_push_state(
+                            AGENT_NAME, ok=False, device_id=device.device_id
                         )
                         failed_devices.append(device)
                         continue
@@ -684,18 +720,32 @@ class CodexDaemon:
             )
 
     def _record_health_failure(self, device: PairedDevice) -> None:
-        """Persist a health-probe failure for `device` without evicting.
+        """Count a failed health probe, marking the device unhealthy only
+        after HEALTH_FAILURE_THRESHOLD *consecutive* misses.
 
-        Per the mDNS resilience plan (§8) the pairing is preserved
-        regardless of how many health probes miss — only `/summary` 401
-        is an ownership signal. The counter still advances so logs (and
-        a future `burnscope status` view) can surface the degraded peer.
+        A single missed probe is not enough: an idle ESP32 in WiFi
+        modem-sleep occasionally answers GET /health slower than the 5 s
+        timeout while still accepting /summary fine, so one miss is noise,
+        not a fault. We bump the consecutive-miss counter (reset by any
+        healthy probe in `_mark_health_ok`) and only persist ok=False once
+        it reaches the threshold — below it the device keeps its prior
+        state, so a transient blip never flips the derived aggregate red.
+
+        The pairing is preserved regardless of how many probes miss — per
+        the mDNS resilience plan (§8), only a `/summary` 401 is an
+        ownership signal. The counter also surfaces a degraded peer in
+        logs (and a future `burnscope status` view).
         """
+        misses = self._health_failures.get(device.device_id, 0) + 1
+        self._health_failures[device.device_id] = misses
+        if misses < HEALTH_FAILURE_THRESHOLD:
+            log.debug(
+                "health miss %d/%d for %s; not marking unhealthy yet",
+                misses, HEALTH_FAILURE_THRESHOLD, device.device_id,
+            )
+            return
         host_cache.write_push_state(
             AGENT_NAME, ok=False, device_id=device.device_id
-        )
-        self._health_failures[device.device_id] = (
-            self._health_failures.get(device.device_id, 0) + 1
         )
 
     async def _reconcile_health_failures(
@@ -760,13 +810,22 @@ class CodexDaemon:
                 device_id=device.device_id, host=found.host
             )
             retry = await fetch_health(refreshed.host, self._client_id, client)
-            if retry is None or retry is HEALTH_AUTH_REJECTED:
-                # None: still unreachable at the new host. Sentinel: reachable
-                # there but our slot isn't bound — the cache now points at the
-                # right host, so the next cycle's initial probe will 401 again
-                # and route it through the /summary re-bind path (issue #66).
-                # Record a miss either way and never pass the sentinel into the
-                # divergence comparison (it isn't a body).
+            if retry is HEALTH_AUTH_REJECTED:
+                # Reachable at the moved host but our slot is unbound — a
+                # definitive 401, not a transient timeout. Mark ok=False
+                # immediately (mirroring the top-level /health 401 branch,
+                # which doesn't bump the miss counter either), bypassing the
+                # consecutive-miss debounce: the device won't accept/display
+                # summaries until re-bound. The cache now points at the right
+                # host, so the next cycle's initial probe 401s again and routes
+                # through the /summary re-bind path (issue #66 / Codex P2).
+                host_cache.write_push_state(
+                    AGENT_NAME, ok=False, device_id=refreshed.device_id
+                )
+                continue
+            if retry is None:
+                # Still unreachable at the new host — a transient miss,
+                # debounced like any other timeout.
                 self._record_health_failure(refreshed)
                 continue
             healed.add(refreshed.device_id)

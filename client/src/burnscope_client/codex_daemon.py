@@ -568,6 +568,19 @@ class CodexDaemon:
                             "treating as identity conflict",
                             device.host, actual_id, device.device_id,
                         )
+                        # Definitive, not a transient timeout: the HTTP peer
+                        # identified itself as a *different* display, so the
+                        # cached host is stale. Mark unhealthy immediately —
+                        # like the 401 branch above — bypassing the
+                        # consecutive-miss debounce in `_record_health_failure`
+                        # (which only ever withholds an ok=False write, never
+                        # writes ok=True, so this can't be undone below
+                        # threshold). Reconciliation still runs to relocate the
+                        # device via mDNS; a successful retry there clears this
+                        # via `_mark_health_ok` (Codex review P2 on PR #74).
+                        host_cache.write_push_state(
+                            AGENT_NAME, ok=False, device_id=device.device_id
+                        )
                         failed_devices.append(device)
                         continue
                     ok_devices.append(device)

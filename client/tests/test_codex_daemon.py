@@ -1565,6 +1565,64 @@ async def test_health_loop_treats_device_id_mismatch_as_identity_conflict(
     ]
 
 
+async def test_health_loop_identity_mismatch_marks_unhealthy_immediately(monkeypatch):
+    """A /health device_id mismatch must mark the device unhealthy on the
+    FIRST conflict, bypassing the consecutive-miss debounce.
+
+    Unlike a timeout, a mismatch is definitive: the HTTP peer identified
+    itself as a *different* display, so the cached host is stale. Debouncing
+    it (Codex review P2 on PR #74) would leave the device — and the derived
+    aggregate — green for up to HEALTH_FAILURE_THRESHOLD-1 cycles while a
+    push could still target the wrong device.
+
+    The browse hangs so `_reconcile_health_failures` (and the only call to
+    `_record_health_failure`) never completes — proving the ok=False came
+    from the immediate identity-conflict write, not the debounced counter,
+    which therefore stays at 0.
+    """
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+    host_cache.add_paired_device("codex", PairedDevice("burnscope-aaaa", "10.0.0.5:80"))
+    # Device was healthy before the conflict.
+    host_cache.write_push_state("codex", ok=True, device_id="burnscope-aaaa")
+
+    async def fake_fetch_health(host, client_id, client):
+        # A different display answers at the cached host.
+        return {"device_id": "burnscope-bbbb", "agents": {}}
+    monkeypatch.setattr(codex_daemon, "fetch_health", fake_fetch_health)
+    monkeypatch.setattr(codex_daemon, "HEALTH_INTERVAL_S", 0.005)
+
+    # mDNS reconciliation can never heal: block the browse so the counter
+    # bump in `_record_health_failure` is unreachable.
+    async def hanging_discover(timeout=4.0, agent=None, zc=None):
+        await asyncio.sleep(3600)
+    monkeypatch.setattr(codex_daemon, "discover_all", hanging_discover)
+    from burnscope_client import pusher as pusher_mod
+    monkeypatch.setattr(pusher_mod, "discover_all", hanging_discover)
+
+    task = asyncio.create_task(daemon._health_loop())
+    try:
+        for _ in range(200):
+            state = host_cache.read_push_state("codex", device_id="burnscope-aaaa")
+            if state is not None and state.get("ok") is False:
+                break
+            await asyncio.sleep(0.005)
+        else:
+            raise AssertionError("identity mismatch never marked unhealthy")
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    # Marked unhealthy immediately, not via the debounced counter.
+    assert host_cache.read_push_state("codex", device_id="burnscope-aaaa")["ok"] is False
+    assert daemon._health_failures.get("burnscope-aaaa", 0) == 0
+    # Pairing preserved — an identity conflict is not an eviction signal.
+    assert {d.device_id for d in host_cache.load_paired_devices("codex")} == {
+        "burnscope-aaaa"
+    }
+
+
 async def test_health_loop_accepts_response_without_device_id(monkeypatch):
     """Backwards compatibility: older firmware doesn't emit device_id.
     Absence of the field must not be treated as a mismatch — the daemon

@@ -415,13 +415,15 @@ flowchart LR
 <p>
   The firmware advertises two TXT records — <code>paired_claude</code> and
   <code>paired_codex</code> — that mirror the NVS slot state (see
-  <a href="#wire-additions">§4.3</a>). Each per-agent collector filters
-  discovery results to devices where <em>its</em> slot is still
-  <code>0</code>, then attempts to claim each via a normal
-  <code>POST /summary</code>. <strong>The TXT record is an advisory hint
-  only</strong> — the firmware's HTTP response (<code>204</code> claims,
-  <code>401</code> rejects) is the authoritative answer when mDNS caches go
-  stale.
+  <a href="#wire-additions">§4.3</a>). They are an <strong>advisory hint
+  only</strong>: in practice every collector path browses
+  <code>discover_all()</code> <em>unfiltered</em> and relies entirely on
+  the firmware's HTTP response (<code>204</code> claims, <code>401</code>
+  rejects) as the authoritative answer. Pre-filtering to
+  <code>paired_&lt;agent&gt;=0</code> would wrongly exclude a device whose
+  slot is already TOFU-bound to us and block recovery after a
+  <code>paired-devices.json</code> wipe — so the <code>agent=</code> filter
+  on <code>discover_all</code> exists but no caller currently uses it.
 </p>
 
 <h4>Client-side state model</h4>
@@ -448,11 +450,15 @@ flowchart LR
   </tr>
   <tr>
     <td><code>GET /health</code> transport-fails or returns invalid JSON</td>
-    <td>Same recovery shape as the push side: codex's health loop batches the failed devices into one throttled mDNS browse, retries <code>/health</code> at any refreshed host, and on continued failure marks the device unhealthy without evicting. Generic <code>/health</code> 401 is currently agent-agnostic on the firmware side, so it surfaces as <code>None</code> and is treated as an unhealthy probe — not as permission to remove a pairing.</td>
+    <td>Same recovery shape as the push side: codex's health loop batches the failed devices into one throttled mDNS browse and retries <code>/health</code> at any refreshed host. On continued failure it <strong>debounces</strong> before marking the device unhealthy — <code>ok=false</code> is persisted only after <code>HEALTH_FAILURE_THRESHOLD</code> (5) <em>consecutive</em> misses (~2.5 min of silence at the 30 s interval). A single miss is treated as noise: an idle ESP32 in WiFi modem-sleep sometimes answers slower than the 5 s timeout while still accepting <code>/summary</code> fine. The streak resets on any healthy probe <em>or</em> any successful <code>/summary</code> push (proof of contact). Never evicts — only <code>/summary</code> 401 removes a pairing.</td>
   </tr>
   <tr>
-    <td><code>/health.device_id</code> doesn't match the requested paired record (firmware ≥ this build)</td>
-    <td>The cached host points at a different physical device (DHCP reassignment, or aliased with another paired entry). Treat as a stale-host conflict — the response is <strong>not</strong> a successful probe; the device is routed through the round-2 mDNS reconciliation path. Older firmware that omits <code>device_id</code> is backwards-compatible: the daemon falls back to local duplicate-host detection alone.</td>
+    <td><code>GET /health</code> returns <code>401</code> (reachable, slot unbound)</td>
+    <td>The device rebooted / reflashed / wiped NVS, so our <code>codex</code> slot is no longer bound. <code>fetch_health</code> returns the <code>HEALTH_AUTH_REJECTED</code> sentinel — distinct from <code>None</code> — and the daemon treats it as a <strong>re-bind trigger</strong>, not a reachability miss. Because a 401 at a <em>stale</em> cached host can also be a different display answering after a DHCP reassignment, <code>_verify_rebind_hosts</code> first confirms via mDNS that the host still maps to this <code>device_id</code>; only then does a targeted <code>/summary</code> re-push TOFU-rebind the empty slot (and 401-drop if the slot is now owned by a different id). Marks <code>ok=false</code> immediately — definitive, so it bypasses the consecutive-miss debounce. The probe itself never evicts (issues #66 / #67).</td>
+  </tr>
+  <tr>
+    <td><code>/health.device_id</code> doesn't match the requested paired record (firmware ≥ 0.5.x)</td>
+    <td>The cached host points at a different physical device (DHCP reassignment, or aliased with another paired entry). Treat as a stale-host conflict — the response is <strong>not</strong> a successful probe. The device is marked <code>ok=false</code> immediately (definitive: a different display identified itself, so the cached host is unambiguously stale — bypasses the consecutive-miss debounce) and routed through the round-2 mDNS reconciliation path. Older firmware that omits <code>device_id</code> is backwards-compatible: absence is treated as a match, and the daemon falls back to local duplicate-host detection alone.</td>
   </tr>
   <tr>
     <td>Two paired records share the same cached <code>host</code></td>
@@ -460,7 +466,7 @@ flowchart LR
   </tr>
   <tr>
     <td>New device appears on the LAN after first-run</td>
-    <td>Run <code>burnscope pair</code>; the collector re-discovers any newly-visible <code>paired_&lt;agent&gt;=0</code> device and adds it to the agent's paired list. The TOFU claim itself fires on the next push (statusline fire or Codex notification), which 401-drops the device if another laptop won the race.</td>
+    <td>Run <code>burnscope pair</code>; one unfiltered mDNS browse merges every device not already in the agent's list (a brand-new display's slot is free) via <code>add_paired_device</code>. The TOFU claim itself fires on the next push (statusline fire or Codex notification), which 401-drops the device if it's owned by someone else / another laptop won the race.</td>
   </tr>
   <tr>
     <td>Auto-pair-on-first-run race (two clients claiming the same free device simultaneously)</td>
@@ -468,7 +474,7 @@ flowchart LR
   </tr>
   <tr>
     <td>Previously-paired device disappears for many cycles, then returns</td>
-    <td><strong>Self-healing.</strong> The pairing stays in <code>paired-devices.&lt;agent&gt;.json</code> through any number of transport / health failures (the diagnostic counter advances so <code>burnscope status</code> can surface the degraded device, but eviction is gone). When the device returns to mDNS, the next eligible reconciliation cycle (cooldown ≥ 60 s by default) catches the new host via <code>update_paired_device_host</code> and the next push or health probe succeeds — no <code>burnscope pair</code> needed. Stale browses started before a concurrent <code>/summary</code> 401 / <code>pair-reset</code> cannot resurrect a forgotten pairing because the update-only primitive returns <code>False</code> when the device is no longer present.</td>
+    <td><strong>Self-healing.</strong> The pairing stays in <code>paired-devices.&lt;agent&gt;.json</code> through any number of transport / health failures (the per-device failure counters advance so <code>burnscope status</code> can surface the degraded device, but eviction is gone). When the device returns to mDNS, the next eligible reconciliation cycle (cooldown ≥ 60 s by default) catches the new host via <code>update_paired_device_host</code> and the next push or health probe succeeds — no <code>burnscope pair</code> needed. Stale browses started before a concurrent <code>/summary</code> 401 / <code>pair-reset</code> cannot resurrect a forgotten pairing because the update-only primitive returns <code>False</code> when the device is no longer present.</td>
   </tr>
   <tr>
     <td>Pairing concurrently removed (<code>/summary</code> 401 or <code>pair-reset</code>) while an mDNS reconciliation is in flight</td>
@@ -582,6 +588,11 @@ flowchart LR
     <td>Returns Claude's plaintext identifier. Resolution: <code>oauthAccount.emailAddress</code> from <code>~/.claude.json</code>; falls back to top-level <code>userID</code> when emailAddress is missing or empty. Raises <code>IdentityError</code> when both are absent or the file is missing/malformed.</td>
   </tr>
   <tr>
+    <td class="mono">redact_client_id</td>
+    <td><code>(client_id: str) → str</code></td>
+    <td>Debug-safe form of an identifier for logging (<code>jo***@example.com</code> / <code>ab*** (40 chars)</code>) so the operator's email/userID isn't leaked verbatim to log sinks. Used by both the Claude statusline and the Codex daemon. (The value still travels plaintext on the wire — redaction is for logs only.)</td>
+  </tr>
+  <tr>
     <td class="mono">CLAUDE_SETTINGS_FILE</td>
     <td><code>Path</code></td>
     <td>Module-level <code>Path.home() / ".claude.json"</code>. Tests monkeypatch this.</td>
@@ -625,9 +636,9 @@ flowchart LR
   <tr><th>File</th><th>Owner</th><th>Reader(s)</th><th>Purpose</th></tr>
   <tr><td class="mono">paired-devices.claude.json</td><td>Claude collector (statusline <code>--push</code> child)</td><td>Claude collector, <code>cli.py</code> (status, pair, pair-reset)</td><td>List of <code>{device_id, host}</code> entries representing displays whose <code>claude</code> NVS slot is bound to this laptop's identifier.</td></tr>
   <tr><td class="mono">paired-devices.codex.json</td><td>Codex daemon pusher coroutine</td><td>Codex daemon, <code>cli.py</code></td><td>Same shape as Claude's list, for the <code>codex</code> slot.</td></tr>
-  <tr><td class="mono">last-push.claude</td><td>Claude collector</td><td>Claude collector (next fire indicator), <code>cli.py status</code></td><td>Aggregated outcome of the most recent fan-out push (<code>{"ok": bool, "at": unix_seconds}</code>). <code>ok</code> is true iff every paired device responded <code>204</code> <em>and</em> no device is in an unresolved duplicate-host group. Drives the <code>✓</code> / <code>✗</code> indicator on the next statusline fire.</td></tr>
-  <tr><td class="mono">last-push.codex</td><td>Codex daemon</td><td><code>cli.py status</code></td><td>Same shape as Claude's aggregate.</td></tr>
-  <tr><td class="mono">last-push.{agent}.{device_id}</td><td>collectors</td><td><code>cli.py status</code></td><td>Per-device push outcome, written alongside the aggregate. Carries a <code>consecutive_failures</code> counter that survives short-lived statusline children — diagnostic only, never used for eviction (the mDNS resilience plan trades eviction for throttled reconciliation).</td></tr>
+  <tr><td class="mono">last-push.{agent}.{device_id}</td><td>collectors (per device, every fan-out / health probe)</td><td><code>cli.py status</code>, <code>compute_aggregate_ok</code></td><td><strong>Single source of truth</strong> for display health: <code>{"ok": bool, "at": unix_seconds, "consecutive_failures": int}</code>. The <code>consecutive_failures</code> counter survives short-lived statusline children so <code>burnscope status</code> can surface a degraded device; on the push side it is diagnostic only (never drives eviction). The ✓/✗/… indicator is <em>derived</em> from these files, not stored separately — see <code>compute_aggregate_ok</code> below.</td></tr>
+  <tr><td class="mono">last-push.{agent} (aggregate)</td><td>(no longer written)</td><td>—</td><td><strong>Vestigial.</strong> Since #73 the aggregate is not stored: <code>compute_aggregate_ok(agent)</code> derives the ✓/✗/… verdict on read from the per-device files above, so it can never disagree with them. A stale aggregate file left by an older client is ignored and removed by <code>pair-reset</code>.</td></tr>
+  <tr><td class="mono">client-id.{agent}</td><td>collectors (first identity resolve)</td><td>collectors, <code>cli.py</code> (status, pair, pair-reset)</td><td>Plaintext per-agent identifier (Claude email / userID, Codex account email) cached so the statusline doesn't re-read <code>~/.claude.json</code> every fire and the daemon doesn't re-derive on restart. Validated on read (printable ASCII, ≤ 254 bytes). <code>burnscope pair</code> needs it; <code>pair-reset</code> wipes it.</td></tr>
   <tr><td class="mono">mdns-reconcile.{agent}.json</td><td>collectors (via <code>claim_reconcile_slots</code>)</td><td>collectors</td><td>Map of <code>{device_id: last_reconcile_unix_ts}</code>. Gates how often a failing or duplicated device can drive a fresh full-LAN mDNS browse. Default cooldown 60 s, overridable via <code>BURNSCOPE_MDNS_RECONCILE_COOLDOWN_S</code>. Shared across the transport-failure and duplicate-host paths so they can't double-trigger a browse within the cooldown.</td></tr>
 </table>
 
@@ -641,11 +652,14 @@ flowchart LR
   <tr><td class="mono">remove_paired_device</td><td><code>(agent: str, device_id: str) → None</code></td><td>No-op if the device is not in the list. Only called on <code>/summary</code> 401; transport / health failures never invoke it.</td></tr>
   <tr><td class="mono">write_push_state</td><td><code>(agent: str, ok: bool, device_id: str | None = None) → None</code></td><td>Writes the aggregate <code>last-push.&lt;agent&gt;</code>, or the per-device <code>last-push.&lt;agent&gt;.&lt;device_id&gt;</code> when <code>device_id</code> is given.</td></tr>
   <tr><td class="mono">read_push_state</td><td><code>(agent: str, device_id: str | None = None) → dict | None</code></td><td>Returns the parsed state, or <code>None</code> if absent / malformed.</td></tr>
+  <tr><td class="mono">compute_aggregate_ok</td><td><code>(agent: str) → bool | None</code></td><td><strong>Derives the ✓/✗/… verdict on read</strong> (#73) — the aggregate is no longer stored, removing the bug class where one of the ~6 writer sites flipped the aggregate while another left a device the opposite color. Pure function of the per-device <code>last-push</code> files: <code>False</code> if any paired device's last outcome was not ok (a known failure outranks a missing outcome, so a freshly-paired device can't mask an already-failing peer); <code>None</code> (pending) when nothing is paired yet or every device is ok-or-unrecorded with at least one unrecorded; <code>True</code> when every paired device has a recorded ok outcome. Reflects <em>device</em> health only — collector preconditions (missing client_id, unparseable input) surface via exit code + log, never this verdict.</td></tr>
+  <tr><td class="mono">read_client_id / write_client_id / invalidate_client_id</td><td><code>(agent[, id]) → …</code></td><td>Read / persist / drop the cached plaintext identifier in <code>client-id.&lt;agent&gt;</code>. <code>read_client_id</code> validates (printable ASCII, ≤ 254 bytes) and returns <code>None</code> on miss/garbage. The Claude statusline and Codex daemon cache here so they don't re-derive identity every fire / restart.</td></tr>
   <tr><td class="mono">bump_push_failures</td><td><code>(agent: str, device_id: str) → int</code></td><td>Atomically increment the per-device <code>consecutive_failures</code> counter; also writes <code>ok=False</code>. Diagnostic-only — surfaces degraded devices in <code>burnscope status</code>; never drives eviction.</td></tr>
   <tr><td class="mono">reset_push_failures</td><td><code>(agent: str, device_id: str) → None</code></td><td>Clears the counter and writes <code>ok=True</code>. Paired with <code>bump_push_failures</code> for stateless callers (the Claude statusline child).</td></tr>
   <tr><td class="mono">claim_reconcile_slots</td><td><code>(agent: str, device_ids: Iterable[str], *, now: float | None = None, cooldown_s: float | None = None) → set[str]</code></td><td>Atomically filters <code>device_ids</code> to the ones whose mDNS-reconciliation cooldown has expired and marks each as just-reconciled. The read-check-write runs inside the per-agent flock so two concurrent statusline children race to a single winner; the loser sees its own just-written timestamp and reports the device as in-cooldown. Used by both <code>refresh_and_retry_transport_failures</code> and <code>reconcile_duplicate_hosts</code> in <code>pusher.py</code>, and by the codex daemon's health loop.</td></tr>
   <tr><td class="mono">clear_reconcile_state</td><td><code>(agent: str) → None</code></td><td>Drops the per-agent cooldown map. Called by <code>burnscope pair-reset</code> so a fresh re-pair doesn't have to wait for timestamps referencing forgotten devices.</td></tr>
-  <tr><td class="mono">migrate_legacy_host_file</td><td><code>() → None</code></td><td>One-shot: if the v1 <code>host</code> file exists, delete it. No state migration — the auto-pair-on-first-run path will re-claim devices via the existing per-agent TOFU bindings (firmware returns <code>204</code> immediately since the slot is already bound to this identifier).</td></tr>
+  <tr><td class="mono">migrate_legacy_host_file</td><td><code>() → None</code></td><td>One-shot: if the legacy single-host <code>host</code> file exists, delete it and write a <code>v1-upgrade-hint</code> file. No state is converted — the auto-pair-on-first-run path re-discovers and re-claims. Idempotent (no-op when the file is absent).</td></tr>
+  <tr><td class="mono">read_upgrade_hint / clear_upgrade_hint</td><td><code>() → str | None</code> / <code>() → None</code></td><td>Read / clear the one-shot upgrade hint written by <code>migrate_legacy_host_file</code>. <code>burnscope status</code> surfaces it: the v1→v2 client_id format change (hash → plaintext email) means previously-paired devices <code>401</code> until factory-reset, so the hint tells the operator to reset each device and re-run <code>burnscope pair</code>.</td></tr>
 </table>
 
 <p>
@@ -679,7 +693,7 @@ flowchart LR
   <tr>
     <td class="mono">discover_all</td>
     <td><code>(timeout: float = 10.0, agent: str | None = None) → list[DiscoveredDevice]</code></td>
-    <td>Browses for the full <code>timeout</code> (no early-exit). When <code>agent</code> is passed, the result is filtered to devices where <code>paired_&lt;agent&gt; is False</code>. With <code>agent=None</code> the caller gets every device on the LAN with both flags exposed — that's the shape used by all mDNS-reconciliation paths (transport failure recovery, duplicate-host reconciliation, codex health recovery), since they match by stable <code>device_id</code> rather than per-agent slot hints.</td>
+    <td>Browses for the full <code>timeout</code> (no early-exit). When <code>agent</code> is passed, the result is filtered to devices where <code>paired_&lt;agent&gt; is False</code>; with <code>agent=None</code> the caller gets every device on the LAN with both flags exposed. <strong>All current callers pass <code>agent=None</code></strong> — auto-pair, <code>burnscope pair</code>, and every mDNS-reconciliation path (transport-failure recovery, duplicate-host reconciliation, codex health recovery / re-bind) — because they match by stable <code>device_id</code> and must be able to re-claim a device already bound to us. The <code>agent=</code> filter is retained for completeness but currently unused.</td>
   </tr>
 </table>
 
@@ -812,8 +826,10 @@ flowchart LR
 
 <ul>
   <li><strong>Default (no args)</strong> — read JSON from stdin, print
-      statusline to stdout (including the indicator from
-      <code>read_push_state("claude")</code>), fork a detached background
+      statusline to stdout (the ✓/✗/… indicator comes from
+      <code>compute_aggregate_ok("claude")</code>, which derives it from
+      the per-device <code>last-push</code> files — <code>None</code>
+      renders as <code>…</code> pending), fork a detached background
       child to do the push.</li>
   <li><strong><code>--push</code></strong> — read AgentSnapshot JSON from
       stdin (piped by the detached parent), load the agent's paired
@@ -823,10 +839,12 @@ flowchart LR
       <code>reconcile_duplicate_hosts</code> (each gated by the
       file-backed reconciliation throttle so frequent statusline fires
       don't repeatedly browse mDNS for the same offline or aliased
-      device), and call <code>write_push_state("claude", ok=…)</code>
-      with both per-device and aggregate state. Transport / identity
-      failures bump <code>bump_push_failures</code> but never evict —
-      only <code>/summary</code> 401 may remove a pairing.</li>
+      device), and write <strong>per-device</strong> outcomes via
+      <code>reset_push_failures</code> / <code>bump_push_failures</code>.
+      No aggregate write — the next fire derives it. <code>overall_ok</code>
+      becomes the process exit code only. Transport / identity / duplicate-host
+      failures bump <code>bump_push_failures</code> but never evict — only
+      <code>/summary</code> 401 may remove a pairing.</li>
 </ul>
 
 <p>
@@ -856,27 +874,48 @@ flowchart LR
       <code>POST /summary</code> via <code>push_to_all</code>, then
       runs <code>refresh_and_retry_transport_failures</code> and
       <code>reconcile_duplicate_hosts</code> to heal stale IPs and
-      surface identity conflicts. Writes per-device + aggregate
-      <code>last-push.codex*</code>. Advances
+      surface identity conflicts. Writes <strong>per-device</strong>
+      <code>last-push.codex.&lt;device_id&gt;</code> only — no aggregate
+      write; <code>compute_aggregate_ok</code> derives the verdict from
+      those files on read. Advances
       <code>_last_pushed_snapshot</code> when at least one device's
       <code>PushResult.ok</code> is True and that device isn't in the
       duplicate-host-unverified set (gates the Poll coroutine's
-      dedupe — see below). Transport failures bump the diagnostic
+      dedupe — see below). On any device's success it clears
+      <em>both</em> <code>_push_failures</code> and
+      <code>_health_failures</code> for that id: a successful
+      <code>/summary</code> is proof of contact, so it resets the
+      health debounce streak too (otherwise a push that lands between
+      <code>/health</code> timeouts wouldn't stop the threshold from
+      tripping). Transport failures bump the diagnostic
       <code>_push_failures</code> counter but never evict — only
       <code>/summary</code> 401 may remove a pairing.</li>
   <li><strong>Health</strong> — periodic <code>GET /health</code>.
       For each successful body, verifies <code>device_id</code> matches
       the requested paired record (mismatch = stale-host / identity
-      conflict → device is rerouted into the round-2 reconcile path).
-      Devices whose round-1 probe failed are batched into one shared
-      throttled mDNS browse (via <code>claim_reconcile_slots</code>)
+      conflict → marked <code>ok=false</code> immediately and rerouted
+      into the round-2 reconcile path). A <code>401</code>
+      (<code>HEALTH_AUTH_REJECTED</code>) means the slot was wiped by a
+      reboot/reflash → the device is scheduled for re-bind:
+      <code>_verify_rebind_hosts</code> confirms the host via mDNS, then
+      a targeted <code>/summary</code> re-push TOFU-rebinds the empty
+      slot. Devices whose round-1 probe timed out are batched into one
+      shared throttled mDNS browse (via <code>claim_reconcile_slots</code>)
       with a single <code>/health</code> retry at any refreshed host.
       Then runs <code>reconcile_duplicate_hosts</code> on the
       post-recovery paired list and marks aliased devices unverified.
       On body divergence vs <code>_last_pushed_snapshot</code> (the
       anchored value the firmware actually has), re-pushes <em>only</em>
-      to the diverged devices. Transport / identity failures bump the
-      diagnostic <code>_health_failures</code> counter but never evict.</li>
+      to the diverged (and verified-rebind) devices.
+      <strong>Transport timeouts are debounced</strong>:
+      <code>_record_health_failure</code> persists <code>ok=false</code>
+      only after <code>HEALTH_FAILURE_THRESHOLD</code> (5) consecutive
+      misses — so <code>_health_failures</code> is no longer
+      diagnostic-only, it gates the unhealthy write (the streak resets
+      on any healthy probe or successful push). Definitive failures
+      (device_id mismatch, a 401 on the post-mDNS-move retry) bypass the
+      debounce and mark <code>ok=false</code> at once. Never evicts on
+      any health signal.</li>
   <li><strong>Poll</strong> — every <code>POLL_INTERVAL_S</code>
       (60 s), sends <code>account/rateLimits/read</code> to the
       app-server, builds an <code>AgentSnapshot</code>, and enqueues
@@ -942,18 +981,23 @@ flowchart LR
   </tr>
   <tr>
     <td class="mono">burnscope pair [--agent {claude,codex}]</td>
-    <td>Explicit re-discovery. For each agent whose
+    <td>Explicit re-discovery. Runs <strong>one unfiltered</strong>
+        <code>discover_all()</code> browse (no <code>agent=</code> filter;
+        the single browse is reused across both agents so the user waits
+        the ~10 s timeout once, not twice). For each agent whose
         <code>client_id</code> is known (cached in
-        <code>~/.burnscope/client-id.&lt;agent&gt;</code>), runs
-        <code>discover_all(agent=…)</code> and merges every visible
-        <code>paired_&lt;agent&gt;=0</code> device into the agent's
-        paired list via <code>add_paired_device</code>. The TOFU claim
-        itself happens on the next push (statusline fire or Codex
-        notification), which silently drops the device on
-        <code>401</code> if another laptop won the race. With
-        <code>--agent</code> the operation is restricted to that agent.
-        Useful when a new display was added after first-run, or after
-        moving devices between LANs.</td>
+        <code>~/.burnscope/client-id.&lt;agent&gt;</code>), merges every
+        discovered device not already in that agent's list via
+        <code>add_paired_device</code> — including devices already
+        TOFU-bound to us, so a <code>pair-reset</code> or accidental
+        <code>paired-devices.json</code> wipe can recover them. The TOFU
+        claim itself happens on the next push (statusline fire or Codex
+        notification), which silently drops the device on <code>401</code>
+        if it's owned by someone else / another laptop won the race. With
+        <code>--agent</code> the operation is restricted to that agent
+        (agents missing a cached <code>client_id</code> are skipped with a
+        warning). Useful when a new display was added after first-run, or
+        after moving devices between LANs.</td>
   </tr>
   <tr>
     <td class="mono">burnscope pair-reset</td>
@@ -976,11 +1020,12 @@ flowchart LR
   <li><strong>Read stdin</strong> as JSON; locate
       <code>rate_limits.five_hour</code> and <code>rate_limits.seven_day</code>.</li>
   <li><strong>Read indicator state</strong>
-      via <code>read_push_state("claude")</code>
-      (reads <code>~/.burnscope/last-push.claude</code>):
-      <code>{"ok": true}</code> → <code>✓</code>,
-      <code>{"ok": false}</code> → <code>✗</code>,
-      absent → <code>…</code>.</li>
+      via <code>compute_aggregate_ok("claude")</code>
+      (derives from the per-device <code>last-push.claude.*</code> files):
+      <code>True</code> → <code>✓</code>,
+      <code>False</code> → <code>✗</code>,
+      <code>None</code> (pending: nothing paired yet, or a device with no
+      recorded outcome) → <code>…</code>.</li>
   <li><strong>Render statusline</strong> to stdout:
       <code>5h X% · 7d Y% ✓</code>. If <code>rate_limits</code> is absent
       (first-message-of-session or non-subscriber), substitute dashes.
@@ -999,9 +1044,13 @@ flowchart LR
   <li><strong>(Child) Resolve paired devices</strong>:
       <code>devices = load_paired_devices("claude")</code>. If the list is
       empty (first-run or post-<code>pair-reset</code>), run
-      <code>discover_all(agent="claude")</code>, attempt to claim each
-      discovered device by POSTing the snapshot with our client_id, and
-      <code>add_paired_device("claude", device)</code> on every
+      <code>discover_all()</code> <strong>unfiltered</strong> (no
+      <code>agent=</code> filter — a device whose <code>claude</code> slot
+      is already TOFU-bound to us returns <code>204</code> and must be
+      recovered after a <code>paired-devices.json</code> wipe; devices
+      owned by someone else 401 and are skipped below), attempt to claim
+      each discovered device by POSTing the snapshot with our client_id,
+      and <code>add_paired_device("claude", device)</code> on every
       <code>204</code>. <code>401</code> and transport failures are
       silently skipped during this auto-pair phase (next fire retries).</li>
   <li><strong>(Child) Fan-out push</strong> via
@@ -1047,11 +1096,14 @@ flowchart LR
             <code>/summary</code> 401 does.</li>
       </ul>
   </li>
-  <li><strong>(Child) Aggregate indicator</strong>:
-      <code>write_push_state("claude", ok=overall_ok)</code>. The
-      aggregate drives the next statusline fire's indicator. If the
-      paired list is empty after step 7 (no devices on the LAN), the
-      aggregate is <code>ok=False</code> with no per-device entries.</li>
+  <li><strong>(Child) No aggregate write</strong>. The per-device files
+      written in step 12 are the source of truth; the next fire's
+      <code>compute_aggregate_ok("claude")</code> derives the indicator
+      from them, so it can never disagree with per-device state.
+      <code>overall_ok</code> is returned only as the process exit code.
+      If the paired list is empty after step 7 (no devices on the LAN),
+      the child exits non-zero and writes nothing — the derived verdict
+      is <code>None</code> (pending), not a failure.</li>
 </ol>
 
 <p>
@@ -1134,8 +1186,10 @@ flowchart LR
 <ol>
   <li>Await a snapshot from the queue.</li>
   <li><code>devices = load_paired_devices("codex")</code>. If empty, run
-      <code>discover_all(agent="codex")</code>, attempt to claim each
-      via <code>POST /summary</code> with the cached client_id, and
+      <code>discover_all()</code> <strong>unfiltered</strong> (no
+      <code>agent=</code> filter, so a device already bound to us is
+      re-claimed after a wipe), attempt to claim each via
+      <code>POST /summary</code> with the cached client_id, and
       <code>add_paired_device("codex", device)</code> on every
       <code>204</code>. Silent skip on <code>401</code> / transport.</li>
   <li><code>results = await push_to_all(snapshot, devices, client_id, client)</code>.</li>
@@ -1143,72 +1197,124 @@ flowchart LR
   <li><code>unverified = await reconcile_duplicate_hosts("codex", load_paired_devices("codex"))</code>.</li>
   <li>Per device, write <code>last-push.codex.&lt;device_id&gt;</code> with
       <code>ok = result.ok and device_id ∉ unverified</code> and update
-      diagnostic counters:
+      the in-memory counters:
       <ul>
         <li><code>device_id ∈ unverified</code> → keep pairing, bump
-            <code>_push_failures</code>; aggregate <code>ok=False</code>.</li>
+            <code>_push_failures</code>; per-device <code>ok=False</code>.</li>
         <li><code>kind="ok"</code> and not unverified → clear
-            <code>_push_failures</code>; any-success advances
-            <code>_last_pushed_snapshot</code>.</li>
+            <em>both</em> <code>_push_failures</code> and
+            <code>_health_failures</code> for that id (a successful push is
+            proof of contact, so it also resets the health debounce streak);
+            any-success advances <code>_last_pushed_snapshot</code>.</li>
         <li><code>kind="auth"</code> → silently
             <code>remove_paired_device("codex", device_id)</code> and
             clear both counters for that device.</li>
         <li><code>kind="transport"</code> → keep pairing, bump
-            <code>_push_failures</code> (diagnostic).</li>
+            <code>_push_failures</code> (diagnostic-only; never evicts).</li>
       </ul></li>
-  <li>Aggregate: <code>write_push_state("codex", ok=overall_ok)</code>.
-      <code>overall_ok</code> is False if any device failed or was
-      unverified, or if the paired list was emptied entirely by 401s.</li>
+  <li><strong>No aggregate write.</strong> The per-device files above are
+      the single source of truth; <code>compute_aggregate_ok("codex")</code>
+      derives the overall verdict on read (this is what fixed the
+      writer-disagreement bug class of #73). An empty paired list (every
+      device 401-dropped) derives to <code>None</code> (pending), not a
+      failure.</li>
 </ol>
 
-<h4>Health coroutine (every 30 s)</h4>
+<h4>Health coroutine (every <code>HEALTH_INTERVAL_S</code> = 30 s)</h4>
 
 <ol>
   <li><strong>Round 1 — initial probe.</strong> For each device in
-      <code>load_paired_devices("codex")</code>:
-      <code>GET /health</code> with the client_id header. Devices that
-      return <code>None</code> (transport / non-2xx / invalid JSON;
-      <code>401</code> is currently agent-agnostic on the firmware side
-      and surfaces here too) go into <code>failed_devices</code>.</li>
-  <li><strong>Identity verification.</strong> For each successful body,
-      compare <code>body["device_id"]</code> (firmware ≥ this build)
-      against the expected paired record. A mismatch means the cached
-      host points at a different physical device — the device is moved
-      from <code>ok_devices</code> to <code>failed_devices</code> so
-      reconciliation can heal the cache. Older firmware that omits the
-      field is treated as a match (backwards-compatible).</li>
+      <code>load_paired_devices("codex")</code>, call
+      <code>fetch_health</code> (sends the client_id header). It returns
+      one of three things, each routed differently:
+      <ul>
+        <li><code>HEALTH_AUTH_REJECTED</code> (<code>401</code>) →
+            reachable but our slot is unbound (the device rebooted /
+            reflashed / wiped NVS). Append to <code>rebind_devices</code>
+            and write <code>ok=false</code> now so state is honest if
+            there's nothing to re-push. <strong>Not</strong> a
+            reachability miss.</li>
+        <li><code>None</code> (transport / non-2xx / invalid JSON) →
+            append to <code>failed_devices</code> for round-2 recovery.
+            A transient timeout, to be <em>debounced</em>, not believed
+            on the first miss.</li>
+        <li>a dict body → run <strong>identity verification</strong>:
+            compare <code>body["device_id"]</code> (firmware ≥ 0.5.x)
+            against the expected record. A mismatch means a different
+            physical display answered at the cached host — write
+            <code>ok=false</code> <em>immediately</em> (definitive stale
+            host, bypasses the debounce) and append to
+            <code>failed_devices</code> so mDNS relocates it. A match
+            (or an older firmware that omits the field) →
+            <code>_mark_health_ok</code>.</li>
+      </ul></li>
+  <li><strong><code>_mark_health_ok</code>.</strong> Clears the
+      device's <code>_health_failures</code> streak, then clears a stale
+      <code>ok=false</code> only when all three hold: a delivery baseline
+      exists this run (<code>_last_pushed_snapshot is not None</code> — a
+      reachable probe alone, e.g. just after a restart, proves only
+      reachability, not that the firmware holds current data); the
+      firmware is <em>not</em> diverged from the last-pushed snapshot; and
+      <code>_push_failures == 0</code> (no newer snapshot is currently
+      failing to deliver to this device). A diverged device is appended
+      to <code>diverged_devices</code> for the targeted re-push instead.</li>
   <li><strong>Round 2 — batched mDNS recovery.</strong> If
       <code>failed_devices</code> is non-empty, call
       <code>_reconcile_health_failures</code>: claim slots via
-      <code>host_cache.claim_reconcile_slots</code> (shared with the
-      push-side throttle), run one <code>discover_all</code>, commit
-      any refreshed host via <code>update_paired_device_host</code>,
-      and retry <code>/health</code> once at the new host. Healed
-      devices clear <code>_health_failures</code> and report
-      <code>ok=True</code>; still-failing devices have
-      <code>_record_health_failure</code> called (writes
-      <code>ok=False</code>, bumps the diagnostic counter, no
-      eviction). Devices removed by a concurrent 401 / <code>pair-reset</code>
-      while the browse was in flight are skipped without resurrecting.</li>
+      <code>claim_reconcile_slots</code> (shared with the push-side
+      throttle), run one <code>discover_all</code>, commit any refreshed
+      host via <code>update_paired_device_host</code> (update-only), and
+      retry <code>/health</code> once at the new host. Outcomes:
+      <ul>
+        <li>retry body → <code>_mark_health_ok</code> (healed).</li>
+        <li>retry <code>None</code> (still timing out) → debounced via
+            <code>_record_health_failure</code>: <code>ok=false</code> is
+            persisted only after <code>HEALTH_FAILURE_THRESHOLD</code> (5)
+            <em>consecutive</em> misses; below that the device keeps its
+            prior state so a transient blip never flips the derived
+            aggregate red.</li>
+        <li>retry <code>HEALTH_AUTH_REJECTED</code> → <code>ok=false</code>
+            immediately (definitive, bypasses the debounce — slot unbound
+            at the now-correct host).</li>
+        <li>inside cooldown, not seen on mDNS, or same host →
+            <code>_record_health_failure</code> (debounced), no browse.</li>
+        <li>pairing removed by a concurrent 401 / <code>pair-reset</code>
+            during the browse → skipped without resurrecting.</li>
+      </ul>
+      In every case the pairing is preserved — only <code>/summary</code>
+      401 evicts.</li>
+  <li><strong>401 re-bind verification.</strong> If
+      <code>rebind_devices</code> is non-empty <em>and</em> a
+      <code>_last_pushed_snapshot</code> exists,
+      <code>_verify_rebind_hosts</code> confirms via mDNS that each 401
+      device's host still maps to its <code>device_id</code> before any
+      re-bind — a 401 at a stale host can be a different display after a
+      DHCP reassignment, and blind <code>/summary</code> would TOFU-bind
+      the wrong device. Only mDNS-confirmed hosts are returned (shares the
+      reconcile cooldown).</li>
   <li><strong>Duplicate-host check.</strong>
       <code>reconcile_duplicate_hosts("codex", load_paired_devices("codex"))</code>
-      runs against the post-recovery list. Devices in the unverified
-      set get <code>write_push_state(ok=False, device_id=…)</code> so
-      the aggregate is honest until reconciliation can split them.</li>
-  <li><strong>Aggregate.</strong> If no device was verifiably healthy in
-      either round (and no duplicate-host healed device made it through
-      unverified-free), write aggregate <code>ok=False</code>.</li>
-  <li><strong>Divergence re-push.</strong> For round-1-or-round-2-success
-      bodies, compare per-agent <code>sessions</code> against
-      <code>_last_pushed_snapshot</code> (the anchored value the
-      firmware actually received — comparing against the raw
-      <code>_last_snapshot</code> would manufacture a spurious
-      divergence each cycle because the poll-loop anchoring keeps
+      runs against the post-recovery list. Devices still aliasing another
+      paired entry get a per-device <code>ok=false</code> write so the
+      derived aggregate stays honest until reconciliation splits them.</li>
+  <li><strong>No aggregate write.</strong> The per-device files written
+      above (round-1 branches, <code>_mark_health_ok</code>,
+      <code>_record_health_failure</code>, the duplicate-host loop, and
+      the re-push below) are the single source of truth;
+      <code>compute_aggregate_ok</code> derives the verdict on read.</li>
+  <li><strong>Targeted re-push.</strong> Re-push
+      <code>_last_pushed_snapshot</code> to
+      <code>diverged_devices + verified_rebind</code> only — never the
+      whole fleet, so idle peers aren't woken.
+      Divergence is measured against <code>_last_pushed_snapshot</code>
+      (the anchored value the firmware actually received); comparing
+      against the raw <code>_last_snapshot</code> would manufacture a
+      spurious divergence every cycle, since poll-loop anchoring keeps
       <code>_last_pushed_snapshot</code> stable while
-      <code>_last_snapshot</code> tracks the drifting wire value). On
-      divergence, re-push <em>only</em> to the diverged devices —
-      pushing to already-fresh peers would wake their idle SM and
-      waste bandwidth.</li>
+      <code>_last_snapshot</code> tracks the drifting wire value. The
+      re-push goes through <code>_push_to_devices</code>, which writes the
+      true per-device outcome and (for a verified re-bind) TOFU-binds the
+      empty slot or 401-drops a slot now owned by a different id.</li>
 </ol>
 
 <h4>Subprocess failure</h4>
@@ -1259,7 +1365,7 @@ burnscope status           # confirm wiring</code></pre>
   </tr>
   <tr>
     <td class="mono">host_cache.py</td>
-    <td>Atomic write under concurrent <code>save_paired_devices()</code> calls. <code>load_paired_devices(agent)</code> returns <code>[]</code> for missing/empty/garbage files. <code>add_paired_device</code> deduplicates by <code>device_id</code>. <code>update_paired_device_host</code> rewrites the host of a known device, returns <code>False</code> for an unknown one (anti-resurrection contract under concurrent <code>/summary</code> 401 / <code>pair-reset</code>), preserves list order, and is per-agent isolated. <code>remove_paired_device</code> is idempotent. <code>bump_push_failures</code> / <code>reset_push_failures</code> persist <code>consecutive_failures</code> across short-lived statusline children (diagnostic only — never used for eviction). <code>claim_reconcile_slots</code> exercises cold-cache, in-cooldown, partial eligibility, env override (good and bad value), per-agent isolation, empty input, unsafe device_id rejection, corrupted state recovery, and a concurrent claim race that resolves to a single winner. <code>clear_reconcile_state</code> is idempotent and lets a freshly re-paired device claim immediately. Per-agent state files do not cross-contaminate. <code>migrate_legacy_host_file()</code> removes the v1 <code>host</code> file when present and is a no-op otherwise.</td>
+    <td>Atomic write under concurrent <code>save_paired_devices()</code> calls. <code>load_paired_devices(agent)</code> returns <code>[]</code> for missing/empty/garbage files. <code>add_paired_device</code> deduplicates by <code>device_id</code>. <code>update_paired_device_host</code> rewrites the host of a known device, returns <code>False</code> for an unknown one (anti-resurrection contract under concurrent <code>/summary</code> 401 / <code>pair-reset</code>), preserves list order, and is per-agent isolated. <code>remove_paired_device</code> is idempotent. <code>bump_push_failures</code> / <code>reset_push_failures</code> persist <code>consecutive_failures</code> across short-lived statusline children (diagnostic only — never used for eviction). <code>claim_reconcile_slots</code> exercises cold-cache, in-cooldown, partial eligibility, env override (good and bad value), per-agent isolation, empty input, unsafe device_id rejection, corrupted state recovery, and a concurrent claim race that resolves to a single winner. <code>clear_reconcile_state</code> is idempotent and lets a freshly re-paired device claim immediately. <code>compute_aggregate_ok</code> derivation: <code>None</code> for no devices and for ok-with-pending; <code>False</code> when any device's last outcome was not ok (a known failure outranks a pending peer); <code>True</code> only when every device recorded ok. Per-agent state files do not cross-contaminate. <code>migrate_legacy_host_file()</code> removes the legacy <code>host</code> file and writes the <code>v1-upgrade-hint</code> when present, and is a no-op otherwise; <code>read_upgrade_hint</code> / <code>clear_upgrade_hint</code> round-trip.</td>
   </tr>
   <tr>
     <td class="mono">discovery.py</td>
@@ -1271,11 +1377,11 @@ burnscope status           # confirm wiring</code></pre>
   </tr>
   <tr>
     <td class="mono">claude_statusline.py</td>
-    <td>End-to-end with mocked stdin: statusline output format, push child spawned with correct args, indicator file read for previous state. <code>rate_limits</code>-absent path doesn't push. <code>--push</code> mode: empty paired-list triggers auto-pair (discovery + per-device claim); cached non-empty list skips discovery; fan-out push records per-device outcomes; <code>401</code> from one device removes only that device from the agent's list; <code>kind="transport"</code> preserves the device with <code>ok:false</code> per-device; 10+ consecutive transport failures still leave the device paired (only <code>/summary</code> 401 evicts); two paired records sharing the same cached host with HTTP success → both stay paired but both reported <code>ok:false</code> with aggregate <code>ok=False</code> until reconciliation splits them; stale cached IP healed via mDNS reconciliation and the retry pushes to the refreshed host.</td>
+    <td>End-to-end with mocked stdin: statusline output format, push child spawned with correct args, indicator derived via <code>compute_aggregate_ok</code> (✓ / ✗ / … for True / False / None-pending). <code>rate_limits</code>-absent path doesn't push. <code>--push</code> mode: empty paired-list triggers auto-pair (discovery + per-device claim); cached non-empty list skips discovery; fan-out push records per-device outcomes (no aggregate write — derived on the next fire); <code>401</code> from one device removes only that device from the agent's list; <code>kind="transport"</code> preserves the device with <code>ok:false</code> per-device; 10+ consecutive transport failures still leave the device paired (only <code>/summary</code> 401 evicts); two paired records sharing the same cached host with HTTP success → both stay paired but both reported <code>ok:false</code> (so the derived aggregate is False) until reconciliation splits them; stale cached IP healed via mDNS reconciliation and the retry pushes to the refreshed host.</td>
   </tr>
   <tr>
     <td class="mono">codex_daemon.py</td>
-    <td>Integration with mocked app-server subprocess: bootstrap sequence; account.email becomes the wire-level client_id verbatim; rateLimits/updated → push; subprocess EOF triggers restart with backoff; multi-device fan-out push semantics match the Claude collector; health divergence on one device re-pushes only to that device. Push transport failures bump the diagnostic counter but never evict (10+ misses still keeps the pairing). Push-side stale-IP healed via mDNS reconciliation with one retry at the refreshed host. Push-side duplicate-host conflict: both ids reported <code>ok=False</code> even on HTTP 204, both stay paired. Health-side: many consecutive misses keep the device paired (counter advances past the old threshold without eviction); stale IP triggers one throttled mDNS browse and the retry succeeds at the new host; repeated cycles inside the cooldown window do not re-browse (single browse for many failures); concurrent removal during health reconcile drops the retry without resurrecting; <code>/health.device_id</code> mismatch routes the device into the round-2 reconcile path and the cache heals to the real host; absence of <code>device_id</code> (older firmware) is treated as a match (backwards-compat); duplicate-host conflict on the health side reports both <code>ok=False</code> even on successful probes.</td>
+    <td>Integration with mocked app-server subprocess: bootstrap sequence; account.email becomes the wire-level client_id verbatim; rateLimits/updated → push; subprocess EOF triggers restart with backoff; multi-device fan-out push semantics match the Claude collector; health divergence on one device re-pushes only to that device. Push transport failures bump the diagnostic counter but never evict (10+ misses still keeps the pairing). Push-side stale-IP healed via mDNS reconciliation with one retry at the refreshed host. Push-side duplicate-host conflict: both ids reported <code>ok=False</code> even on HTTP 204, both stay paired. Health-side (<code>test_codex_daemon_health_recovery.py</code>): a single <code>/health</code> miss does NOT mark the device unhealthy — <code>ok=false</code> is written only after <code>HEALTH_FAILURE_THRESHOLD</code> consecutive misses; the streak resets on a healthy probe and on a successful <code>/summary</code> push; the device stays paired regardless of miss count (no eviction). Definitive failures bypass the debounce: a <code>/health.device_id</code> mismatch and a 401 on the post-mDNS-move retry mark <code>ok=false</code> at once. A <code>HEALTH_AUTH_REJECTED</code> (401) schedules a re-bind only after <code>_verify_rebind_hosts</code> mDNS-confirms the host, then a targeted <code>/summary</code> re-push TOFU-binds the slot. Stale IP triggers one throttled mDNS browse and the retry succeeds at the new host; repeated cycles inside the cooldown window do not re-browse; concurrent removal during health reconcile drops the retry without resurrecting; absence of <code>device_id</code> (older firmware) is treated as a match (backwards-compat); duplicate-host conflict reports both <code>ok=false</code> even on successful probes; <code>_mark_health_ok</code> won't clear a persisted <code>ok=false</code> before a delivery baseline exists this run. The aggregate is asserted via <code>compute_aggregate_ok</code> on the per-device files, never a separately stored flag.</td>
   </tr>
   <tr>
     <td class="mono">cli.py</td>
@@ -1316,16 +1422,28 @@ burnscope status           # confirm wiring</code></pre>
 <h4>v2 → v2+multi-device upgrade</h4>
 
 <p>
-  An existing v2 client deployment had a single-host
+  An older client deployment had a single-host
   <code>~/.burnscope/host</code> file. On the first read after upgrade,
-  <code>migrate_legacy_host_file()</code> deletes the file. No state
-  conversion is performed. Each collector's first fire afterward hits
-  the empty paired-list branch, runs discovery, and re-claims devices
-  via the existing per-agent TOFU bindings — the firmware returns
-  <code>204</code> immediately because the agent slot is already bound
-  to this laptop's identifier, and the device lands in the per-agent
-  paired list. Zero-shim migration.
+  <code>migrate_legacy_host_file()</code> deletes the file <em>and</em>
+  writes a one-shot <code>v1-upgrade-hint</code> that
+  <code>burnscope status</code> surfaces. No state is converted: each
+  collector's first fire afterward hits the empty paired-list branch,
+  runs discovery, and tries to re-claim every visible device via a
+  normal <code>POST /summary</code>. Whether that re-claim succeeds
+  depends on what the device's NVS slot already holds:
 </p>
+
+<ul>
+  <li>If the slot holds <em>this laptop's plaintext identifier</em>
+      (a device paired by an already-plaintext client) → <code>204</code>,
+      auto-reclaimed silently, no operator action.</li>
+  <li>If the slot holds a <em>v1-era hashed</em> client_id → the v2
+      client's plaintext identifier won't match → <code>401</code>, and
+      the device is silently skipped. This is why the migration writes
+      the recovery hint: the operator must factory-reset each such device
+      (clear NVS) and re-run <code>burnscope pair</code>. The hint text
+      spells this out so <code>burnscope status</code> can guide them.</li>
+</ul>
 
 <p>
   No data is migrated. The wire format is backward-compatible at the

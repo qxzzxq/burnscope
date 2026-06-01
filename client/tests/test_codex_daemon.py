@@ -1635,6 +1635,77 @@ async def test_health_loop_identity_mismatch_marks_unhealthy_immediately(monkeyp
     }
 
 
+async def test_health_reconcile_retry_401_marks_unhealthy_immediately(monkeypatch):
+    """A /health 401 found on the post-mDNS-move retry must mark the device
+    unhealthy immediately, bypassing the consecutive-miss debounce.
+
+    Scenario: a device is unreachable at its stale cached host (transport
+    miss), mDNS relocates it to a new host, and the retry there returns
+    HEALTH_AUTH_REJECTED — reachable but our slot is unbound (rebooted /
+    NVS-wiped). That's definitive, not a transient timeout: the device
+    won't accept/display summaries until re-bound, exactly like the
+    top-level /health 401 branch, which marks ok=False at once. Routing the
+    retry-path 401 through the debounced _record_health_failure left a
+    previously-healthy device green for the debounce window (Codex review
+    P2 on PR #74).
+
+    The second initial probe at the moved host hangs, so the device cannot
+    be re-marked via the next cycle's top-level 401 branch — proving the
+    ok=False came from the retry path on the move cycle, with the debounce
+    counter untouched (stays 0, mirroring the top-level 401 branch).
+    """
+    from burnscope_client.discovery import DiscoveredDevice
+
+    daemon = CodexDaemon()
+    daemon._client_id = "u@example.com"
+    host_cache.add_paired_device("codex", PairedDevice("dev-moved", "10.0.0.5:80"))
+    # Device was healthy before it moved + lost its binding.
+    host_cache.write_push_state("codex", ok=True, device_id="dev-moved")
+
+    new_host_calls = 0
+
+    async def fake_fetch_health(host, client_id, client):
+        nonlocal new_host_calls
+        if host == "10.0.0.5:80":
+            return None  # stale host: unreachable → triggers reconcile
+        # Moved host: first call is the post-move retry (401); freeze any
+        # later cycle's initial probe so it can't re-mark via the top path.
+        new_host_calls += 1
+        if new_host_calls == 1:
+            return codex_daemon.HEALTH_AUTH_REJECTED
+        await asyncio.sleep(3600)
+    monkeypatch.setattr(codex_daemon, "fetch_health", fake_fetch_health)
+    monkeypatch.setattr(codex_daemon, "HEALTH_INTERVAL_S", 0.005)
+
+    async def fake_discover_all(timeout=4.0, agent=None, zc=None):
+        return [DiscoveredDevice("dev-moved", "10.0.0.9:80", True, False)]
+    monkeypatch.setattr(codex_daemon, "discover_all", fake_discover_all)
+    from burnscope_client import pusher as pusher_mod
+    monkeypatch.setattr(pusher_mod, "discover_all", fake_discover_all)
+
+    task = asyncio.create_task(daemon._health_loop())
+    try:
+        for _ in range(200):
+            state = host_cache.read_push_state("codex", device_id="dev-moved")
+            if state is not None and state.get("ok") is False:
+                break
+            await asyncio.sleep(0.005)
+        else:
+            raise AssertionError("retry-path 401 never marked device unhealthy")
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    # Host was refreshed by the reconcile, ok flipped false on the move
+    # cycle's retry, and the debounce counter was never touched.
+    assert host_cache.load_paired_devices("codex") == [
+        PairedDevice("dev-moved", "10.0.0.9:80")
+    ]
+    assert host_cache.read_push_state("codex", device_id="dev-moved")["ok"] is False
+    assert daemon._health_failures.get("dev-moved", 0) == 0
+
+
 async def test_health_loop_accepts_response_without_device_id(monkeypatch):
     """Backwards compatibility: older firmware doesn't emit device_id.
     Absence of the field must not be treated as a mismatch — the daemon

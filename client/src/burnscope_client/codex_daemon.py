@@ -810,13 +810,22 @@ class CodexDaemon:
                 device_id=device.device_id, host=found.host
             )
             retry = await fetch_health(refreshed.host, self._client_id, client)
-            if retry is None or retry is HEALTH_AUTH_REJECTED:
-                # None: still unreachable at the new host. Sentinel: reachable
-                # there but our slot isn't bound — the cache now points at the
-                # right host, so the next cycle's initial probe will 401 again
-                # and route it through the /summary re-bind path (issue #66).
-                # Record a miss either way and never pass the sentinel into the
-                # divergence comparison (it isn't a body).
+            if retry is HEALTH_AUTH_REJECTED:
+                # Reachable at the moved host but our slot is unbound — a
+                # definitive 401, not a transient timeout. Mark ok=False
+                # immediately (mirroring the top-level /health 401 branch,
+                # which doesn't bump the miss counter either), bypassing the
+                # consecutive-miss debounce: the device won't accept/display
+                # summaries until re-bound. The cache now points at the right
+                # host, so the next cycle's initial probe 401s again and routes
+                # through the /summary re-bind path (issue #66 / Codex P2).
+                host_cache.write_push_state(
+                    AGENT_NAME, ok=False, device_id=refreshed.device_id
+                )
+                continue
+            if retry is None:
+                # Still unreachable at the new host — a transient miss,
+                # debounced like any other timeout.
                 self._record_health_failure(refreshed)
                 continue
             healed.add(refreshed.device_id)

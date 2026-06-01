@@ -150,13 +150,19 @@ class CodexDaemon:
         # change — see `_poll_loop`.
         self._last_pushed_snapshot: AgentSnapshot | None = None
         self._proc: asyncio.subprocess.Process | None = None
-        # Two diagnostic transport-failure counters, one per probe path.
-        # Per the mDNS resilience plan, neither path evicts on transport
-        # failure — only `/summary` 401 removes a pairing. The counters
-        # stay split so a push success cannot zero out accumulated
-        # health failures, and vice versa, keeping the per-path "have we
-        # heard from this device recently" signal honest for logs and a
-        # future `burnscope status` view.
+        # Two per-path transport-failure counters. Per the mDNS resilience
+        # plan, neither path evicts on transport failure — only `/summary`
+        # 401 removes a pairing.
+        #
+        # `_health_failures` is no longer diagnostic-only: it gates the
+        # ok=False write after HEALTH_FAILURE_THRESHOLD consecutive misses,
+        # so it means "consecutive intervals with no confirmed contact." A
+        # successful `/summary` push IS contact, so `_push_to_devices` resets
+        # it on success (PR #74) — that's the one direction where the two
+        # counters are intentionally coupled. The reverse stays split: a
+        # healthy `/health` probe must NOT clear `_push_failures` while a
+        # newer snapshot is still failing to deliver, so `_mark_health_ok`
+        # leaves it intact (deep-review H-2 / Codex P2).
         self._push_failures: dict[str, int] = {}
         self._health_failures: dict[str, int] = {}
 
@@ -455,9 +461,17 @@ class CodexDaemon:
                     self._push_failures.get(device_id, 0) + 1
                 )
             else:
-                # Push succeeded — clear only the push counter. Health
-                # has its own counter and resets independently.
+                # Push succeeded (effective_ok — unverified/duplicate-host
+                # devices took the `continue` above, so this is confirmed
+                # contact with *this* device_id). Clear both counters: the
+                # push obviously delivered, and since `_health_failures` now
+                # gates the ok=False write, a confirmed contact must reset the
+                # consecutive-miss streak too — otherwise a /summary push that
+                # succeeds between /health timeouts wouldn't stop the threshold
+                # from tripping, the exact flaky-LAN false positive this debounce
+                # exists to prevent (Codex review P2 on PR #74).
                 self._push_failures.pop(device_id, None)
+                self._health_failures.pop(device_id, None)
         # Advance the dedupe baseline as soon as *any* device accepted
         # the push — that device now has the snapshot, so re-pushing the
         # same content next minute would pummel a working peer because

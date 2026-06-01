@@ -1196,18 +1196,30 @@ def test_enqueue_bounded_caps_queue_and_keeps_newest():
     assert seen == list(range(total - cap, total))
 
 
-# ============================================== H-2: split push/health counters
+# ===================================== push success resets the health debounce
 
 
-async def test_push_counter_does_not_reset_health_counter(monkeypatch):
-    """A push success must not clear the health failure counter, and
-    vice versa. Without separated counters, either path's success
-    masked the other's accumulated failures (deep-review H-2).
+async def test_push_success_resets_health_debounce_counter(monkeypatch):
+    """A successful /summary push must reset the health-miss debounce counter.
+
+    The counter now gates the ok=False write (PR #74), so it means
+    "consecutive intervals with no successful contact" — and a push *is*
+    contact. In the flaky-LAN case a /summary push often succeeds between
+    /health timeouts (the exact symptom this PR targets); if the counter
+    survived the push, four earlier health timeouts plus one later one would
+    still trip the 5-miss threshold even though the device was never silent
+    for five consecutive intervals. (Codex review P2 on PR #74; this
+    deliberately revises the earlier diagnostic-only H-2 split, under which a
+    push success left the health counter untouched.)
+
+    The reverse direction is unchanged and covered elsewhere: a healthy
+    /health probe must NOT clear `_push_failures` while a newer snapshot is
+    still failing to deliver (test_codex_daemon_health_recovery.py).
     """
     daemon = CodexDaemon()
     daemon._client_id = "u@example.com"
     host_cache.add_paired_device("codex", PairedDevice("dev-x", "10.0.0.5:80"))
-    # Pretend the health loop already saw 3 health failures.
+    # The health loop already saw 3 misses — short of the threshold.
     daemon._health_failures["dev-x"] = 3
 
     async def fake_push_to_all(snapshot, devices, client_id, client):
@@ -1227,10 +1239,10 @@ async def test_push_counter_does_not_reset_health_counter(monkeypatch):
         predicate=lambda: daemon._last_pushed_snapshot is not None,
     )
 
-    # Push success cleared its own counter but the health counter
-    # must remain at 3 — health still hasn't seen recovery.
+    # Confirmed contact via /summary resets both counters — the device was
+    # demonstrably reachable, so the consecutive-miss streak restarts.
     assert daemon._push_failures.get("dev-x", 0) == 0
-    assert daemon._health_failures.get("dev-x") == 3
+    assert daemon._health_failures.get("dev-x", 0) == 0
 
 
 async def test_health_loop_keeps_device_after_many_health_failures(monkeypatch):

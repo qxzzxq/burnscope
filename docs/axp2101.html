@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AXP2101 Power Management Driver</title>
+<style>
+  :root {
+    --accent: #2c5aa0;
+    --accent-soft: #eef3fa;
+    --border: #e1e4e8;
+    --bg-soft: #fafbfc;
+    --bg-code: #f4f4f7;
+    --text: #24292f;
+    --muted: #57606a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    max-width: 1040px;
+    margin: 2em auto;
+    padding: 0 1.5em;
+    color: var(--text);
+    line-height: 1.55;
+  }
+  h1 { border-bottom: 2px solid var(--accent); padding-bottom: .35em; }
+  h2 { border-bottom: 1px solid var(--border); padding-bottom: .25em; margin-top: 2.2em; }
+  h3 { color: var(--accent); margin-top: 1.8em; }
+  h4 { margin-top: 1.4em; margin-bottom: .4em; color: var(--muted); text-transform: uppercase;
+       font-size: .82em; letter-spacing: .05em; }
+  p { margin: .6em 0; }
+  code, pre { font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace; }
+  code {
+    background: var(--bg-code);
+    padding: .1em .35em;
+    border-radius: 3px;
+    font-size: .92em;
+  }
+  pre {
+    background: var(--bg-code);
+    padding: 1em 1.2em;
+    border-radius: 6px;
+    overflow-x: auto;
+    border-left: 3px solid var(--accent);
+    font-size: .87em;
+    line-height: 1.5;
+  }
+  pre code { background: transparent; padding: 0; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 1em 0;
+    font-size: .92em;
+  }
+  th, td {
+    border: 1px solid var(--border);
+    padding: .55em .8em;
+    text-align: left;
+    vertical-align: top;
+  }
+  th { background: var(--bg-soft); font-weight: 600; }
+  td.mono, table.mono td:first-child {
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: .9em;
+    white-space: nowrap;
+  }
+  .toc {
+    background: var(--bg-soft);
+    border: 1px solid var(--border);
+    padding: 1em 1.5em;
+    border-radius: 6px;
+  }
+  .toc ul { margin: .3em 0; padding-left: 1.4em; }
+  .toc li { margin: .15em 0; }
+  .module-header {
+    background: var(--bg-soft);
+    padding: .8em 1.2em;
+    border-radius: 6px;
+    border-left: 4px solid var(--accent);
+    margin-top: 1.8em;
+  }
+  .module-header h3 { margin: 0; }
+  .module-header .path { color: var(--muted); font-family: monospace; font-size: .88em; }
+  .tag {
+    display: inline-block;
+    background: var(--accent-soft);
+    color: var(--accent);
+    padding: .12em .55em;
+    border-radius: 3px;
+    font-size: .78em;
+    font-weight: 600;
+    margin-right: .4em;
+    vertical-align: middle;
+  }
+  .tag-new { background: #d4f4dd; color: #1a7f37; }
+  .tag-gone { background: #ffe1e1; color: #b42318; }
+  blockquote {
+    border-left: 3px solid #ccc;
+    margin: 1em 0;
+    padding: .35em 1em;
+    color: var(--muted);
+    background: var(--bg-soft);
+    border-radius: 0 4px 4px 0;
+  }
+  .diagram {
+    background: white;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 1em;
+    margin: 1.2em 0;
+    overflow-x: auto;
+  }
+  .diagram pre {
+    background: transparent;
+    border-left: none;
+    padding: 0;
+    margin: 0;
+    font-size: .88em;
+  }
+  .small { font-size: .88em; color: var(--muted); }
+  hr { border: 0; border-top: 1px solid var(--border); margin: 2.5em 0; }
+</style>
+</head>
+<body>
+
+<h1>AXP2101 Power Management Driver</h1>
+
+<p class="small">
+  Reference for the battery / charger telemetry driver on the Waveshare
+  ESP32-S3-Touch-AMOLED-1.75 board. Source:
+  <code>firmware/main/displays/amoled_co5300_175/axp2101.{c,h}</code>.
+  Register semantics are mirrored from the Waveshare vendor demo
+  <code>ESP-IDF-v5.5/01_AXP2101</code> (XPowersLib) and cross-checked
+  against the
+  <a href="https://files.waveshare.com/wiki/common/X-power-AXP2101_SWcharge_V1.0.pdf">X-Powers AXP2101 datasheet (SWcharge V1.0)</a>.
+</p>
+
+<div class="toc">
+  <strong>Contents</strong>
+  <ul>
+    <li><a href="#overview">1. Overview</a></li>
+    <li><a href="#bus">2. I&sup2;C bus &amp; addressing</a></li>
+    <li><a href="#registers">3. Register map (verified vs datasheet)</a></li>
+    <li><a href="#caveats">4. Datasheet caveats</a></li>
+    <li><a href="#interface">5. Public interface (<code>axp2101.h</code>)</a></li>
+    <li><a href="#integration">6. Integration in the UI</a></li>
+    <li><a href="#src-h">7. Source — <code>axp2101.h</code></a></li>
+    <li><a href="#src-c">8. Source — <code>axp2101.c</code></a></li>
+  </ul>
+</div>
+
+<!-- =============================================================== -->
+<h2 id="overview">1. Overview</h2>
+
+<p>
+  The AXP2101 is the single-cell NVDC PMU with an on-chip fuel gauge
+  (X-Powers E-Gauge&trade;) fitted to the 1.75" AMOLED board. Our driver
+  is <strong>read-only</strong>: this profile never touches the power
+  rails — the panel is powered from the board's power-on defaults (see
+  <code>driver.c</code>). We only read the fuel gauge and charger status so
+  the UI can show a battery indicator when a pack is attached.
+</p>
+
+<p>
+  The chip shares the I&sup2;C0 bus with the CST9217 touch controller and
+  the QMI8658 IMU. <code>axp2101_init</code> installs that bus
+  <em>idempotently</em>, exactly like <code>touch.c</code> and
+  <code>qmi8658.c</code>: whichever module runs first installs the driver,
+  the others tolerate the redundant install, and the real health gate is
+  the chip-id probe — not the install return code.
+</p>
+
+<!-- =============================================================== -->
+<h2 id="bus">2. I&sup2;C bus &amp; addressing</h2>
+
+<table>
+  <tr><th>Parameter</th><th>Value</th><th>Notes</th></tr>
+  <tr><td>Port</td><td class="mono">I2C_NUM_0</td><td>shared with touch + IMU</td></tr>
+  <tr><td>SDA / SCL</td><td class="mono">GPIO15 / GPIO14</td><td>board <code>IIC_SDA</code> / <code>IIC_SCL</code></td></tr>
+  <tr><td>Clock</td><td class="mono">400 kHz</td><td>matches <code>qmi8658.c</code> / <code>touch.c</code></td></tr>
+  <tr><td>Slave address (7-bit)</td><td class="mono">0x34</td><td>datasheet &sect;6.3 quotes TWSI default <code>0x68/0x69</code> — that is the 8-bit write/read pair; <code>0x68 &gt;&gt; 1 = 0x34</code>. ESP-IDF uses the 7-bit form.</td></tr>
+  <tr><td>Per-op timeout</td><td class="mono">50 ms</td><td><code>pdMS_TO_TICKS(50)</code></td></tr>
+</table>
+
+<blockquote>
+  Note: the 7-bit slave address <code>0x34</code> happens to equal the
+  VBAT-high <em>register</em> address <code>0x34</code>. Different
+  namespaces (device vs register) — the collision is a coincidence.
+</blockquote>
+
+<!-- =============================================================== -->
+<h2 id="registers">3. Register map (verified vs datasheet)</h2>
+
+<p>
+  Every register the driver touches, cross-checked against the AXP2101
+  datasheet &sect;6.13 (register list + per-register bit descriptions).
+</p>
+
+<table>
+  <tr><th>Symbol</th><th>Addr</th><th>Datasheet</th><th>Meaning (bits the driver uses)</th></tr>
+  <tr>
+    <td class="mono">REG_STATUS1</td><td class="mono">0x00</td>
+    <td>&sect;6.13.2.1 <em>PMU status1</em></td>
+    <td>bit&nbsp;3 = battery present (0 absent / 1 present); bit&nbsp;5 = VBUS good (0 / 1).</td>
+  </tr>
+  <tr>
+    <td class="mono">REG_STATUS2</td><td class="mono">0x01</td>
+    <td>&sect;6.13.2.2 <em>PMU status2</em></td>
+    <td>bits&nbsp;[6:5] = <em>Battery Current Direction</em>: <code>00</code> standby, <code>01</code> charge, <code>10</code> discharge. The driver reads <code>(status2 &gt;&gt; 5) &amp; 0x07 == 0x001</code>; bit&nbsp;7 is reserved-0, so this is equivalent to <code>[6:5]==01</code>.</td>
+  </tr>
+  <tr>
+    <td class="mono">REG_IC_TYPE</td><td class="mono">0x03</td>
+    <td><strong>not in datasheet</strong></td>
+    <td>Chip-id probe; expects <code>0x4A</code>. Sourced from XPowersLib, not the public register list — see caveats.</td>
+  </tr>
+  <tr>
+    <td class="mono">REG_ADC_CHAN_CTRL</td><td class="mono">0x30</td>
+    <td>&sect;6.13.2.30 <em>ADC Channel enable control</em></td>
+    <td>bit&nbsp;0 = battery-voltage ADC enable (default 1); bit&nbsp;1 = TS-pin (NTC) ADC enable (default 1). The driver sets bit&nbsp;0 and clears bit&nbsp;1.</td>
+  </tr>
+  <tr>
+    <td class="mono">REG_ADC_VBAT_H</td><td class="mono">0x34</td>
+    <td>&sect;6.13.2.31 <em>vbat_h</em></td>
+    <td>bits&nbsp;[5:0] = <code>vbat[13:8]</code>; bits&nbsp;[7:6] are channel-debug (ignored).</td>
+  </tr>
+  <tr>
+    <td class="mono">REG_ADC_VBAT_L</td><td class="mono">0x35</td>
+    <td>&sect;6.13.2.32 <em>vbat_l</em></td>
+    <td>bits&nbsp;[7:0] = <code>vbat[7:0]</code>. Assembled as <code>((vh &amp; 0x1F) &lt;&lt; 8) | vl</code> — already in mV.</td>
+  </tr>
+  <tr>
+    <td class="mono">REG_BAT_PERCENT</td><td class="mono">0xA4</td>
+    <td>&sect;6.13.1 <em>Battery percentage data</em></td>
+    <td>Fuel-gauge 0..100 %, read directly (clamped to 100).</td>
+  </tr>
+</table>
+
+<!-- =============================================================== -->
+<h2 id="caveats">4. Datasheet caveats</h2>
+
+<p>These are the non-obvious points where the code and the public datasheet
+   don't line up one-to-one — all benign, recorded so a future reader
+   doesn't re-discover them.</p>
+
+<h4>0x03 (chip id) is not in the datasheet</h4>
+<p>
+  The register list (&sect;6.13.1) runs <code>0x00 &rarr; 0x01 &rarr;
+  0x04-0x07</code> — there is <strong>no</strong> IC-type / chip-id /
+  version register documented anywhere in the PDF. The <code>0x03 ==
+  0x4A</code> probe is mirrored from XPowersLib and works on real silicon,
+  but it cannot be validated against this datasheet.
+</p>
+
+<h4>0x35 is real — just hidden inside a range</h4>
+<p>
+  The register list collapses the ADC block into one line,
+  <code>0X34-3D ADC data</code>, so <code>0x35</code> is never named there.
+  It <em>is</em> spelled out in &sect;6.11 (&ldquo;Battery Voltage
+  (reg34H, reg35H)&rdquo;) and &sect;6.13.2.32 (<code>REG 35: vbat_l =
+  vbat[7:0]</code>).
+</p>
+
+<h4>&ldquo;Charging&rdquo; uses current direction, not charge stage</h4>
+<p>
+  STATUS2 has two charge-related fields: bits&nbsp;[6:5] = <em>Battery
+  Current Direction</em> (used here for the binary &ldquo;is
+  charging&rdquo;), and bits&nbsp;[2:0] = <em>charge stage</em>
+  (tri / pre / CC / CV / done). The driver reads the current-direction
+  field, matching XPowersLib's <code>isCharging()</code>.
+</p>
+
+<h4>VBAT is effectively 13-bit (H5L8)</h4>
+<p>
+  The SAR ADC is 14-bit in general (<code>REG34[5:0] = vbat[13:8]</code>),
+  but datasheet Table&nbsp;6-7 caps the VBAT channel at <code>1FFFH</code>
+  (8.191&nbsp;V), so <code>vbat[13]</code> is always 0. The driver's
+  <code>(vh &amp; 0x1F) &lt;&lt; 8 | vl</code> keeps <code>vbat[12:0]</code>
+  (13 bits, max 8191 mV) — matching XPowersLib's <code>readRegisterH5L8</code>.
+  <strong>Heads-up:</strong> VBUS / VSYS / TS (<code>0x36</code>&ndash;<code>0x3B</code>)
+  <em>do</em> use the full 14-bit (H6L8), so don't copy the <code>0x1F</code>
+  mask if you add those channels.
+</p>
+
+<!-- =============================================================== -->
+<h2 id="interface">5. Public interface (<code>axp2101.h</code>)</h2>
+
+<p>Two functions and one snapshot struct:</p>
+
+<table>
+  <tr><th>Symbol</th><th>Signature</th><th>Behaviour</th></tr>
+  <tr>
+    <td class="mono">axp2101_init</td><td class="mono">bool axp2101_init(void)</td>
+    <td>Installs the shared bus (idempotent), verifies chip id <code>0x4A</code>, enables the VBAT ADC and disables the TS-pin measurement (a thermistor-less pack otherwise mis-charges, per the vendor note). Returns <code>false</code> if no AXP2101 answers — caller then skips the battery UI.</td>
+  </tr>
+  <tr>
+    <td class="mono">axp2101_read</td><td class="mono">bool axp2101_read(axp2101_status_t *out)</td>
+    <td>Fills a fresh snapshot. Returns <code>false</code> on I&sup2;C error or if init never succeeded. With no pack: returns <code>true</code> with <code>present=false, percent=-1, millivolts=0</code>. Does its own I&sup2;C, so callers must throttle.</td>
+  </tr>
+  <tr>
+    <td class="mono">axp2101_status_t</td><td class="mono">struct</td>
+    <td><code>present</code> (bool), <code>percent</code> (int8, -1 = absent/unknown), <code>millivolts</code> (uint16), <code>charging</code> (bool), <code>vbus</code> (bool).</td>
+  </tr>
+</table>
+
+<!-- =============================================================== -->
+<h2 id="integration">6. Integration in the UI</h2>
+
+<p>
+  Consumed by <code>ui.c</code> on the 1.75" profile:
+</p>
+<ul>
+  <li><code>axp2101_init()</code> is called once at UI bring-up; its result
+      is cached in <code>s_battery_ok</code>. When <code>false</code> (no
+      PMU / no board) the battery indicator is suppressed entirely.</li>
+  <li><code>sample_battery()</code> calls <code>axp2101_read()</code> at
+      <strong>1&nbsp;Hz</strong> from the UI tick. A failed read is a no-op
+      — the previous reading is kept so a transient bus hiccup doesn't
+      blank the indicator.</li>
+  <li>The paint step is gated on a snapshot of the shown appearance
+      (presence, percent, charging, vbus), so the per-second tick only
+      touches LVGL when something visible actually changed.</li>
+</ul>
+
+<!-- =============================================================== -->
+<h2 id="src-h">7. Source &mdash; <code>axp2101.h</code></h2>
+<pre><code>#pragma once
+
+#include &lt;stdbool.h&gt;
+#include &lt;stdint.h&gt;
+
+/*
+ * axp2101 — battery / power telemetry for the Waveshare 1.75&quot; AMOLED
+ * board&#x27;s AXP2101 PMU. Read-only: this profile does not drive any power
+ * rails (the panel rail is on by the board&#x27;s power-on defaults — see
+ * driver.c). We only read the on-chip fuel gauge and charger status so
+ * the UI can show a battery indicator when a pack is attached.
+ *
+ * The AXP2101 sits at I²C address 0x34 on the same I²C0 bus as the
+ * CST9217 touch controller and the QMI8658 IMU (SDA=GPIO15, SCL=GPIO14);
+ * `axp2101_init` installs that bus idempotently, exactly like touch.c /
+ * qmi8658.c. Register semantics are mirrored from the Waveshare vendor
+ * demo `ESP-IDF-v5.5/01_AXP2101` (XPowersLib).
+ */
+
+/** Snapshot of AXP2101 power state, filled by `axp2101_read`. */
+typedef struct {
+    bool     present;      /* battery physically connected (STATUS1 bit 3) */
+    int8_t   percent;      /* fuel-gauge 0..100 %, -1 when absent/unknown  */
+    uint16_t millivolts;   /* battery voltage in mV, 0 when absent         */
+    bool     charging;     /* charger in the constant-current/voltage state */
+    bool     vbus;         /* external 5 V (USB) present (STATUS1 bit 5)    */
+} axp2101_status_t;
+
+/**
+ * Probe and configure the AXP2101 on the shared I²C0 bus.
+ *
+ * Verifies the chip id (IC_TYPE 0x03 == 0x4A), enables the battery-voltage
+ * ADC, and disables the TS-pin (NTC) measurement so a thermistor-less pack
+ * charges normally — without this the AXP2101 mis-handles charging (per the
+ * vendor demo&#x27;s note). Returns false if no AXP2101 answers at 0x34, in
+ * which case the caller should skip the battery UI entirely. Idempotent;
+ * safe to call after touch_init / qmi8658_init have already installed the bus.
+ */
+bool axp2101_init(void);
+
+/**
+ * Read a fresh power snapshot into `*out`. Returns false on I²C error or
+ * if `axp2101_init` has not succeeded. When no battery is connected,
+ * returns true with `present=false`, `percent=-1`, `millivolts=0`.
+ */
+bool axp2101_read(axp2101_status_t *out);
+</code></pre>
+
+<!-- =============================================================== -->
+<h2 id="src-c">8. Source &mdash; <code>axp2101.c</code></h2>
+<pre><code>/*
+ * AXP2101 PMU battery telemetry for the Waveshare 1.75&quot; AMOLED board.
+ *
+ * Read-only driver: we never touch the power rails (the board powers the
+ * panel from its defaults — see driver.c). The AXP2101 shares the I²C0
+ * bus with the CST9217 touch controller and the QMI8658 IMU on
+ * SDA=GPIO15 / SCL=GPIO14, so the bus install here is idempotent in the
+ * exact same way qmi8658.c / touch.c are: whichever runs first installs
+ * the driver, the others tolerate the redundant install, and the real
+ * health gate is the chip-id probe.
+ *
+ * Register addresses and bit semantics are mirrored from the vendor demo
+ * `ESP-IDF-v5.5/01_AXP2101` and its XPowersLib (XPowersAXP2101.tpp):
+ *   - STATUS1 (0x00): bit 3 = battery present, bit 5 = VBUS good.
+ *   - STATUS2 (0x01): bits[7:5] charge state, 0b001 == charging.
+ *   - IC_TYPE (0x03): chip id, 0x4A for the AXP2101.
+ *   - ADC_CHANNEL_CTRL (0x30): bit 0 = VBAT ADC, bit 1 = TS-pin ADC.
+ *   - ADC_DATA_VBAT (0x34/0x35): 13-bit H5L8 battery voltage in mV.
+ *   - BAT_PERCENT (0xA4): fuel-gauge percentage, read directly.
+ */
+
+#include &quot;axp2101.h&quot;
+
+#include &quot;driver/i2c.h&quot;
+#include &quot;esp_err.h&quot;
+#include &quot;esp_log.h&quot;
+#include &quot;freertos/FreeRTOS.h&quot;  /* pdMS_TO_TICKS — direct include */
+
+static const char *TAG = &quot;axp2101&quot;;
+
+#define AXP_I2C_PORT      I2C_NUM_0
+#define AXP_I2C_SDA       15     /* IIC_SDA — shared peripheral bus */
+#define AXP_I2C_SCL       14     /* IIC_SCL */
+#define AXP_I2C_HZ        400000 /* matches qmi8658.c / touch.c on the shared bus */
+#define AXP_ADDR          0x34   /* AXP2101_SLAVE_ADDRESS */
+#define AXP_I2C_TIMEOUT   pdMS_TO_TICKS(50)
+
+#define REG_STATUS1       0x00
+#define REG_STATUS2       0x01
+#define REG_IC_TYPE       0x03
+#define REG_ADC_CHAN_CTRL 0x30
+#define REG_ADC_VBAT_H    0x34
+#define REG_ADC_VBAT_L    0x35
+#define REG_BAT_PERCENT   0xA4
+
+#define AXP2101_CHIP_ID   0x4A
+
+#define STATUS1_BAT_PRESENT_BIT 3
+#define STATUS1_VBUS_GOOD_BIT   5
+#define ADC_CHAN_VBAT_BIT       0
+#define ADC_CHAN_TS_PIN_BIT     1
+
+static bool s_initialised = false;
+
+/* Install the I²C0 master on the 1.75&quot;&#x27;s shared bus. Idempotent: shared
+ * with touch.c (CST9217) and qmi8658.c (IMU). A redundant install is
+ * ESP_ERR_INVALID_STATE on some IDF versions but ESP_FAIL on v6.0.1 —
+ * either way the bus is up, so any install error is treated as &quot;already
+ * installed, proceed&quot;. The chip-id probe in axp2101_init is the real gate. */
+static esp_err_t ensure_i2c_bus(void)
+{
+    const i2c_config_t cfg = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = AXP_I2C_SDA,
+        .scl_io_num = AXP_I2C_SCL,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = AXP_I2C_HZ,
+    };
+    esp_err_t err = i2c_param_config(AXP_I2C_PORT, &amp;cfg);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = i2c_driver_install(AXP_I2C_PORT, cfg.mode, 0, 0, 0);
+    if (err != ESP_OK) {
+        ESP_LOGD(TAG, &quot;i2c_driver_install: %s — assuming shared bus already up&quot;,
+                 esp_err_to_name(err));
+    }
+    return ESP_OK;  /* the chip-id probe is the real gate, not the install code */
+}
+
+static esp_err_t read_reg(uint8_t reg, uint8_t *out)
+{
+    return i2c_master_write_read_device(AXP_I2C_PORT, AXP_ADDR, &amp;reg, 1,
+                                        out, 1, AXP_I2C_TIMEOUT);
+}
+
+static esp_err_t write_reg(uint8_t reg, uint8_t value)
+{
+    const uint8_t buf[2] = { reg, value };
+    return i2c_master_write_to_device(AXP_I2C_PORT, AXP_ADDR, buf,
+                                      sizeof buf, AXP_I2C_TIMEOUT);
+}
+
+bool axp2101_init(void)
+{
+    esp_err_t bus = ensure_i2c_bus();
+    if (bus != ESP_OK) {
+        ESP_LOGW(TAG, &quot;I2C bus install failed (%s) — battery telemetry disabled&quot;,
+                 esp_err_to_name(bus));
+        return false;
+    }
+
+    uint8_t id = 0;
+    esp_err_t err = read_reg(REG_IC_TYPE, &amp;id);
+    if (err != ESP_OK || id != AXP2101_CHIP_ID) {
+        ESP_LOGW(TAG, &quot;no AXP2101 at 0x%02x (err=%s id=0x%02x) — battery telemetry disabled&quot;,
+                 AXP_ADDR, esp_err_to_name(err), id);
+        return false;
+    }
+
+    /* Read-modify-write the ADC channel control: enable the battery-voltage
+     * ADC (so getBattVoltage has data) and disable the TS-pin measurement.
+     * Disabling TS matters: with a thermistor-less pack the vendor demo
+     * notes that leaving NTC detection on &quot;will cause abnormal charging&quot;. */
+    uint8_t adc = 0;
+    if (read_reg(REG_ADC_CHAN_CTRL, &amp;adc) == ESP_OK) {
+        adc |= (uint8_t)(1u &lt;&lt; ADC_CHAN_VBAT_BIT);
+        adc &amp;= (uint8_t)~(1u &lt;&lt; ADC_CHAN_TS_PIN_BIT);
+        esp_err_t w = write_reg(REG_ADC_CHAN_CTRL, adc);
+        if (w != ESP_OK) {
+            ESP_LOGW(TAG, &quot;ADC channel config write failed (%s) — proceeding&quot;,
+                     esp_err_to_name(w));
+        }
+    }
+
+    s_initialised = true;
+    ESP_LOGI(TAG, &quot;ready @0x%02x (chip id 0x4A)&quot;, AXP_ADDR);
+    return true;
+}
+
+bool axp2101_read(axp2101_status_t *out)
+{
+    if (!s_initialised || out == NULL) {
+        return false;
+    }
+
+    uint8_t status1 = 0;
+    uint8_t status2 = 0;
+    if (read_reg(REG_STATUS1, &amp;status1) != ESP_OK ||
+        read_reg(REG_STATUS2, &amp;status2) != ESP_OK) {
+        return false;
+    }
+
+    const bool present  = (status1 &gt;&gt; STATUS1_BAT_PRESENT_BIT) &amp; 0x01;
+    const bool vbus     = (status1 &gt;&gt; STATUS1_VBUS_GOOD_BIT) &amp; 0x01;
+    /* STATUS2 bits[7:5]: 0b001 == charging (0b010 == discharging, 0b000
+     * == standby). Mirrors XPowersLib isCharging(). */
+    const bool charging = ((status2 &gt;&gt; 5) &amp; 0x07) == 0x01;
+
+    out-&gt;present  = present;
+    out-&gt;vbus     = vbus;
+    out-&gt;charging = charging;
+
+    if (!present) {
+        out-&gt;percent    = -1;
+        out-&gt;millivolts = 0;
+        return true;
+    }
+
+    uint8_t pct = 0;
+    if (read_reg(REG_BAT_PERCENT, &amp;pct) != ESP_OK) {
+        return false;
+    }
+    if (pct &gt; 100) {
+        pct = 100;
+    }
+    out-&gt;percent = (int8_t)pct;
+
+    uint8_t vh = 0;
+    uint8_t vl = 0;
+    if (read_reg(REG_ADC_VBAT_H, &amp;vh) != ESP_OK ||
+        read_reg(REG_ADC_VBAT_L, &amp;vl) != ESP_OK) {
+        return false;
+    }
+    /* 13-bit H5L8 assembly: high register carries the top 5 bits, low
+     * register the bottom 8. The result is already in millivolts. */
+    out-&gt;millivolts = (uint16_t)(((vh &amp; 0x1F) &lt;&lt; 8) | vl);
+    return true;
+}
+</code></pre>
+
+</body>
+</html>

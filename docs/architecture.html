@@ -267,11 +267,15 @@
 <h2 id="wire">3. The wire-format seam</h2>
 
 <p>
-  The daemon ↔ firmware contract is agent-agnostic and hand-mirrored in both
-  Python (<code>schema.py</code>) and C (the firmware snapshot store). The
-  firmware never learns which agent a snapshot came from; it renders whatever
-  <code>AgentSnapshot</code> it is handed. That is what makes adding an agent a
-  laptop-side job — see <a href="./add_an_agent.html">add_an_agent.html</a>.
+  The daemon ↔ firmware contract is hand-mirrored in both Python
+  (<code>schema.py</code>) and C (the firmware snapshot store), and is
+  structurally agent-agnostic: any well-formed <code>AgentSnapshot</code>
+  parses. The agent <em>name</em> is not free-form, though — the firmware
+  validates it against a fixed allowlist (<code>KNOWN_AGENTS</code>), keeps one
+  display slot per known agent, and picks a per-agent icon. So most of adding
+  an agent is a laptop-side job, but a new name also needs a few firmware
+  edits; both are covered in
+  <a href="./add_an_agent.html">add_an_agent.html</a>.
 </p>
 
 <p>

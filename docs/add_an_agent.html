@@ -108,10 +108,14 @@
 <h1>BurnScope — adding a new agent</h1>
 
 <p class="small">
-  How to teach BurnScope about a new AI coding agent. The firmware contract is
-  agent-agnostic, so this is entirely laptop-side work. For how the pieces fit
-  together see <a href="./architecture.html">architecture.html</a>; for the
-  byte-level contract see <a href="./wire-format.md">wire-format.md</a>.
+  How to teach BurnScope about a new AI coding agent. Most of the work is
+  laptop-side — read your agent's usage and shape it into an
+  <code>AgentSnapshot</code>. The wire format is structurally agent-agnostic,
+  but the firmware ships a fixed allowlist of agent names plus two display
+  slots, so a brand-new agent name also needs a few firmware edits
+  (<a href="#firmware">§7</a>). For how the pieces fit together see
+  <a href="./architecture.html">architecture.html</a>; for the byte-level
+  contract see <a href="./wire-format.md">wire-format.md</a>.
 </p>
 
 <div class="toc">
@@ -128,19 +132,25 @@
     <li><a href="#steps">4. Step by step</a></li>
     <li><a href="#snapshot">5. Building the snapshot</a></li>
     <li><a href="#install">6. Wiring the installer</a></li>
+    <li><a href="#firmware">7. Firmware: register the agent name</a></li>
   </ul>
 </div>
 
 <h2 id="boundary">1. Where the work lives</h2>
 
 <p>
-  There is no <code>Agent</code> base class to subclass. The firmware renders
-  whatever <code>AgentSnapshot</code> it is handed and never learns which agent
-  produced it, so everything agent-specific happens upstream of
-  <code>schema.AgentSnapshot</code> on the laptop. Your job is to read your
+  There is no <code>Agent</code> base class to subclass. The wire format is
+  structurally agent-agnostic, so most of the work is laptop-side: read your
   agent's usage data, shape it into an <code>AgentSnapshot</code>, and hand it
-  to the shared push path. The five shared modules
-  (<a href="#modules">§3</a>) do the rest.
+  to the shared push path. The five shared modules (<a href="#modules">§3</a>)
+  do the rest.
+</p>
+
+<p>
+  The firmware is not fully agent-agnostic, though. It validates the snapshot's
+  <code>agent</code> field against a fixed allowlist, holds two display slots,
+  and renders a per-agent icon, so a brand-new agent name needs a few firmware
+  edits before the device will accept it — see <a href="#firmware">§7</a>.
 </p>
 
 <h2 id="patterns">2. Pick a lifecycle</h2>
@@ -291,6 +301,45 @@ snapshot = AgentSnapshot(
   to the per-agent loops in <code>status</code> and <code>pair-reset</code> so
   the tooling reports and resets it alongside the others.
 </p>
+
+<h2 id="firmware">7. Firmware: register the agent name</h2>
+
+<p>
+  The device ships a fixed set of agent names and two display slots, so a new
+  name needs the edits below in <code>firmware/main/</code> (rebuild and flash,
+  or push an OTA, afterwards). Skip the first one and the device answers
+  <code>400</code> to the agent's very first <code>POST /summary</code>.
+</p>
+
+<table>
+  <thead>
+    <tr><th>File</th><th>Change</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td class="mono">http_server.c</td>
+      <td>Add the name to <code>KNOWN_AGENTS[]</code>.
+      <code>parse_snapshot()</code> rejects any other <code>agent</code> value,
+      which the <code>/summary</code> handler returns as <code>400</code>.</td>
+    </tr>
+    <tr>
+      <td class="mono">snapshot.c</td>
+      <td>Raise <code>MAX_AGENTS</code> if you want more than two agents held at
+      once. The store keeps one slot per agent name, so two is the current cap.</td>
+    </tr>
+    <tr>
+      <td class="mono">mdns_svc.c</td>
+      <td>Advertise a <code>paired_&lt;agent&gt;</code> TXT record.
+      <code>discovery</code> reads these per-agent hints to find a device with a
+      free slot, so without it the new agent can't be auto-discovered.</td>
+    </tr>
+    <tr>
+      <td class="mono">displays/&lt;profile&gt;/ui.c</td>
+      <td>Add the agent to the footer list and give it an icon (selection falls
+      back to the Claude glyph otherwise). Repeat for each display profile.</td>
+    </tr>
+  </tbody>
+</table>
 
 </body>
 </html>

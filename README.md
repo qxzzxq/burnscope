@@ -8,45 +8,47 @@ the agent **already produces** (no upstream API calls, no header scraping),
 discover the ESP32 over mDNS, and push the latest numbers straight to it over
 HTTP. No intermediate server.
 
-When you hit the cap and walk away, an always-on display tells you "how much
-have I used / when does it reset" without unlocking a laptop.
+When you hit the cap and walk away, the display tells you how much you've used
+and when it resets, without unlocking a laptop.
 
 ## Supported agents
 
 | Agent | Source on your laptop | Push lifecycle | Windows |
 | --- | --- | --- | --- |
-| **Claude Code** | Statusline hook reading `rate_limits.*` from the runtime payload | Per-fire (after each assistant message) | `current` (5 h), `weekly` (7 d) — fixed, anchored to first prompt of the period |
-| **Codex CLI** | Long-lived daemon over `codex app-server` JSON-RPC | 60 s poll of `account/rateLimits/read`, anchored on `used_pct` so wall-clock-driven `resetsAt` drift doesn't trigger pushes + 30 s `/health` divergence reconciliation | `primary` (5 h), `secondary` (7 d) — both rolling against wall-clock |
+| **Claude Code** | Statusline hook reading `rate_limits.*` from the runtime payload | Per-fire (after each assistant message) | `current` (5 h) and `weekly` (7 d), both fixed and anchored to the first prompt of the period |
+| **Codex CLI** | Long-lived daemon over `codex app-server` JSON-RPC | 60 s poll of `account/rateLimits/read`, anchored on `used_pct` so wall-clock-driven `resetsAt` drift doesn't trigger pushes, plus 30 s `/health` divergence reconciliation | `primary` (5 h) and `secondary` (7 d), both rolling against wall-clock |
 
-Each collector ships its own plaintext identifier (`oauthAccount.emailAddress`
+Each collector sends its own plaintext identifier (`oauthAccount.emailAddress`
 for Claude, `account.email` for Codex) in `X-BurnScope-Client-Id`. The ESP32
 binds it on first push (TOFU) and rejects mismatches with `401`.
 
-## Architecture
+## Supported hardware
 
-```
-┌───────────────────────────────┐       POST /summary           ┌────────────────────┐
-│  Per-agent collectors         │ ────────────────────────────▶ │  ESP32 display     │
-│   - Claude statusline hook    │   AgentSnapshot JSON          │   - mDNS advert    │
-│   - Codex app-server daemon   │   + X-BurnScope-Client-Id     │   - HTTP server    │
-│  Shared: schema, discovery,   │                               │   - NVS pairing    │
-│  identity, pusher, host_cache │                               │   - LVGL renderer  │
-└───────────────────────────────┘                               └────────────────────┘
-```
+Three ESP32 display boards build from the same firmware tree; pick one at
+build time (see [Building & flashing](#building--flashing-the-firmware)).
 
-See:
+- **Cheap Yellow Display (CYD)**: ESP32, ST7789 320×240 LCD, 4 MB flash.
+- **Waveshare ESP32-S3-Touch-AMOLED-1.43"**: ESP32-S3, SH8601/CO5300 466×466 round AMOLED, 16 MB flash.
+- **Waveshare ESP32-S3-Touch-AMOLED-1.75"**: ESP32-S3, CO5300 466×466 round AMOLED, 16 MB flash.
 
-- [`docs/description.md`](./docs/description.md) — design rationale & scope.
-- [`docs/wire-format.md`](./docs/wire-format.md) — daemon ↔ firmware contract (TOFU pairing, monotonic `captured_at`, `/health` shape, error codes).
-- [`docs/client-spec-v2.html`](./docs/client-spec-v2.html) — canonical v2 client spec.
-- [`docs/fsd/firmware-fsd.md`](./docs/fsd/firmware-fsd.md) — firmware functional spec.
+What each board does today (✓ implemented, ✗ not available):
 
-(The historical v1 client spec lives at `docs/client-spec.html` for reference.)
+| Board | Agent display | Auto-rotate | Burn-in guard | Touch | Battery | OTA | OTA rollback |
+| --- | :-: | :-: | :-: | :-: | :-: | :-: | :-: |
+| CYD | ✓ | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ |
+| AMOLED 1.43" | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ |
+| AMOLED 1.75" | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+
+Burn-in guard, auto-rotate, and touch are AMOLED-only; the CYD's LCD doesn't
+age and uses a fixed rotation. Battery telemetry needs the 1.75" board's
+AXP2101 PMU. OTA rollback rides on the ESP32-S3 bootloader, so the CYD takes
+LAN updates but without the auto-revert safety net. Details are in
+[`docs/architecture.html`](./docs/architecture.html).
 
 ## Installing the client
 
-The CLI entry point is `burnscope` (installer/status only, not a daemon
-entry). Install it with [uv](https://docs.astral.sh/uv/) — `client/uv.lock`
+The CLI entry point is `burnscope` (installer and status only, not a daemon
+entry). Install it with [uv](https://docs.astral.sh/uv/); `client/uv.lock`
 pins the deps.
 
 ```sh
@@ -66,86 +68,69 @@ For an editable install (source changes picked up automatically):
 uv tool install --editable ./client
 ```
 
-`install` is per-agent — install only the ones you use. The status command
-prints the cached ESP32 host, identifier source per agent, and the last-push
-indicator under `~/.burnscope/`.
-
-Debugging tips and log-level controls live in [`client/README.md`](./client/README.md).
+`install` is per-agent, so install only the ones you use. The status command
+prints the cached ESP32 host, the identifier source per agent, and the
+last-push indicator under `~/.burnscope/`. Debugging tips and log-level
+controls live in [`client/README.md`](./client/README.md).
 
 ## Building & flashing the firmware
 
-Two display boards are supported; the target chip picks the default
-display profile automatically.
+The target chip picks the default display profile. The 1.75" AMOLED shares the
+ESP32-S3 target with the 1.43" and selects its profile through a dedicated
+sdkconfig.
 
 ```sh
 . ~/.espressif/v6.0.1/esp-idf/export.sh   # once per shell
 cd firmware                                # all commands below run from here
 
-idf.py set-target esp32                    # CYD (cyd2usb, ST7789 320×240)
+idf.py set-target esp32                    # CYD (ST7789 320×240)
 # or
-idf.py set-target esp32s3                  # Waveshare 1.43" AMOLED (SH8601/CO5300, 466×466)
+idf.py set-target esp32s3                  # Waveshare AMOLED 1.43"
 
 idf.py -p <PORT> flash monitor             # builds, writes, then tails serial
 ```
 
-First boot brings up a captive portal (`BURNSCOPE-XXXX` open AP) for WiFi.
-Full details, re-provisioning, and on-device smoke tests in
+For the **1.75" AMOLED**, see the exact `-B build-amoled175 …` invocation in
 [`firmware/README.md`](./firmware/README.md).
 
-After the initial USB flash, subsequent updates can ship over the LAN
-via `burnscope ota <bin> --device <device_id>` (see `POST /ota` in
-[`docs/wire-format.md`](./docs/wire-format.md)). The AMOLED uses a
-16 MB layout with two 5 MB OTA slots, a ~5.8 MB LittleFS volume at
-`/storage` (room for the future pixel-aging map), and bootloader
-rollback enabled — a bad image is reverted automatically if it fails
-to mark itself valid on first boot. The CYD stays on its 4 MB layout
-with two ~1.875 MB OTA slots; it accepts the same `burnscope ota`
-push but does not run the rollback safety net (a corrupted image
-requires a USB re-flash to recover).
+First boot brings up a captive portal (`BURNSCOPE-XXXX` open AP) for WiFi.
+Provisioning, re-provisioning, and on-device smoke tests are covered in
+[`firmware/README.md`](./firmware/README.md).
+
+After the initial USB flash, later updates ship over the LAN with
+`burnscope ota <bin> --device <device_id>` (see `POST /ota` in
+[`docs/wire-format.md`](./docs/wire-format.md)). Per-board partition layouts
+and the bootloader rollback safety net are covered in
+[`docs/architecture.html`](./docs/architecture.html).
+
+## Architecture
+
+A per-agent collector reads the data your agent already writes, finds the
+ESP32 over mDNS, and pushes it over HTTP. There is no intermediate server.
+The wire format is agent-agnostic, so the firmware renders any snapshot
+without knowing which agent produced it.
+
+See [`docs/architecture.html`](./docs/architecture.html) for the full design.
+Reference docs:
+
+- [`docs/description.md`](./docs/description.md): design rationale and scope.
+- [`docs/wire-format.md`](./docs/wire-format.md): the daemon ↔ firmware contract (TOFU pairing, monotonic `captured_at`, `/health` shape, error codes).
+- [`docs/client-spec-v2.html`](./docs/client-spec-v2.html): the canonical v2 client spec.
+- [`docs/fsd/firmware-fsd.md`](./docs/fsd/firmware-fsd.md): the firmware functional spec.
 
 ## Repository layout
 
 ```
 burnscope/
-├── README.md
-├── .claude/CLAUDE.md             ← in-repo agent instructions
-├── docs/
-│   ├── description.md            ← design rationale
-│   ├── wire-format.md            ← daemon ↔ firmware contract
-│   ├── client-spec-v2.html       ← v2 client spec (current)
-│   ├── client-spec.html          ← v1 client spec (historical)
-│   ├── claude-statusline.html    ← Claude Code statusline reference
-│   ├── codex-app-server.html     ← codex app-server reference
-│   └── fsd/firmware-fsd.md       ← firmware functional spec
-├── client/                       ← Python collectors (v2)
-│   └── src/burnscope_client/
-│       ├── schema.py             ← SessionSnapshot / AgentSnapshot
-│       ├── discovery.py          ← mDNS browse for _burnscope._tcp.local
-│       ├── identity.py           ← plaintext client_id resolver
-│       ├── host_cache.py         ← atomic ~/.burnscope/ state
-│       ├── pusher.py             ← POST /summary, GET /health
-│       ├── ota_pusher.py         ← POST /ota (firmware update over LAN)
-│       ├── claude_statusline.py  ← Claude Code statusline hook (per-fire)
-│       ├── codex_daemon.py       ← long-lived Codex daemon
-│       └── cli.py                ← install/uninstall/status/pair{-reset}/ota
-└── firmware/                     ← ESP32 firmware (ESP-IDF; CYD ST7789 + Waveshare 1.43" AMOLED)
+├── client/      ← Python collectors (Claude statusline + Codex daemon)
+├── firmware/    ← ESP32 firmware (ESP-IDF; CYD + AMOLED profiles)
+├── docs/        ← specs, wire format, architecture
+└── .claude/     ← in-repo agent instructions
 ```
 
 ## Adding a new agent
 
-There's no single Agent ABC to subclass. Each agent has its own lifecycle:
-
-- **Statusline-style (per-fire)** — write a script like
-  `claude_statusline.py` that builds an `AgentSnapshot` and forks a detached
-  `--push` child. Register a `burnscope-client install <agent>` path that
-  wires the supervisor (e.g. `settings.json` for Claude Code).
-- **Daemon-style (long-lived)** — write a module like `codex_daemon.py`
-  that owns its upstream subprocess, queues snapshots, and pushes them.
-  Register a `burnscope-client install <agent>` path that drops a launchd
-  plist / systemd unit.
-
-In both cases reuse the shared modules: `schema` (frozen dataclasses,
-matches the wire format), `discovery` (mDNS), `host_cache` (atomic state),
-`identity` (resolves the plaintext identifier sent in the header), and
-`pusher` (the actual HTTP call). The firmware contract is agent-agnostic;
-all the per-agent work is upstream of `schema.AgentSnapshot`.
+There's no single `Agent` base class to subclass. Each agent reads from its
+own native source, upstream of `schema.AgentSnapshot`. See
+[`docs/add_an_agent.html`](./docs/add_an_agent.html) for the two lifecycle
+patterns (statusline per-fire and long-lived daemon) and a step-by-step guide.

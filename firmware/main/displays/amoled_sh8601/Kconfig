@@ -24,7 +24,7 @@ menu "AMOLED burn-in mitigation"
 
     config BURNSCOPE_AMOLED_IDLE_DIM_MINUTES
         int "Minutes of idle before dimming the panel"
-        default 3
+        default 2
         range 1 60
         help
             After this many minutes with no activity event (motion,
@@ -36,7 +36,7 @@ menu "AMOLED burn-in mitigation"
 
     config BURNSCOPE_AMOLED_IDLE_OFF_MINUTES
         int "Minutes of idle before turning the panel off"
-        default 15
+        default 5
         range 1 240
         help
             After this many minutes idle the burn-in adapter issues

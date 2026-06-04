@@ -1120,6 +1120,14 @@ void http_server_start(void)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
     config.uri_match_fn = httpd_uri_match_wildcard;
+    /* A client vanishing mid-connection (e.g. the host dropping off
+     * WiFi) leaves its session socket half-open forever — no keepalive
+     * reaps it. Without LRU purge those dead sessions pile up until all
+     * slots are taken and every new connection is reset at accept,
+     * wedging the server until a physical reboot. Purging the
+     * least-recently-used session instead lets the next incoming
+     * connection self-heal the pool. */
+    config.lru_purge_enable = true;
 
     ESP_ERROR_CHECK(httpd_start(&s_server, &config));
 

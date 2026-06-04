@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BurnScope — architecture</title>
+<style>
+  :root {
+    --accent: #2c5aa0;
+    --accent-soft: #eef3fa;
+    --border: #e1e4e8;
+    --bg-soft: #fafbfc;
+    --bg-code: #f4f4f7;
+    --text: #24292f;
+    --muted: #57606a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    max-width: 1040px;
+    margin: 2em auto;
+    padding: 0 1.5em;
+    color: var(--text);
+    line-height: 1.55;
+  }
+  h1 { border-bottom: 2px solid var(--accent); padding-bottom: .35em; }
+  h2 { border-bottom: 1px solid var(--border); padding-bottom: .25em; margin-top: 2.2em; }
+  h3 { color: var(--accent); margin-top: 1.8em; }
+  h4 { margin-top: 1.4em; margin-bottom: .4em; color: var(--muted); text-transform: uppercase;
+       font-size: .82em; letter-spacing: .05em; }
+  p { margin: .6em 0; }
+  code, pre { font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace; }
+  code {
+    background: var(--bg-code);
+    padding: .1em .35em;
+    border-radius: 3px;
+    font-size: .92em;
+  }
+  pre {
+    background: var(--bg-code);
+    padding: 1em 1.2em;
+    border-radius: 6px;
+    overflow-x: auto;
+    border-left: 3px solid var(--accent);
+    font-size: .87em;
+    line-height: 1.5;
+  }
+  pre code { background: transparent; padding: 0; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 1em 0;
+    font-size: .92em;
+  }
+  th, td {
+    border: 1px solid var(--border);
+    padding: .55em .8em;
+    text-align: left;
+    vertical-align: top;
+  }
+  th { background: var(--bg-soft); font-weight: 600; }
+  td.mono, table.mono td:first-child {
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: .9em;
+    white-space: nowrap;
+  }
+  .toc {
+    background: var(--bg-soft);
+    border: 1px solid var(--border);
+    padding: 1em 1.5em;
+    border-radius: 6px;
+  }
+  .toc ul { margin: .3em 0; padding-left: 1.4em; }
+  .toc li { margin: .15em 0; }
+  .tag {
+    display: inline-block;
+    background: var(--accent-soft);
+    color: var(--accent);
+    padding: .12em .55em;
+    border-radius: 3px;
+    font-size: .78em;
+    font-weight: 600;
+    margin-right: .4em;
+    vertical-align: middle;
+  }
+  blockquote {
+    border-left: 3px solid #ccc;
+    margin: 1em 0;
+    padding: .35em 1em;
+    color: var(--muted);
+    background: var(--bg-soft);
+    border-radius: 0 4px 4px 0;
+  }
+  .note {
+    background: var(--accent-soft);
+    border-left: 3px solid var(--accent);
+    padding: .6em 1em;
+    margin: 1em 0;
+    border-radius: 0 4px 4px 0;
+    font-size: .92em;
+  }
+  .small { font-size: .88em; color: var(--muted); }
+  hr { border: 0; border-top: 1px solid var(--border); margin: 2.5em 0; }
+</style>
+</head>
+<body>
+
+<h1>BurnScope — architecture</h1>
+
+<p class="small">
+  How the pieces fit together: laptop-side collectors that read what your AI
+  coding agents already write to disk, a small HTTP wire format, and ESP32
+  firmware that renders the numbers. For the byte-level contract see
+  <a href="./wire-format.md">wire-format.md</a>; to add support for a new
+  agent see <a href="./add_an_agent.html">add_an_agent.html</a>.
+</p>
+
+<div class="toc">
+  <strong>Contents</strong>
+  <ul>
+    <li><a href="#overview">1. Overview &amp; data flow</a></li>
+    <li><a href="#client">2. Client (laptop side)</a>
+      <ul>
+        <li><a href="#shared">2.1 Shared modules</a></li>
+        <li><a href="#lifecycles">2.2 Two collector lifecycles</a></li>
+        <li><a href="#state">2.3 On-disk state</a></li>
+      </ul>
+    </li>
+    <li><a href="#wire">3. The wire-format seam</a></li>
+    <li><a href="#firmware">4. Firmware (ESP32 side)</a>
+      <ul>
+        <li><a href="#profiles">4.1 Display profiles</a></li>
+        <li><a href="#partitions">4.2 Partition layouts</a></li>
+        <li><a href="#ota">4.3 OTA &amp; rollback</a></li>
+      </ul>
+    </li>
+    <li><a href="#further">5. Further reading</a></li>
+  </ul>
+</div>
+
+<h2 id="overview">1. Overview &amp; data flow</h2>
+
+<p>
+  BurnScope has no server. A collector on your laptop reads the rate-limit
+  data your agent already produces, finds the ESP32 on the local network over
+  mDNS, and pushes the latest numbers straight to it over HTTP. The display
+  holds the last push and renders it until the next one arrives.
+</p>
+
+<pre>┌───────────────────────────────┐       POST /summary           ┌────────────────────┐
+│  Per-agent collectors         │ ────────────────────────────▶ │  ESP32 display     │
+│   - Claude statusline hook    │   AgentSnapshot JSON          │   - mDNS advert    │
+│   - Codex app-server daemon   │   + X-BurnScope-Client-Id     │   - HTTP server    │
+│  Shared: schema, discovery,   │                               │   - NVS pairing    │
+│  identity, pusher, host_cache │                               │   - LVGL renderer  │
+└───────────────────────────────┘                               └────────────────────┘</pre>
+
+<p>
+  Nothing is scraped from an upstream API and no credentials leave the
+  machine. Each collector reads a source the agent writes for its own use,
+  shapes it into an <code>AgentSnapshot</code>, and sends it. One display can
+  hold two agents at once (Claude and Codex) and cycles between them.
+</p>
+
+<h2 id="client">2. Client (laptop side)</h2>
+
+<p>
+  The client lives under <code>client/src/burnscope_client/</code>. It is not
+  a single daemon. The v1 design had one <code>Agent</code> abstract base
+  class and a shared asyncio loop; v2 dropped that because the two agents we
+  support have genuinely different shapes. Each collector now reads from an
+  agent-native, zero-cost source on its own schedule. The full spec is
+  <a href="./client-spec-v2.html">client-spec-v2.html</a> (the historical v1
+  spec is <a href="./client-spec.html">client-spec.html</a>).
+</p>
+
+<h3 id="shared">2.1 Shared modules</h3>
+
+<p>
+  Everything an agent has in common with every other agent lives in five
+  modules. A new collector composes these rather than subclassing anything.
+</p>
+
+<table>
+  <thead>
+    <tr><th>Module</th><th>Responsibility</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td class="mono">schema.py</td>
+      <td><code>SessionSnapshot</code> and <code>AgentSnapshot</code> — frozen
+      dataclasses that mirror <a href="./wire-format.md">wire-format.md</a>.
+      This is the boundary: everything agent-specific happens upstream of it.</td>
+    </tr>
+    <tr>
+      <td class="mono">discovery.py</td>
+      <td>mDNS browse for <code>_burnscope._tcp.local.</code>
+      <code>discover_all(timeout, agent=None)</code> returns every resolved
+      device with per-agent pairing hints from the TXT records; pass
+      <code>agent=…</code> to keep only devices whose slot is still free.</td>
+    </tr>
+    <tr>
+      <td class="mono">identity.py</td>
+      <td>Resolves the plaintext identifier sent in the
+      <code>X-BurnScope-Client-Id</code> header. For Claude it prefers
+      <code>oauthAccount.emailAddress</code> from <code>~/.claude.json</code>.
+      No hashing — the device shows the value on screen.</td>
+    </tr>
+    <tr>
+      <td class="mono">host_cache.py</td>
+      <td>Atomic file-backed state in <code>~/.burnscope/</code> — the paired
+      device list, last-push outcomes, and the mDNS-reconcile cooldown map.
+      See <a href="#state">§2.3</a>.</td>
+    </tr>
+    <tr>
+      <td class="mono">pusher.py</td>
+      <td><code>POST /summary</code> and <code>GET /health</code>.
+      <code>push_to_all()</code> fans out to every paired device in parallel.
+      A <code>401</code> (<code>PushAuthError</code>) is kept distinct from a
+      transport error so callers know whether to drop the device or just
+      record a failure.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3 id="lifecycles">2.2 Two collector lifecycles</h3>
+
+<p>
+  The two agents we ship differ in how their usage data becomes available,
+  so each has its own lifecycle. These are the two templates a new agent
+  follows.
+</p>
+
+<h4>Statusline-style (per-fire)</h4>
+<p>
+  <code>claude_statusline.py</code> is a Claude Code statusline hook. Claude
+  runs it after each assistant message and hands it the runtime payload,
+  which already carries <code>rate_limits.*</code>. The foreground process
+  renders the status line and forks a detached <code>--push</code> child; the
+  child builds the snapshot, fans out the push, runs host reconciliation, and
+  exits. There is no long-running process.
+</p>
+
+<h4>Daemon-style (long-lived)</h4>
+<p>
+  <code>codex_daemon.py</code> owns a <code>codex app-server</code> subprocess
+  and runs reader, pusher, health, and poll coroutines. The poll loop calls
+  <code>account/rateLimits/read</code> every 60&nbsp;s and dedupes so that
+  wall-clock drift in Codex's <code>resetsAt</code> does not trigger a push
+  when usage hasn't actually changed. It reconnects with exponential backoff
+  on EOF. See <a href="./codex-app-server.html">codex-app-server.html</a>.
+</p>
+
+<h3 id="state">2.3 On-disk state</h3>
+
+<p>
+  All client state is per-agent and lives in <code>~/.burnscope/</code>
+  (override with <code>BURNSCOPE_STATE_DIR</code>). Pairing is trust-on-first-use:
+  the first successful <code>/summary</code> push binds the device to the
+  collector's identifier, recorded in <code>paired-devices.&lt;agent&gt;.json</code>.
+  A device is only forgotten on a <code>/summary</code> <code>401</code> or an
+  explicit <code>burnscope pair-reset</code> — transport failures and failed
+  health checks never evict, so a display that is merely asleep or off-network
+  is not dropped.
+</p>
+
+<h2 id="wire">3. The wire-format seam</h2>
+
+<p>
+  The daemon ↔ firmware contract is agent-agnostic and hand-mirrored in both
+  Python (<code>schema.py</code>) and C (the firmware snapshot store). The
+  firmware never learns which agent a snapshot came from; it renders whatever
+  <code>AgentSnapshot</code> it is handed. That is what makes adding an agent a
+  laptop-side job — see <a href="./add_an_agent.html">add_an_agent.html</a>.
+</p>
+
+<p>
+  The full contract — request shapes, TOFU pairing, the monotonic
+  <code>captured_at</code> rule, the <code>/health</code> response, error
+  codes, and <code>POST /ota</code> — is in
+  <a href="./wire-format.md">wire-format.md</a>. In short: <code>POST /summary</code>
+  carries the snapshot JSON plus the <code>X-BurnScope-Client-Id</code> header;
+  the device binds that id on first push and answers <code>401</code> on a
+  mismatch.
+</p>
+
+<h2 id="firmware">4. Firmware (ESP32 side)</h2>
+
+<p>
+  The firmware lives under <code>firmware/</code> and is built with ESP-IDF.
+  Several display boards ship from the same source tree; one is selected at
+  build time. The HTTP server, mDNS advertisement, snapshot store, and NVS
+  pairing are shared across all of them — only the panel driver and the LVGL
+  layout change per board.
+</p>
+
+<h3 id="profiles">4.1 Display profiles</h3>
+
+<p>
+  A <em>display profile</em> bundles a panel driver with the UI layout that
+  fits that panel, because layout is geometry-bound (a 320×240 rectangle and
+  a 466×466 circle want different screens). Each profile lives in
+  <code>main/displays/&lt;name&gt;/</code> and is chosen by a Kconfig
+  <code>choice</code> in <code>main/Kconfig.projbuild</code>. The target chip
+  picks a sensible default profile via <code>sdkconfig.defaults.&lt;target&gt;</code>.
+</p>
+
+<table>
+  <thead>
+    <tr><th>Profile</th><th>Chip</th><th>Panel</th><th>Kconfig symbol</th></tr>
+  </thead>
+  <tbody>
+    <tr><td class="mono">cyd2usb_st7789</td><td>ESP32</td><td>ST7789 320×240 LCD</td><td class="mono">CONFIG_BURNSCOPE_DISPLAY_CYD2USB_ST7789</td></tr>
+    <tr><td class="mono">amoled_sh8601</td><td>ESP32-S3</td><td>SH8601/CO5300 466×466 (1.43")</td><td class="mono">CONFIG_BURNSCOPE_DISPLAY_AMOLED_SH8601</td></tr>
+    <tr><td class="mono">amoled_co5300_175</td><td>ESP32-S3</td><td>CO5300 466×466 (1.75")</td><td class="mono">CONFIG_BURNSCOPE_DISPLAY_AMOLED_CO5300_175</td></tr>
+  </tbody>
+</table>
+
+<p>
+  The two AMOLED boards share the round-display UI and the QMI8658 IMU stack
+  (auto-rotate and motion-wake). The 1.75" board adds a CST9217 touch
+  controller and an AXP2101 PMU that the firmware reads (read-only) for the
+  battery indicator. The CYD has none of these and uses a static rotation.
+  See the matrix in the <a href="../README.md">README</a> for what each board
+  implements, and <code>firmware/README.md</code> for the per-board build
+  commands.
+</p>
+
+<h3 id="partitions">4.2 Partition layouts</h3>
+
+<p>
+  Flash size drives the partition table, which differs by board.
+</p>
+
+<table>
+  <thead>
+    <tr><th>Board</th><th>Flash</th><th>Table</th><th>Layout</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>CYD</td><td>4 MB</td><td class="mono">partitions-4mb.csv</td>
+      <td>Two ~1.875 MB OTA slots, no data partition.</td>
+    </tr>
+    <tr>
+      <td>AMOLED (1.43" / 1.75")</td><td>16 MB</td><td class="mono">partitions-16mb.csv</td>
+      <td>Two 5 MB OTA slots plus a ~5.8 MB <code>storage</code> partition,
+      mounted as LittleFS at <code>/storage</code> by
+      <code>main/storage.c</code>, reserved for the future pixel-aging map and
+      persistent assets.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3 id="ota">4.3 OTA &amp; rollback</h3>
+
+<p>
+  After the initial USB flash, updates ship over the LAN:
+  <code>burnscope ota &lt;bin&gt; --device &lt;id&gt;</code> on the client and the
+  <code>POST /ota</code> handler in <code>main/http_server.c</code> on the
+  device. <code>/ota</code> writes the inactive slot and uses the same
+  client-id slot match as <code>/summary</code>, but it never TOFU-binds — a
+  device has to have been paired by a prior <code>/summary</code> push first.
+</p>
+
+<p>
+  On the ESP32-S3 boards the bootloader has rollback enabled
+  (<code>CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE</code>): a freshly flashed image
+  has to mark itself valid after its first healthy <code>/summary</code> push,
+  and anything that boots but never proves itself is reverted on the next
+  reboot. The CYD's 4 MB layout does not carry this safety net, so a bad image
+  there needs a USB re-flash to recover.
+</p>
+
+<h2 id="further">5. Further reading</h2>
+
+<ul>
+  <li><a href="./description.md">description.md</a> — design rationale &amp; scope.</li>
+  <li><a href="./wire-format.md">wire-format.md</a> — daemon ↔ firmware contract.</li>
+  <li><a href="./client-spec-v2.html">client-spec-v2.html</a> — canonical v2 client spec.</li>
+  <li><a href="./add_an_agent.html">add_an_agent.html</a> — how to add a new agent.</li>
+  <li><a href="./fsd/firmware-fsd.md">fsd/firmware-fsd.md</a> — firmware functional spec.</li>
+</ul>
+
+</body>
+</html>

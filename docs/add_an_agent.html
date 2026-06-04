@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BurnScope — adding a new agent</title>
+<style>
+  :root {
+    --accent: #2c5aa0;
+    --accent-soft: #eef3fa;
+    --border: #e1e4e8;
+    --bg-soft: #fafbfc;
+    --bg-code: #f4f4f7;
+    --text: #24292f;
+    --muted: #57606a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    max-width: 1040px;
+    margin: 2em auto;
+    padding: 0 1.5em;
+    color: var(--text);
+    line-height: 1.55;
+  }
+  h1 { border-bottom: 2px solid var(--accent); padding-bottom: .35em; }
+  h2 { border-bottom: 1px solid var(--border); padding-bottom: .25em; margin-top: 2.2em; }
+  h3 { color: var(--accent); margin-top: 1.8em; }
+  h4 { margin-top: 1.4em; margin-bottom: .4em; color: var(--muted); text-transform: uppercase;
+       font-size: .82em; letter-spacing: .05em; }
+  p { margin: .6em 0; }
+  code, pre { font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace; }
+  code {
+    background: var(--bg-code);
+    padding: .1em .35em;
+    border-radius: 3px;
+    font-size: .92em;
+  }
+  pre {
+    background: var(--bg-code);
+    padding: 1em 1.2em;
+    border-radius: 6px;
+    overflow-x: auto;
+    border-left: 3px solid var(--accent);
+    font-size: .87em;
+    line-height: 1.5;
+  }
+  pre code { background: transparent; padding: 0; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 1em 0;
+    font-size: .92em;
+  }
+  th, td {
+    border: 1px solid var(--border);
+    padding: .55em .8em;
+    text-align: left;
+    vertical-align: top;
+  }
+  th { background: var(--bg-soft); font-weight: 600; }
+  td.mono, table.mono td:first-child {
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: .9em;
+    white-space: nowrap;
+  }
+  .toc {
+    background: var(--bg-soft);
+    border: 1px solid var(--border);
+    padding: 1em 1.5em;
+    border-radius: 6px;
+  }
+  .toc ul { margin: .3em 0; padding-left: 1.4em; }
+  .toc li { margin: .15em 0; }
+  .tag {
+    display: inline-block;
+    background: var(--accent-soft);
+    color: var(--accent);
+    padding: .12em .55em;
+    border-radius: 3px;
+    font-size: .78em;
+    font-weight: 600;
+    margin-right: .4em;
+    vertical-align: middle;
+  }
+  blockquote {
+    border-left: 3px solid #ccc;
+    margin: 1em 0;
+    padding: .35em 1em;
+    color: var(--muted);
+    background: var(--bg-soft);
+    border-radius: 0 4px 4px 0;
+  }
+  .note {
+    background: var(--accent-soft);
+    border-left: 3px solid var(--accent);
+    padding: .6em 1em;
+    margin: 1em 0;
+    border-radius: 0 4px 4px 0;
+    font-size: .92em;
+  }
+  .small { font-size: .88em; color: var(--muted); }
+  hr { border: 0; border-top: 1px solid var(--border); margin: 2.5em 0; }
+</style>
+</head>
+<body>
+
+<h1>BurnScope — adding a new agent</h1>
+
+<p class="small">
+  How to teach BurnScope about a new AI coding agent. The firmware contract is
+  agent-agnostic, so this is entirely laptop-side work. For how the pieces fit
+  together see <a href="./architecture.html">architecture.html</a>; for the
+  byte-level contract see <a href="./wire-format.md">wire-format.md</a>.
+</p>
+
+<div class="toc">
+  <strong>Contents</strong>
+  <ul>
+    <li><a href="#boundary">1. Where the work lives</a></li>
+    <li><a href="#patterns">2. Pick a lifecycle</a>
+      <ul>
+        <li><a href="#statusline">2.1 Statusline-style (per-fire)</a></li>
+        <li><a href="#daemon">2.2 Daemon-style (long-lived)</a></li>
+      </ul>
+    </li>
+    <li><a href="#modules">3. Shared modules to reuse</a></li>
+    <li><a href="#steps">4. Step by step</a></li>
+    <li><a href="#snapshot">5. Building the snapshot</a></li>
+    <li><a href="#install">6. Wiring the installer</a></li>
+  </ul>
+</div>
+
+<h2 id="boundary">1. Where the work lives</h2>
+
+<p>
+  There is no <code>Agent</code> base class to subclass. The firmware renders
+  whatever <code>AgentSnapshot</code> it is handed and never learns which agent
+  produced it, so everything agent-specific happens upstream of
+  <code>schema.AgentSnapshot</code> on the laptop. Your job is to read your
+  agent's usage data, shape it into an <code>AgentSnapshot</code>, and hand it
+  to the shared push path. The five shared modules
+  (<a href="#modules">§3</a>) do the rest.
+</p>
+
+<h2 id="patterns">2. Pick a lifecycle</h2>
+
+<p>
+  How you collect depends on how your agent exposes its usage. The two agents
+  we ship are the two templates.
+</p>
+
+<h3 id="statusline">2.1 Statusline-style (per-fire)</h3>
+<p>
+  Use this when the agent will run your code and hand you the data, on its own
+  schedule. <code>claude_statusline.py</code> is a Claude Code statusline hook:
+  Claude invokes it after each assistant message with a payload that already
+  contains <code>rate_limits.*</code>. The foreground process renders the
+  status line and forks a detached <code>--push</code> child that builds the
+  snapshot and pushes it. Nothing stays resident.
+</p>
+
+<h3 id="daemon">2.2 Daemon-style (long-lived)</h3>
+<p>
+  Use this when you have to hold a connection open to get the data.
+  <code>codex_daemon.py</code> owns a <code>codex app-server</code> subprocess
+  and polls <code>account/rateLimits/read</code> on a timer. A long-lived
+  process lets you dedupe across polls (only push when usage actually changed)
+  and reconnect with backoff. It is more code than the statusline path; reach
+  for it only when a per-fire hook can't get at the data.
+</p>
+
+<h2 id="modules">3. Shared modules to reuse</h2>
+
+<p>
+  Compose these — don't reimplement them. They live in
+  <code>client/src/burnscope_client/</code>.
+</p>
+
+<table>
+  <thead>
+    <tr><th>Module</th><th>What you call it for</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td class="mono">schema.py</td>
+      <td>The <code>AgentSnapshot</code> / <code>SessionSnapshot</code> frozen
+      dataclasses you build. <code>AgentSnapshot.semantically_equal()</code>
+      lets a daemon skip pushes when nothing changed.</td>
+    </tr>
+    <tr>
+      <td class="mono">identity.py</td>
+      <td>Resolve the plaintext identifier you send in the
+      <code>X-BurnScope-Client-Id</code> header. Add a resolver for your
+      agent's account email if it isn't already covered.</td>
+    </tr>
+    <tr>
+      <td class="mono">discovery.py</td>
+      <td><code>discover_all(timeout, agent=…)</code> to find displays on the
+      LAN over mDNS and filter to ones with a free slot for your agent.</td>
+    </tr>
+    <tr>
+      <td class="mono">host_cache.py</td>
+      <td>Atomic per-agent state in <code>~/.burnscope/</code>: the paired
+      device list, last-push outcomes, and the mDNS-reconcile cooldown. Your
+      agent gets its own files keyed by name.</td>
+    </tr>
+    <tr>
+      <td class="mono">pusher.py</td>
+      <td><code>push_to_all()</code> to fan out <code>POST /summary</code> to
+      every paired device, plus the host-reconciliation helpers
+      (<code>refresh_and_retry_transport_failures</code>,
+      <code>reconcile_duplicate_hosts</code>) the shipped collectors run after
+      each push.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="steps">4. Step by step</h2>
+
+<ol>
+  <li>Read your agent's usage data from its native, zero-cost source — a
+  payload it hands you, a file it already writes, or a subprocess it exposes.
+  No upstream API calls or header scraping.</li>
+  <li>Map it into an <code>AgentSnapshot</code> (<a href="#snapshot">§5</a>).</li>
+  <li>Resolve the client identifier with <code>identity.py</code>.</li>
+  <li>Load the paired device list from <code>host_cache.py</code>; on an empty
+  first run, browse with <code>discovery.py</code> and pair (the TOFU claim
+  fires on the first push).</li>
+  <li>Push with <code>pusher.push_to_all()</code>, then run the same
+  reconciliation chain the shipped collectors do
+  (<code>refresh_and_retry_transport_failures</code> →
+  <code>reconcile_duplicate_hosts</code>) and record the outcomes. Drop a
+  device only on a <code>/summary</code> <code>401</code>; transport and health
+  failures never evict.</li>
+  <li>Register a <code>burnscope install &lt;agent&gt;</code> path
+  (<a href="#install">§6</a>).</li>
+</ol>
+
+<h2 id="snapshot">5. Building the snapshot</h2>
+
+<p>
+  An <code>AgentSnapshot</code> is the agent name, the capture time, and one or
+  more <code>SessionSnapshot</code> windows. <code>used_pct</code> is a
+  fraction in <code>0.0–1.0</code> (not a percentage). Set
+  <code>rolling=True</code> and <code>window_duration_mins</code> for windows
+  whose <code>resets_at</code> drifts with wall-clock, so the firmware can
+  synthesise a fresh countdown when it goes idle.
+</p>
+
+<pre><code>from burnscope_client.schema import AgentSnapshot, SessionSnapshot
+
+snapshot = AgentSnapshot(
+    agent="myagent",            # lowercase identifier, shown on screen
+    captured_at=now_unix,       # Unix seconds (UTC), monotonic per device
+    sessions=[
+        SessionSnapshot(
+            type="current",     # agent-defined label
+            used_pct=0.42,      # 0.0–1.0
+            resets_at=reset_unix,
+            rolling=False,
+            window_duration_mins=300,
+        ),
+    ],
+)</code></pre>
+
+<p>
+  The field names and rules match <a href="./wire-format.md">wire-format.md</a>
+  exactly — the C side parses the same JSON, so keep the two in step.
+</p>
+
+<h2 id="install">6. Wiring the installer</h2>
+
+<p>
+  Add an install path to <code>cli.py</code> so
+  <code>burnscope install &lt;agent&gt;</code> wires your collector into the
+  right supervisor:
+</p>
+
+<ul>
+  <li><strong>Statusline-style</strong> — patch the agent's config to call your
+  hook, the way <code>_install_claude()</code> writes the statusline command
+  into <code>~/.claude/settings.json</code>.</li>
+  <li><strong>Daemon-style</strong> — drop a supervisor unit, the way
+  <code>_install_codex()</code> installs a launchd plist (macOS) or a
+  <code>systemd --user</code> unit (Linux) that runs the daemon.</li>
+</ul>
+
+<p>
+  Add your agent to the <code>install</code>/<code>uninstall</code> choices and
+  to the per-agent loops in <code>status</code> and <code>pair-reset</code> so
+  the tooling reports and resets it alongside the others.
+</p>
+
+</body>
+</html>

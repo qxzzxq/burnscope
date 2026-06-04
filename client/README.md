@@ -1,23 +1,19 @@
 # burnscope-client (v2)
 
-Per-laptop client that reports Claude Code and Codex CLI rate-limit usage to
-the BurnScope ESP32. v2 drops the v1 header-probe approach in favor of two
-agent-native, zero-cost sources:
+The laptop-side client that reports Claude Code and Codex CLI rate-limit usage
+to the BurnScope ESP32. v2 replaces v1's header probing with two zero-cost
+sources the agents already produce:
 
-- **Claude** — Claude Code statusline hook (`claude_statusline.py`,
-  invoked per fire).
-- **Codex** — `codex app-server` JSON-RPC subprocess (`codex_daemon.py`,
-  long-lived).
+- **Claude**: a Claude Code statusline hook (`claude_statusline.py`), run on each fire.
+- **Codex**: a long-lived `codex app-server` JSON-RPC subprocess (`codex_daemon.py`).
 
-See `docs/client-spec-v2.html` for the full specification. The v1 client
-was removed; its history is preserved in git.
+Full spec: `docs/client-spec-v2.html`. The v1 client is gone; its history is in git.
 
 ## Install
 
 This project uses [uv](https://docs.astral.sh/uv/); `uv.lock` pins the deps.
 
-For end-use (installs `burnscope` on PATH in an isolated venv) — run
-from the `client/` directory:
+For normal use, install `burnscope` onto your PATH and call it directly:
 
 ```sh
 cd client
@@ -27,35 +23,35 @@ burnscope install codex     # macOS launchd or Linux systemd --user
 burnscope status            # confirm wiring
 ```
 
-For development (creates `.venv/` here, installs dev deps from `[dependency-groups]`):
+For development, work from a local `.venv/` instead. It isn't on your PATH, so
+run the same CLI through `uv run`:
 
 ```sh
 cd client
 uv sync
-uv run burnscope status     # invoke via the project venv
+uv run burnscope status     # same command, via the project venv
 uv run pytest               # run the test suite
 ```
 
 ## Debugging
 
-Claude Code discards the statusline script's stderr, so logs are silent
-by default. Set `BURNSCOPE_LOG_FILE` to capture them:
+Claude Code discards the statusline script's stderr, so logs are silent by
+default. Set `BURNSCOPE_LOG_FILE` to capture them:
 
 ```sh
 export BURNSCOPE_LOG_FILE=~/.burnscope/claude.log
-# trigger a Claude message; then:
+# trigger a Claude message, then:
 tail -f ~/.burnscope/claude.log
 ```
 
-The env var is inherited by the detached `--push` child, so both the
-foreground render and the network call land in the same file. The codex
-daemon honors the same variable; when unset, it falls back to stderr
-(which the launchd plist / systemd unit redirects to
-`~/.burnscope/codex.stderr.log`).
+The detached `--push` child inherits the variable, so the foreground render and
+the network call land in the same file. The codex daemon honors it too; when
+unset, it falls back to stderr (which the launchd plist or systemd unit
+redirects to `~/.burnscope/codex.stderr.log`).
 
-By default the log level is `INFO` — only lifecycle events and warnings
-are recorded. For the full per-fire narrative (mDNS browse, cache hits,
-POST URL, etc.) bump it up:
+The default log level is `INFO`, which records only lifecycle events and
+warnings. For the full per-fire narrative (mDNS browse, cache hits, POST URL),
+raise it:
 
 ```sh
 export BURNSCOPE_LOG_LEVEL=DEBUG
@@ -63,4 +59,3 @@ export BURNSCOPE_LOG_LEVEL=DEBUG
 
 Accepted values: `DEBUG`, `INFO` (default), `WARNING`, `ERROR`
 (case-insensitive). Unknown values fall back to `INFO`.
-

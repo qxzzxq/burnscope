@@ -8,3 +8,5 @@ sdkconfig.old
 
 # Phase 1 compile-time WiFi credentials — never check in.
 main/wifi_creds.h
+
+.clangd

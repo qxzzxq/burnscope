@@ -1,5 +1,7 @@
 # BurnScope
 
+test
+
 > An always-on token & quota meter for your AI coding agents.
 
 BurnScope surfaces rate-limit usage for your AI coding agents on a dedicated
